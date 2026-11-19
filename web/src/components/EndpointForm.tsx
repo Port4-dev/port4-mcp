@@ -94,87 +94,87 @@ export function EndpointForm({
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
       <form
         onSubmit={handleCreate}
-        className="lg:col-span-5 p4-card rounded-2xl p-5 flex flex-col gap-3.5"
+        className="lg:col-span-5 cf-card rounded-2xl p-5 flex flex-col gap-3.5"
       >
         <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-white">New Paid Endpoint</h3>
-          <span className="font-mono text-[11px] text-[#10B981]">Instant Publish</span>
+          <h3 className="text-sm font-semibold text-zinc-900">New Paid Endpoint</h3>
+          <span className="font-mono text-[11px] text-[#E06D0C]">Instant Publish</span>
         </div>
 
         <div className="grid grid-cols-2 gap-3">
           <label className="flex flex-col gap-1">
-            <span className="text-[11px] text-slate-400">Subdomain</span>
+            <span className="text-[11px] font-medium text-zinc-600">Subdomain</span>
             <input
               required
               value={subdomain}
               onChange={(e) => setSubdomain(e.target.value.toLowerCase())}
               placeholder="weather"
-              className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#0EA5E9]"
+              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-3 py-2 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
             />
           </label>
           <label className="flex flex-col gap-1">
-            <span className="text-[11px] text-slate-400">Name</span>
+            <span className="text-[11px] font-medium text-zinc-600">Display Name</span>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Weather API"
-              className="text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#0EA5E9]"
+              className="text-xs bg-white border border-zinc-300 rounded-lg px-3 py-2 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
             />
           </label>
         </div>
 
         <label className="flex flex-col gap-1">
-          <span className="text-[11px] text-slate-400">Upstream Base URL</span>
+          <span className="text-[11px] font-medium text-zinc-600">Upstream Base URL</span>
           <input
             required
             value={upstreamUrl}
             onChange={(e) => setUpstreamUrl(e.target.value)}
-            className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#0EA5E9]"
+            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-3 py-2 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
           />
         </label>
 
         <label className="flex flex-col gap-1">
-          <span className="text-[11px] text-slate-400">Payout Wallet (USDC)</span>
+          <span className="text-[11px] font-medium text-zinc-600">Payout Wallet (USDC)</span>
           <input
             required
             value={payoutWallet}
             onChange={(e) => setPayoutWallet(e.target.value)}
-            className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#0EA5E9]"
+            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-3 py-2 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
           />
         </label>
 
-        <div className="grid grid-cols-3 gap-2.5 pt-2 border-t border-emerald-500/15">
+        <div className="grid grid-cols-3 gap-2.5 pt-2 border-t border-zinc-200">
           <label className="flex flex-col gap-1">
-            <span className="text-[11px] text-slate-400">Tool</span>
+            <span className="text-[11px] font-medium text-zinc-600">Tool</span>
             <input
               required
               value={toolName}
               onChange={(e) => setToolName(e.target.value)}
-              className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-2.5 py-2 text-white focus:outline-none focus:border-[#10B981]"
+              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-2 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
             />
           </label>
           <label className="flex flex-col gap-1">
-            <span className="text-[11px] text-slate-400">Path</span>
+            <span className="text-[11px] font-medium text-zinc-600">Path</span>
             <input
               required
               value={toolPath}
               onChange={(e) => setToolPath(e.target.value)}
-              className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-2.5 py-2 text-white focus:outline-none focus:border-[#10B981]"
+              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-2 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
             />
           </label>
           <label className="flex flex-col gap-1">
-            <span className="text-[11px] text-slate-400">Price ($)</span>
+            <span className="text-[11px] font-medium text-zinc-600">Price ($)</span>
             <input
               required
               value={priceUsd}
               onChange={(e) => setPriceUsd(e.target.value)}
-              className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-2.5 py-2 text-[#10B981] focus:outline-none focus:border-[#10B981]"
+              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-2 text-[#C25906] font-medium focus:outline-none focus:border-[#F6821F]"
             />
           </label>
         </div>
 
         {error && (
-          <div className="font-mono text-xs text-rose-400 bg-rose-950/30 border border-rose-500/30 rounded-lg px-3 py-2">
+          <div className="font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
             {error}
           </div>
         )}
@@ -182,7 +182,7 @@ export function EndpointForm({
         <button
           type="submit"
           disabled={submitting}
-          className="p4-btn-primary mt-1 inline-flex items-center justify-center gap-2 rounded-lg py-2.5 text-xs cursor-pointer disabled:opacity-60"
+          className="cf-btn-primary mt-1 inline-flex items-center justify-center gap-2 rounded-lg py-2.5 text-xs cursor-pointer disabled:opacity-60"
         >
           <Plus className="w-4 h-4" />
           {submitting ? "Publishing..." : "Create Paid Endpoint"}
@@ -191,29 +191,29 @@ export function EndpointForm({
 
       <div className="lg:col-span-7 flex flex-col gap-3">
         {tenants.length === 0 ? (
-          <div className="p4-card rounded-2xl p-8 text-center font-mono text-xs text-slate-400">
+          <div className="cf-card rounded-2xl p-8 text-center font-mono text-xs text-zinc-500">
             No endpoints yet. Create one to start monetizing calls.
           </div>
         ) : (
           tenants.map((tenant) => (
-            <div key={tenant.id} className="p4-card rounded-2xl p-4 flex flex-col gap-3">
+            <div key={tenant.id} className="cf-card rounded-2xl p-4 flex flex-col gap-3">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <div className="flex items-center gap-2">
-                    <Globe className="w-4 h-4 text-[#0EA5E9]" />
-                    <span className="text-sm font-semibold text-white">{tenant.name}</span>
-                    <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-[#10B981] border border-emerald-500/30">
+                    <Globe className="w-4 h-4 text-[#F6821F]" />
+                    <span className="text-sm font-semibold text-zinc-900">{tenant.name}</span>
+                    <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-[#F6821F]/10 text-[#C25906] border border-[#F6821F]/25">
                       {tenant.network}
                     </span>
                   </div>
-                  <div className="font-mono text-xs text-[#0EA5E9] mt-1">{tenant.endpoint_url}</div>
+                  <div className="font-mono text-xs text-zinc-600 mt-1">{tenant.endpoint_url}</div>
                 </div>
 
                 {tenant.subdomain !== "demo" && (
                   <button
                     type="button"
                     onClick={() => handleDelete(tenant.id)}
-                    className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 cursor-pointer"
+                    className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer"
                     title="Delete endpoint"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -225,12 +225,12 @@ export function EndpointForm({
                 {tenant.tools.map((tool) => (
                   <div
                     key={tool.id}
-                    className="inline-flex items-center gap-2 rounded-lg bg-[#050B14] border border-emerald-500/20 px-2.5 py-1.5 font-mono text-[11px]"
+                    className="inline-flex items-center gap-2 rounded-lg bg-zinc-50 border border-zinc-200 px-2.5 py-1.5 font-mono text-[11px]"
                   >
-                    <span className="text-slate-200">{tool.name}</span>
-                    <span className="text-slate-500">{tool.http_method}</span>
-                    <span className="inline-flex items-center gap-1 text-[#10B981]">
-                      <Coins className="w-3 h-3" />${tool.price_usd}
+                    <span className="text-zinc-900 font-medium">{tool.name}</span>
+                    <span className="text-zinc-400">{tool.http_method}</span>
+                    <span className="inline-flex items-center gap-1 text-[#C25906] font-medium">
+                      <Coins className="w-3 h-3 text-[#F6821F]" />${tool.price_usd}
                     </span>
                   </div>
                 ))}

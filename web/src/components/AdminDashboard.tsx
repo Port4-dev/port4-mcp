@@ -118,7 +118,7 @@ export function AdminDashboard() {
 
   if (error) {
     return (
-      <div className="p4-card rounded-2xl p-8 text-center font-mono text-xs text-rose-400">
+      <div className="cf-card rounded-2xl p-8 text-center font-mono text-xs text-rose-700">
         {error}
       </div>
     );
@@ -128,42 +128,40 @@ export function AdminDashboard() {
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2.5">
-          <ShieldCheck className="w-5 h-5 text-[#10B981]" />
-          <h1 className="text-2xl font-bold tracking-tight text-white">Super-Admin Control</h1>
+          <ShieldCheck className="w-5 h-5 text-[#F6821F]" />
+          <h1 className="text-2xl font-bold tracking-tight text-zinc-900">Super-Admin Control</h1>
         </div>
-        <span className="font-mono text-xs text-[#10B981] bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-1 rounded">
+        <span className="font-mono text-xs text-[#C25906] bg-[#F6821F]/10 border border-[#F6821F]/25 px-2.5 py-1 rounded">
           Live Governance
         </span>
       </div>
 
-      {/* 1. Global Telemetry */}
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-        <Kpi icon={<Users className="w-4 h-4 text-[#0EA5E9]" />} label="Developers" value={String(stats?.total_users ?? 0)} />
-        <Kpi icon={<Activity className="w-4 h-4 text-[#0EA5E9]" />} label="Endpoints" value={`${stats?.active_tenants ?? 0}/${stats?.total_tenants ?? 0}`} />
-        <Kpi icon={<Activity className="w-4 h-4 text-[#10B981]" />} label="Settled Calls" value={String(stats?.total_transactions ?? 0)} />
-        <Kpi icon={<Coins className="w-4 h-4 text-[#0EA5E9]" />} label="Gross USDC" value={`$${stats?.gross_usdc_volume ?? "0.0000"}`} />
-        <Kpi icon={<Coins className="w-4 h-4 text-[#10B981]" />} label="Net Revenue" value={`$${stats?.net_platform_revenue ?? "0.0000"}`} />
+        <Kpi icon={<Users className="w-4 h-4 text-[#F6821F]" />} label="Developers" value={String(stats?.total_users ?? 0)} />
+        <Kpi icon={<Activity className="w-4 h-4 text-[#F6821F]" />} label="Endpoints" value={`${stats?.active_tenants ?? 0}/${stats?.total_tenants ?? 0}`} />
+        <Kpi icon={<Activity className="w-4 h-4 text-emerald-600" />} label="Settled Calls" value={String(stats?.total_transactions ?? 0)} />
+        <Kpi icon={<Coins className="w-4 h-4 text-[#F6821F]" />} label="Gross USDC" value={`$${stats?.gross_usdc_volume ?? "0.0000"}`} />
+        <Kpi icon={<Coins className="w-4 h-4 text-emerald-600" />} label="Net Revenue" value={`$${stats?.net_platform_revenue ?? "0.0000"}`} />
       </div>
 
-      {/* 2. Tenant Governance + Kill-Switch + Featured + Plan */}
-      <section className="p4-card rounded-2xl overflow-hidden">
-        <div className="p-4 border-b border-emerald-500/20 flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-sm font-semibold text-white">Tenant Governance</h2>
+      <section className="cf-card rounded-2xl overflow-hidden">
+        <div className="p-4 border-b border-zinc-200 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-sm font-semibold text-zinc-900">Tenant Governance</h2>
           <div className="flex items-center gap-2">
             <div className="relative">
-              <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2.5" />
+              <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-2.5" />
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Search slug or owner..."
-                className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg pl-8 pr-3 py-1.5 text-slate-200 focus:outline-none focus:border-[#0EA5E9]"
+                className="font-mono text-xs bg-white border border-zinc-300 rounded-lg pl-8 pr-3 py-1.5 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
               />
             </div>
             <select
               aria-label="Filter status"
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value as "" | "active" | "suspended")}
-              className="font-mono text-xs bg-[#050B14] border border-emerald-500/20 rounded-lg px-2.5 py-1.5 text-slate-200"
+              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-1.5 text-zinc-800"
             >
               <option value="">All</option>
               <option value="active">Active</option>
@@ -175,7 +173,7 @@ export function AdminDashboard() {
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse font-mono text-xs">
             <thead>
-              <tr className="border-b border-emerald-500/15 text-[11px] uppercase text-slate-400">
+              <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] uppercase text-zinc-500">
                 <th className="py-2.5 px-4">Slug</th>
                 <th className="py-2.5 px-4">Owner</th>
                 <th className="py-2.5 px-4">Plan / Fee</th>
@@ -185,32 +183,32 @@ export function AdminDashboard() {
                 <th className="py-2.5 px-4">Kill-Switch</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-800/70">
+            <tbody className="divide-y divide-zinc-200">
               {tenants.map((t) => (
-                <tr key={t.id} className="hover:bg-[#0EA5E9]/5">
-                  <td className="py-2.5 px-4 text-[#0EA5E9]">{t.slug}</td>
-                  <td className="py-2.5 px-4 text-slate-300">@{t.owner_login}</td>
+                <tr key={t.id} className="hover:bg-orange-50/40">
+                  <td className="py-2.5 px-4 text-[#C25906] font-medium">{t.slug}</td>
+                  <td className="py-2.5 px-4 text-zinc-700">@{t.owner_login}</td>
                   <td className="py-2.5 px-4">
                     <select
                       aria-label={`Plan for ${t.owner_login}`}
                       value={t.owner_plan}
                       onChange={(e) => updateUserPlan(t.owner_id, e.target.value as "free" | "pro")}
-                      className="bg-[#050B14] border border-slate-700 rounded px-2 py-1 text-[11px] text-slate-200"
+                      className="bg-white border border-zinc-300 rounded px-2 py-1 text-[11px] text-zinc-800"
                     >
                       <option value="free">free (3%)</option>
                       <option value="pro">pro (1%)</option>
                     </select>
                   </td>
-                  <td className="py-2.5 px-4 text-slate-300">{t.total_calls}</td>
-                  <td className="py-2.5 px-4 text-[#10B981]">${t.total_revenue_usd}</td>
+                  <td className="py-2.5 px-4 text-zinc-700">{t.total_calls}</td>
+                  <td className="py-2.5 px-4 text-emerald-700 font-medium">${t.total_revenue_usd}</td>
                   <td className="py-2.5 px-4">
                     <button
                       type="button"
                       onClick={() => toggleFeatured(t.slug, t.is_featured)}
                       className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] cursor-pointer border ${
                         t.is_featured === 1
-                          ? "bg-sky-500/15 text-sky-300 border-sky-500/40"
-                          : "bg-[#050B14] text-slate-500 border-slate-700"
+                          ? "bg-[#F6821F]/10 text-[#C25906] border-[#F6821F]/35"
+                          : "bg-zinc-50 text-zinc-500 border-zinc-200"
                       }`}
                     >
                       <Star className="w-3 h-3" />
@@ -223,8 +221,8 @@ export function AdminDashboard() {
                       onClick={() => toggleStatus(t.slug, t.status)}
                       className={`inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] cursor-pointer border ${
                         t.status === "active"
-                          ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40 hover:bg-rose-500/15 hover:text-rose-300 hover:border-rose-500/40"
-                          : "bg-rose-500/15 text-rose-300 border-rose-500/40 hover:bg-emerald-500/15 hover:text-emerald-300"
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-rose-50 hover:text-rose-700 hover:border-rose-200"
+                          : "bg-rose-50 text-rose-700 border-rose-200 hover:bg-emerald-50 hover:text-emerald-700"
                       }`}
                     >
                       <Power className="w-3 h-3" />
@@ -238,18 +236,15 @@ export function AdminDashboard() {
         </div>
       </section>
 
-      {/* 3. Global Live Audit Ledger */}
-      <section className="p4-card rounded-2xl overflow-hidden">
-        <div className="p-4 border-b border-emerald-500/20 flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-white">Global Audit Ledger (Latest 100)</h2>
-          <span className="font-mono text-[11px] text-slate-400">
-            {transactions.length} records
-          </span>
+      <section className="cf-card rounded-2xl overflow-hidden">
+        <div className="p-4 border-b border-zinc-200 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-900">Global Audit Ledger (Latest 100)</h2>
+          <span className="font-mono text-[11px] text-zinc-500">{transactions.length} records</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse font-mono text-xs">
             <thead>
-              <tr className="border-b border-emerald-500/15 text-[11px] uppercase text-slate-400">
+              <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] uppercase text-zinc-500">
                 <th className="py-2.5 px-4">Time</th>
                 <th className="py-2.5 px-4">Endpoint</th>
                 <th className="py-2.5 px-4">Amount</th>
@@ -258,32 +253,32 @@ export function AdminDashboard() {
                 <th className="py-2.5 px-4">Tx Hash</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-800/70">
+            <tbody className="divide-y divide-zinc-200">
               {transactions.map((tx) => (
-                <tr key={tx.id} className="hover:bg-[#0EA5E9]/5">
-                  <td className="py-2.5 px-4 text-slate-400">{tx.created_at}</td>
+                <tr key={tx.id} className="hover:bg-orange-50/40">
+                  <td className="py-2.5 px-4 text-zinc-500">{tx.created_at}</td>
                   <td className="py-2.5 px-4">
-                    <span className="text-[#0EA5E9]">{tx.slug}</span>
-                    <span className="text-slate-600">/</span>
-                    <span className="text-slate-200">{tx.tool_name}</span>
+                    <span className="text-[#C25906]">{tx.slug}</span>
+                    <span className="text-zinc-400">/</span>
+                    <span className="text-zinc-900">{tx.tool_name}</span>
                   </td>
-                  <td className="py-2.5 px-4 text-[#10B981]">${tx.amount_usd}</td>
+                  <td className="py-2.5 px-4 text-emerald-700 font-medium">${tx.amount_usd}</td>
                   <td className="py-2.5 px-4">
                     {tx.is_platform_fee === 1 ? (
-                      <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[10px]">
+                      <span className="px-2 py-0.5 rounded bg-[#F6821F]/10 text-[#C25906] border border-[#F6821F]/25 text-[10px]">
                         Platform Fee
                       </span>
                     ) : (
-                      <span className="text-slate-500 text-[10px]">Merchant</span>
+                      <span className="text-zinc-400 text-[10px]">Merchant</span>
                     )}
                   </td>
-                  <td className="py-2.5 px-4 text-slate-400">{tx.latency_ms}ms</td>
+                  <td className="py-2.5 px-4 text-zinc-500">{tx.latency_ms}ms</td>
                   <td className="py-2.5 px-4">
                     <a
                       href={tx.basescan_url}
                       target="_blank"
                       rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-[#0EA5E9] hover:underline"
+                      className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
                     >
                       {tx.tx_hash.slice(0, 10)}...{tx.tx_hash.slice(-6)}
                       <ExternalLink className="w-3 h-3" />
@@ -301,12 +296,12 @@ export function AdminDashboard() {
 
 function Kpi({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return (
-    <div className="p4-card rounded-xl p-4 flex items-center justify-between">
+    <div className="cf-card rounded-xl p-4 flex items-center justify-between">
       <div>
-        <div className="text-[10px] uppercase tracking-wider text-slate-400">{label}</div>
-        <div className="font-mono text-base font-semibold text-white mt-0.5">{value}</div>
+        <div className="text-[10px] uppercase tracking-wider text-zinc-500">{label}</div>
+        <div className="font-mono text-base font-semibold text-zinc-900 mt-0.5">{value}</div>
       </div>
-      <div className="p-2 rounded-lg bg-[#050B14] border border-emerald-500/20">{icon}</div>
+      <div className="p-2 rounded-lg bg-[#F6821F]/10 border border-[#F6821F]/20">{icon}</div>
     </div>
   );
 }

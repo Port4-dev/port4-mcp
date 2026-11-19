@@ -1,19 +1,22 @@
 @import "tailwindcss";
 
 :root {
-  --p4-bg: #050b14;
-  --p4-card: #0b1526;
-  --p4-blue: #0ea5e9;
-  --p4-green: #10b981;
-  --p4-border: rgba(16, 185, 129, 0.2);
+  --cf-bg: #fafafa;
+  --cf-surface: #ffffff;
+  --cf-ink: #111827;
+  --cf-muted: #52525b;
+  --cf-border: #e4e4e7;
+  --cf-orange: #f6821f;
+  --cf-orange-hover: #e06d0c;
+  --cf-amber: #fbad41;
 }
 
 @layer base {
   html,
   body {
     font-family: "Roboto", -apple-system, BlinkMacSystemFont, sans-serif;
-    background-color: var(--p4-bg);
-    color: #e2e8f0;
+    background-color: var(--cf-bg);
+    color: var(--cf-ink);
   }
 
   code,
@@ -23,24 +26,26 @@
   }
 }
 
-.p4-bg {
-  background-color: var(--p4-bg);
+.cf-hero-bg {
+  background-color: var(--cf-bg);
   background-image:
-    radial-gradient(ellipse 65% 40% at 25% 0%, rgba(14, 165, 233, 0.14), transparent 65%),
-    radial-gradient(ellipse 55% 35% at 80% 5%, rgba(16, 185, 129, 0.12), transparent 60%);
+    radial-gradient(ellipse 70% 45% at 50% -10%, rgba(246, 130, 31, 0.12), transparent 70%),
+    radial-gradient(ellipse 40% 30% at 85% 5%, rgba(251, 173, 65, 0.1), transparent 65%);
 }
 
-.p4-card {
-  background-color: var(--p4-card);
-  border: 1px solid var(--p4-border);
+.cf-card {
+  background-color: var(--cf-surface);
+  border: 1px solid var(--cf-border);
+  box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
 }
 
-.p4-btn-primary {
-  background: linear-gradient(135deg, #0ea5e9 0%, #10b981 100%);
-  color: #050b14;
-  font-weight: 600;
+.cf-btn-primary {
+  background: linear-gradient(180deg, #f6821f 0%, #e86f0c 100%);
+  color: #ffffff;
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(246, 130, 31, 0.3);
 }
 
-.p4-btn-primary:hover {
-  filter: brightness(1.08);
+.cf-btn-primary:hover {
+  background: linear-gradient(180deg, #ea7613 0%, #d46205 100%);
 }
