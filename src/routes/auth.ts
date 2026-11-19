@@ -11,10 +11,10 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
 function getJwtSecret(c: Context<AppEnv>): string {
   const secret = c.env.JWT_SECRET;
-  if (secret && secret.length >= 16) {
-    return secret;
+  if (!secret || secret.length < 16) {
+    throw new Error("JWT_SECRET binding is required and must be at least 16 characters.");
   }
-  return "port4-ephemeral-local-dev-secret-do-not-use-in-prod";
+  return secret;
 }
 
 function isSecureRequest(c: Context<AppEnv>): boolean {

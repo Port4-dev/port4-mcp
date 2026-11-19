@@ -41,4 +41,4 @@
 
 ## Current Build Phase
 - [x] Phase 1–5: Live MVP deployed to `https://port4.dev`
-- [x] Phase 6: Super-Admin RBAC & `/admin` suite, non-custodial fee split, `POST /api/sandbox/run`, Blue & Green minimalist UI + Featured Registry (verified locally; awaiting approval for remote D1 migration + deploy)
+- [x] Phase 6: Super-Admin RBAC & `/admin` suite, non-custodial fee split, `POST /api/sandbox/run`, Blue & Green minimalist UI + Featured Registry (migrated remote D1 `0002_admin_and_fees.sql` and deployed live to `port4.dev`, Version `7720d115-482d-49fe-bc6a-59e53a592e84`)

@@ -94,9 +94,10 @@ export function buildPaymentRequired(
 }
 
 export function getSandboxSigningSecret(env: AppBindings): string {
-  return env.JWT_SECRET && env.JWT_SECRET.length >= 16
-    ? env.JWT_SECRET
-    : "port4-sandbox-base-sepolia-demo-key";
+  if (!env.JWT_SECRET || env.JWT_SECRET.length < 16) {
+    throw new Error("JWT_SECRET binding is required for sandbox signing.");
+  }
+  return env.JWT_SECRET;
 }
 
 async function verifySandboxSignature(
