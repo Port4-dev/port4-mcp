@@ -1,0 +1,59 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "port4-gateway",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-19",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.1
+		}
+	},
+	"assets": {
+		"directory": "./dist",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": true
+	},
+	"vars": {
+		"APP_URL": "https://port4.dev",
+		"ADMIN_GITHUB_LOGIN": "Ishabarundo",
+		"FACILITATOR_URL": "https://x402.org/facilitator",
+		"X402_FACILITATOR_URL": "https://x402.org/facilitator",
+		"X402_NETWORK": "eip155:84532",
+		"X402_USDC_ASSET": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+		"SANDBOX_PAYOUT_WALLET": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "port4-db",
+			"database_id": "833d7aa9-ffaa-4a9c-92e0-dfda811647b1",
+			"migrations_dir": "migrations"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "TENANT_ROUTING",
+			"id": "b5d0c5acba7a402d9ad1960ae1c9c184"
+		}
+	],
+	"routes": [
+		{
+			"pattern": "port4.dev/*",
+			"zone_name": "port4.dev"
+		},
+		{
+			"pattern": "*.port4.dev/*",
+			"zone_name": "port4.dev"
+		}
+	]
+}

@@ -1,0 +1,257 @@
+import type { Context } from "hono";
+import type { AppEnv } from "../types";
+import { executeInternalSandboxTool } from "./sandbox";
+
+const MAX_UPSTREAM_BYTES = 256 * 1024; // 256 KB safety cap to protect 128 MB isolate memory
+
+async function readBoundedText(response: Response, maxBytes = MAX_UPSTREAM_BYTES): Promise<string> {
+  if (!response.body) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let result = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        const allowed = value.byteLength - (total - maxBytes);
+        if (allowed > 0) {
+          result += decoder.decode(value.subarray(0, allowed), { stream: false });
+        }
+        await reader.cancel();
+        break;
+      }
+      result += decoder.decode(value, { stream: true });
+    }
+    result += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+  return result;
+}
+
+function safeParseSchema(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object") {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Fallback to open object schema
+  }
+  return { type: "object", properties: {} };
+}
+
+export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
+  const mcp = c.get("mcp");
+  const tenant = c.get("tenant");
+
+  if (!mcp || !tenant) {
+    return c.json({ error: "gateway_context_missing" }, 500);
+  }
+
+  // 1. Edge-cached stateless tool discovery
+  if (mcp.method === "tools/list") {
+    const tools = tenant.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: safeParseSchema(tool.input_schema_json),
+      _meta: {
+        x402: {
+          scheme: "exact",
+          network: tenant.network,
+          asset: c.env.X402_USDC_ASSET,
+          priceUsd: `$${tool.price_usd}`,
+          amountAtomic: tool.price_atomic,
+          payTo: tenant.payout_wallet
+        }
+      }
+    }));
+
+    c.header("Cache-Control", "public, max-age=300");
+    c.header("X-Port4-Tenant", tenant.subdomain);
+    c.header("MCP-Protocol-Version", mcp.protocolVersion);
+
+    return c.json({
+      jsonrpc: "2.0",
+      id: mcp.rpcId,
+      result: { tools }
+    });
+  }
+
+  // 2. Paid tool invocation (x402GateMiddleware already verified & settled payment)
+  if (mcp.method === "tools/call") {
+    const tool = c.get("selectedTool");
+    const receipt = c.get("x402Receipt");
+    const startedAt = c.get("requestStartedAt") ?? Date.now();
+
+    if (!tool || !receipt) {
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          id: mcp.rpcId,
+          error: { code: -32603, message: "Missing settled tool context." }
+        },
+        500
+      );
+    }
+
+    const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "LOCAL";
+    let upstreamResult: unknown;
+
+    if (tenant.upstream_base_url === "internal://sandbox") {
+      upstreamResult = executeInternalSandboxTool(tool.name, mcp.arguments, colo);
+    } else {
+      const targetUrl = new URL(
+        tool.upstream_path.startsWith("/") ? tool.upstream_path : `/${tool.upstream_path}`,
+        tenant.upstream_base_url
+      );
+
+      const fetchInit: RequestInit = {
+        method: tool.http_method,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Port4-Tenant": tenant.subdomain,
+          "X-Port4-Tool": tool.name,
+          "X-Port4-Payer": receipt.payer,
+          "X-Port4-Tx": receipt.transaction
+        }
+      };
+
+      if (tool.http_method === "GET") {
+        for (const [k, v] of Object.entries(mcp.arguments)) {
+          if (v !== undefined && v !== null) {
+            targetUrl.searchParams.set(k, String(v));
+          }
+        }
+      } else {
+        fetchInit.body = JSON.stringify(mcp.arguments);
+      }
+
+      try {
+        const upstreamRes = await fetch(targetUrl.toString(), fetchInit);
+        const contentType = upstreamRes.headers.get("content-type") ?? "";
+        const rawText = await readBoundedText(upstreamRes);
+        if (contentType.includes("application/json")) {
+          try {
+            upstreamResult = JSON.parse(rawText) as unknown;
+          } catch {
+            upstreamResult = { status: upstreamRes.status, body: rawText.slice(0, 4096) };
+          }
+        } else {
+          upstreamResult = {
+            status: upstreamRes.status,
+            body: rawText.slice(0, 4096)
+          };
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Upstream fetch failed";
+        console.error(
+          JSON.stringify({
+            event: "upstream_fetch_failed",
+            tenant: tenant.subdomain,
+            tool: tool.name,
+            error: msg
+          })
+        );
+        return c.json(
+          {
+            jsonrpc: "2.0",
+            id: mcp.rpcId,
+            error: { code: -32000, message: `Upstream error: ${msg}` }
+          },
+          502
+        );
+      }
+    }
+
+    const latencyMs = Math.max(1, Date.now() - startedAt);
+    const txId = `tx_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const status = receipt.mode === "sandbox" ? "sandbox_settled" : "settled";
+
+    const isPlatformFeeInt = receipt.isPlatformFee ? 1 : 0;
+
+    // Log settlement & increment call counter in D1 without blocking edge response latency
+    c.executionCtx.waitUntil(
+      c.env.DB.batch([
+        c.env.DB.prepare(
+          `INSERT INTO transactions
+           (id, tenant_id, tool_name, payer_wallet, amount_atomic, amount_usd, network, tx_hash, status, latency_ms, is_platform_fee)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          txId,
+          tenant.id,
+          tool.name,
+          receipt.payer,
+          tool.price_atomic,
+          tool.price_usd,
+          receipt.network,
+          receipt.transaction,
+          status,
+          latencyMs,
+          isPlatformFeeInt
+        ),
+        c.env.DB.prepare("UPDATE tenants SET call_count = call_count + 1 WHERE id = ?").bind(
+          tenant.id
+        )
+      ])
+    );
+
+    console.log(
+      JSON.stringify({
+        event: "x402_mcp_settled",
+        tenant: tenant.subdomain,
+        tool: tool.name,
+        amountUsd: tool.price_usd,
+        network: receipt.network,
+        txHash: receipt.transaction,
+        latencyMs,
+        isPlatformFee: receipt.isPlatformFee,
+        mode: receipt.mode
+      })
+    );
+
+    c.header("Cache-Control", "no-store");
+    c.header("MCP-Protocol-Version", mcp.protocolVersion);
+
+    return c.json({
+      jsonrpc: "2.0",
+      id: mcp.rpcId,
+      result: {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(upstreamResult, null, 2)
+          }
+        ],
+        isError: false,
+        _meta: {
+          x402: {
+            txHash: receipt.transaction,
+            network: receipt.network,
+            payer: receipt.payer,
+            amountUsd: `$${tool.price_usd}`,
+            latencyMs,
+            mode: receipt.mode
+          }
+        }
+      }
+    });
+  }
+
+  return c.json(
+    {
+      jsonrpc: "2.0",
+      id: mcp.rpcId,
+      error: {
+        code: -32601,
+        message: `Method '${mcp.method}' not supported. Supported stateless methods: tools/list, tools/call.`
+      }
+    },
+    400
+  );
+}

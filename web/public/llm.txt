@@ -1,0 +1,38 @@
+# Port4 (port4.dev)
+
+> Paid MCP gateway for monetizing any HTTP API per call with USDC via the x402 payment protocol.
+
+## Overview
+Port4 turns REST APIs into pay-per-call Model Context Protocol (MCP) endpoints hosted at `https://{tenant}.port4.dev/mcp`. AI agents can discover tools and pay per invocation using HTTP 402 (`x402` v2) without creating an account.
+
+## Links
+- Homepage: https://port4.dev
+- Developer Docs: https://port4.dev/docs
+- Interactive Sandbox: https://port4.dev/sandbox
+- Console: https://port4.dev/console
+- GitHub: https://github.com/Port4-dev
+- Contact: info@port4.dev
+
+## Protocol Summary
+- Transport: Stateless HTTP `POST` with JSON-RPC 2.0
+- MCP Spec: `2026-07-28` (no `initialize` handshake, no `Mcp-Session-Id`)
+- Required Headers:
+  - `Content-Type: application/json`
+  - `MCP-Protocol-Version: 2026-07-28`
+  - `Mcp-Method: tools/list | tools/call`
+  - `Mcp-Name: <tool_name>` (required for `tools/call`)
+- Payment Protocol: x402 v2 (`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE` Base64 JSON headers)
+- Settlement Network: Base Sepolia (`eip155:84532`), USDC (`exact` scheme)
+
+## Demo Endpoint
+- Endpoint: `https://port4.dev/sandbox/mcp` (or `https://demo.port4.dev/mcp`)
+- Tools:
+  - `market_quote` ($0.001 USDC) — `{ "symbol": "ETH-USD" }`
+  - `edge_dns_lookup` ($0.002 USDC) — `{ "domain": "port4.dev" }`
+
+## Control Plane API (Developers)
+Authenticate with a Bearer API key (`Authorization: Bearer p4_live_...`):
+- `GET https://port4.dev/api/tenants` — List your endpoints and tools
+- `POST https://port4.dev/api/tenants` — Create a paid MCP endpoint
+- `POST https://port4.dev/api/tenants/:id/tools` — Add a paid tool to an endpoint
+- `GET https://port4.dev/api/ledger` — Fetch settled transactions and revenue summary

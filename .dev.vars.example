@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local development (never commit .dev.vars)
+JWT_SECRET=dev-local-port4-jwt-secret-change-in-prod-32bytes
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
