@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Plus, Trash2, Globe, Coins } from "lucide-react";
+import { Check, Coins, Copy, Globe, Play, Plus, Trash2 } from "lucide-react";
 
 export interface ToolItem {
   id: string;
@@ -46,6 +46,13 @@ export function EndpointForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [addingToolFor, setAddingToolFor] = useState<string | null>(null);
+  const [newToolName, setNewToolName] = useState("");
+  const [newToolPath, setNewToolPath] = useState("/v1/action");
+  const [newToolPrice, setNewToolPrice] = useState("0.002");
+  const [liveProbe, setLiveProbe] = useState<{ tenantId: string; output: string } | null>(null);
+
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -85,16 +92,80 @@ export function EndpointForm({
     }
   };
 
+  const handleAddTool = async (tenantId: string) => {
+    if (!newToolName.trim() || !newToolPath.trim()) return;
+    await fetch(`/api/tenants/${tenantId}/tools`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: newToolName.trim(),
+        description: `Paid MCP tool ${newToolName.trim()}`,
+        http_method: "POST",
+        upstream_path: newToolPath.trim(),
+        price_usd: newToolPrice.trim() || "0.001"
+      })
+    });
+    setNewToolName("");
+    setAddingToolFor(null);
+    await onRefresh();
+  };
+
   const handleDelete = async (id: string) => {
     await fetch(`/api/tenants/${id}`, { method: "DELETE" });
     await onRefresh();
+  };
+
+  const copyMcpConfig = (tenant: TenantItem) => {
+    const config = JSON.stringify(
+      {
+        mcpServers: {
+          [tenant.subdomain]: {
+            url: tenant.endpoint_url,
+            headers: {
+              "MCP-Protocol-Version": "2026-07-28"
+            }
+          }
+        }
+      },
+      null,
+      2
+    );
+    void navigator.clipboard.writeText(config);
+    setCopiedId(tenant.id);
+    setTimeout(() => setCopiedId(null), 1600);
+  };
+
+  const testToolsListLive = async (tenant: TenantItem) => {
+    setLiveProbe({ tenantId: tenant.id, output: "Calling POST /mcp (tools/list)..." });
+    try {
+      const res = await fetch("/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Port4-Tenant": tenant.subdomain,
+          "MCP-Protocol-Version": "2026-07-28",
+          "Mcp-Method": "tools/list"
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      });
+      const json = (await res.json()) as unknown;
+      setLiveProbe({
+        tenantId: tenant.id,
+        output: JSON.stringify(json, null, 2)
+      });
+    } catch (err) {
+      setLiveProbe({
+        tenantId: tenant.id,
+        output: err instanceof Error ? err.message : "Probe failed"
+      });
+    }
   };
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
       <form
         onSubmit={handleCreate}
-        className="lg:col-span-5 cf-card rounded-2xl p-5 flex flex-col gap-3.5"
+        className="lg:col-span-5 cf-card rounded-2xl p-5 flex flex-col gap-3.5 h-fit"
       >
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold text-zinc-900">New Paid Endpoint</h3>
@@ -192,7 +263,7 @@ export function EndpointForm({
       <div className="lg:col-span-7 flex flex-col gap-3">
         {tenants.length === 0 ? (
           <div className="cf-card rounded-2xl p-8 text-center font-mono text-xs text-zinc-500">
-            No endpoints yet. Create one to start monetizing calls.
+            No endpoints yet. Create one to get your live MCP URL and client config.
           </div>
         ) : (
           tenants.map((tenant) => (
@@ -209,19 +280,41 @@ export function EndpointForm({
                   <div className="font-mono text-xs text-zinc-600 mt-1">{tenant.endpoint_url}</div>
                 </div>
 
-                {tenant.subdomain !== "demo" && (
+                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
-                    onClick={() => handleDelete(tenant.id)}
-                    className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer"
-                    title="Delete endpoint"
+                    onClick={() => testToolsListLive(tenant)}
+                    className="inline-flex items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1 font-mono text-[11px] text-zinc-700 hover:border-[#F6821F] cursor-pointer"
                   >
-                    <Trash2 className="w-4 h-4" />
+                    <Play className="w-3 h-3 text-[#F6821F]" />
+                    Test MCP
                   </button>
-                )}
+                  <button
+                    type="button"
+                    onClick={() => copyMcpConfig(tenant)}
+                    className="inline-flex items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1 font-mono text-[11px] text-zinc-700 hover:border-[#F6821F] cursor-pointer"
+                  >
+                    {copiedId === tenant.id ? (
+                      <Check className="w-3 h-3 text-emerald-600" />
+                    ) : (
+                      <Copy className="w-3 h-3" />
+                    )}
+                    {copiedId === tenant.id ? "Copied" : "MCP JSON"}
+                  </button>
+                  {tenant.subdomain !== "demo" && (
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(tenant.id)}
+                      className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer"
+                      title="Delete endpoint"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
               </div>
 
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {tenant.tools.map((tool) => (
                   <div
                     key={tool.id}
@@ -234,7 +327,53 @@ export function EndpointForm({
                     </span>
                   </div>
                 ))}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setAddingToolFor(addingToolFor === tenant.id ? null : tenant.id)
+                  }
+                  className="inline-flex items-center gap-1 rounded-lg border border-dashed border-zinc-300 px-2.5 py-1.5 font-mono text-[11px] text-zinc-600 hover:border-[#F6821F] hover:text-[#C25906] cursor-pointer"
+                >
+                  <Plus className="w-3 h-3" />
+                  Add Tool
+                </button>
               </div>
+
+              {addingToolFor === tenant.id && (
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 pt-2 border-t border-zinc-200">
+                  <input
+                    value={newToolName}
+                    onChange={(e) => setNewToolName(e.target.value)}
+                    placeholder="tool_name"
+                    className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-1.5"
+                  />
+                  <input
+                    value={newToolPath}
+                    onChange={(e) => setNewToolPath(e.target.value)}
+                    placeholder="/v1/path"
+                    className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-1.5"
+                  />
+                  <input
+                    value={newToolPrice}
+                    onChange={(e) => setNewToolPrice(e.target.value)}
+                    placeholder="0.002"
+                    className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-1.5"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleAddTool(tenant.id)}
+                    className="cf-btn-primary rounded-lg text-xs py-1.5 cursor-pointer"
+                  >
+                    Save Tool
+                  </button>
+                </div>
+              )}
+
+              {liveProbe && liveProbe.tenantId === tenant.id && (
+                <pre className="font-mono text-[11px] bg-[#18181B] text-zinc-200 rounded-xl p-3 overflow-x-auto max-h-48">
+                  {liveProbe.output}
+                </pre>
+              )}
             </div>
           ))
         )}

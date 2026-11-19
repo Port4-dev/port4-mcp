@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  ArrowLeft,
   ArrowRight,
   Check,
+  Compass,
   Copy,
   Github,
   KeyRound,
@@ -16,10 +18,11 @@ import { RevenueTable, type LedgerTransaction } from "./components/RevenueTable"
 import { Docs, type FeaturedTenant } from "./components/Docs";
 import { AdminDashboard } from "./components/AdminDashboard";
 
-type PageView = "home" | "docs" | "dashboard" | "admin";
+type PageView = "home" | "docs" | "dashboard" | "admin" | "notfound";
 type DashboardTab = "endpoints" | "ledger" | "deploy";
 
 interface AuthState {
+  loaded: boolean;
   authenticated: boolean;
   githubConfigured: boolean;
   user: {
@@ -33,13 +36,14 @@ interface AuthState {
 
 function viewFromPath(pathname: string): PageView {
   const clean = pathname.replace(/\/+$/, "") || "/";
+  if (clean === "/") return "home";
   if (clean === "/docs" || clean === "/sandbox") return "docs";
   if (clean === "/dashboard" || clean === "/console") return "dashboard";
   if (clean === "/admin") return "admin";
-  return "home";
+  return "notfound";
 }
 
-function pathFromView(view: PageView): string {
+function pathFromView(view: Exclude<PageView, "notfound">): string {
   if (view === "docs") return "/docs";
   if (view === "dashboard") return "/dashboard";
   if (view === "admin") return "/admin";
@@ -48,8 +52,10 @@ function pathFromView(view: PageView): string {
 
 export default function App() {
   const [view, setView] = useState<PageView>(() => viewFromPath(window.location.pathname));
+  const [currentPath, setCurrentPath] = useState<string>(() => window.location.pathname);
   const [tab, setTab] = useState<DashboardTab>("endpoints");
   const [auth, setAuth] = useState<AuthState>({
+    loaded: false,
     authenticated: false,
     githubConfigured: false,
     user: null
@@ -61,9 +67,10 @@ export default function App() {
   const [newApiKey, setNewApiKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  const navigate = useCallback((next: PageView) => {
+  const navigate = useCallback((next: Exclude<PageView, "notfound">) => {
     setView(next);
     const targetPath = pathFromView(next);
+    setCurrentPath(targetPath);
     if (window.location.pathname !== targetPath) {
       window.history.pushState({}, "", targetPath);
     }
@@ -71,7 +78,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const onPopState = () => setView(viewFromPath(window.location.pathname));
+    const onPopState = () => {
+      setCurrentPath(window.location.pathname);
+      setView(viewFromPath(window.location.pathname));
+    };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
@@ -81,15 +91,15 @@ export default function App() {
       fetch("/api/auth/me"),
       fetch("/api/public/featured")
     ]);
-    const meData = (await meRes.json()) as AuthState;
-    setAuth(meData);
+    const meJson = (await meRes.json()) as Omit<AuthState, "loaded">;
+    setAuth({ ...meJson, loaded: true });
 
     if (featRes.ok) {
       const fJson = (await featRes.json()) as { featured: FeaturedTenant[] };
       setFeatured(fJson.featured);
     }
 
-    if (meData.authenticated) {
+    if (meJson.authenticated) {
       const [tRes, lRes] = await Promise.all([fetch("/api/tenants"), fetch("/api/ledger")]);
       if (tRes.ok) {
         const tJson = (await tRes.json()) as { tenants: TenantItem[] };
@@ -205,8 +215,17 @@ export default function App() {
           <div className="flex items-center gap-2">
             {auth.authenticated && auth.user ? (
               <>
-                <span className="hidden sm:inline font-mono text-xs text-zinc-600">
+                <span className="hidden sm:inline-flex items-center gap-1.5 font-mono text-[11px] px-2.5 py-1 rounded-lg bg-zinc-100 border border-zinc-200 text-zinc-700">
                   @{auth.user.login}
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                      isAdmin
+                        ? "bg-[#F6821F]/15 text-[#C25906]"
+                        : "bg-zinc-200/80 text-zinc-700"
+                    }`}
+                  >
+                    {isAdmin ? "Admin" : auth.user.plan === "pro" ? "Pro" : "Dev"}
+                  </span>
                 </span>
                 <button
                   type="button"
@@ -242,7 +261,7 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-5xl w-full mx-auto px-5 py-12 md:py-16">
-        {/* Clean, Unpopulated Landing Page — Zero Technical Clutter */}
+        {/* Clean, Unpopulated Landing Page */}
         {view === "home" && (
           <div className="flex flex-col items-center text-center gap-14 py-6">
             <div className="max-w-2xl flex flex-col items-center gap-5">
@@ -304,31 +323,45 @@ export default function App() {
           </div>
         )}
 
-        {/* All Technical Docs, Sandbox, Code Snippets, and Featured Registry */}
+        {/* Technical Docs, Live Sandbox, Practical MCP Configs */}
         {view === "docs" && <Docs featured={featured} onSettled={loadData} />}
 
-        {/* Developer Dashboard */}
+        {/* Developer Dashboard with Clear RBAC Status Bar */}
         {view === "dashboard" && (
           <div className="flex flex-col gap-5">
-            <div className="flex items-center gap-2 border-b border-zinc-200 pb-3">
-              <TabButton
-                active={tab === "endpoints"}
-                onClick={() => setTab("endpoints")}
-                icon={<Layers className="w-3.5 h-3.5" />}
-                label="Endpoints"
-              />
-              <TabButton
-                active={tab === "ledger"}
-                onClick={() => setTab("ledger")}
-                icon={<ReceiptText className="w-3.5 h-3.5" />}
-                label="Ledger"
-              />
-              <TabButton
-                active={tab === "deploy"}
-                onClick={() => setTab("deploy")}
-                icon={<TerminalSquare className="w-3.5 h-3.5" />}
-                label="Deploy"
-              />
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 pb-3">
+              <div className="flex items-center gap-2">
+                <TabButton
+                  active={tab === "endpoints"}
+                  onClick={() => setTab("endpoints")}
+                  icon={<Layers className="w-3.5 h-3.5" />}
+                  label="Endpoints"
+                />
+                <TabButton
+                  active={tab === "ledger"}
+                  onClick={() => setTab("ledger")}
+                  icon={<ReceiptText className="w-3.5 h-3.5" />}
+                  label="Ledger"
+                />
+                <TabButton
+                  active={tab === "deploy"}
+                  onClick={() => setTab("deploy")}
+                  icon={<TerminalSquare className="w-3.5 h-3.5" />}
+                  label="Deploy"
+                />
+              </div>
+
+              {auth.authenticated && auth.user && (
+                <div className="flex items-center gap-2 font-mono text-[11px] text-zinc-600">
+                  <span>Role:</span>
+                  <span className="px-2 py-0.5 rounded bg-zinc-100 border border-zinc-200 text-zinc-900 font-medium">
+                    {isAdmin ? "Super Admin" : "Developer"}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-[#F6821F]/10 border border-[#F6821F]/25 text-[#C25906]">
+                    {auth.user.plan === "pro" ? "Pro · 1% fee" : "Free · 3% fee"}
+                  </span>
+                </div>
+              )}
             </div>
 
             {tab === "endpoints" && (
@@ -384,8 +417,58 @@ export default function App() {
           </div>
         )}
 
-        {/* Super-Admin Control Center */}
-        {view === "admin" && <AdminDashboard />}
+        {/* Super-Admin RBAC Control Center */}
+        {view === "admin" && (
+          <AdminDashboard
+            authLoaded={auth.loaded}
+            authenticated={auth.authenticated}
+            githubConfigured={auth.githubConfigured}
+            user={auth.user}
+            onGoDashboard={() => navigate("dashboard")}
+          />
+        )}
+
+        {/* Clean 404 Page: "Lost on Port5" */}
+        {view === "notfound" && (
+          <div className="max-w-lg mx-auto cf-card rounded-2xl p-10 flex flex-col items-center text-center gap-4 my-8">
+            <div className="p-3 rounded-xl bg-[#F6821F]/10 border border-[#F6821F]/25">
+              <Compass className="w-6 h-6 text-[#F6821F]" />
+            </div>
+            <span className="font-mono text-xs font-semibold text-[#C25906] bg-[#F6821F]/10 border border-[#F6821F]/25 px-2.5 py-0.5 rounded-full">
+              404
+            </span>
+            <h1 className="text-3xl font-bold tracking-tight text-zinc-900">Lost on Port5</h1>
+            <p className="text-sm text-zinc-600">
+              This page doesn&apos;t exist.{" "}
+              <code className="font-mono text-xs bg-zinc-100 border border-zinc-200 px-1.5 py-0.5 rounded text-zinc-700">
+                {currentPath}
+              </code>
+            </p>
+            <div className="flex items-center gap-3 pt-2">
+              <a
+                href="/"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigate("home");
+                }}
+                className="cf-btn-primary inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-xs"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                Back to Port4
+              </a>
+              <a
+                href="/docs"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigate("docs");
+                }}
+                className="inline-flex items-center gap-2 rounded-xl border border-zinc-300 bg-white px-5 py-2.5 text-xs font-medium text-zinc-800 hover:border-[#F6821F]"
+              >
+                Read Docs
+              </a>
+            </div>
+          </div>
+        )}
       </main>
 
       <footer className="border-t border-zinc-200 py-6 bg-white/60">

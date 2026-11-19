@@ -159,6 +159,16 @@ app.route("/api/auth", authRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api", apiRoutes);
 
+app.all("/api/*", (c) =>
+  c.json(
+    {
+      error: "not_found",
+      message: "Lost on Port5 — this API endpoint doesn't exist."
+    },
+    404
+  )
+);
+
 // Root Domain Fallback: Workers Static Assets SPA
 app.all("*", async (c) => {
   const subdomain = extractTenantSubdomain(c);

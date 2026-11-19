@@ -54,64 +54,57 @@ export function Docs({
         <span className="font-mono text-xs font-medium text-[#C25906] bg-[#F6821F]/10 border border-[#F6821F]/25 px-2.5 py-1 rounded-full">
           Developer Docs
         </span>
-        <h1 className="text-3xl font-bold tracking-tight text-zinc-900 mt-3">Using Port4</h1>
+        <h1 className="text-3xl font-bold tracking-tight text-zinc-900 mt-3">
+          Practical Guide to Paid MCP
+        </h1>
         <p className="text-sm text-zinc-600 mt-2">
-          Everything you need to test, integrate, and publish pay-per-call MCP endpoints.
+          Connect any existing REST API, publish a live MCP endpoint, and call it from Cursor,
+          Claude Desktop, or any autonomous TypeScript agent.
         </p>
       </div>
 
-      {/* Live 1-Click Sandbox (moved here from Landing) */}
-      <Sandbox onSettled={onSettled} />
+      {/* Live 1-Click Sandbox */}
+      <div className="flex flex-col gap-2">
+        <Sandbox onSettled={onSettled} />
+        <p className="font-mono text-[11px] text-zinc-500">
+          Note: The 1-Click Sandbox tests the live HTTP 402 → Sign → 200 OK wire flow using the
+          built-in demo tenant without requiring a funded wallet. Production tenants settle real
+          USDC authorizations via <code className="text-zinc-700">https://x402.org/facilitator</code>.
+        </p>
+      </div>
 
       <div className="flex flex-col gap-8 max-w-3xl">
-        {/* 1. Endpoint & Headers */}
+        {/* 1. Practical: Connect to Cursor / Claude Desktop */}
         <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold text-zinc-900">1. Endpoint & Required Headers</h2>
+          <h2 className="text-lg font-semibold text-zinc-900">
+            1. Connect to Cursor, Windsurf, or Claude Desktop
+          </h2>
           <p className="text-sm text-zinc-600">
-            Send stateless JSON-RPC 2.0 <code className="font-mono text-xs">POST</code> requests to{" "}
-            <code className="font-mono text-xs bg-zinc-100 border border-zinc-200 px-1.5 py-0.5 rounded text-zinc-800">
-              https://{"{tenant}"}.port4.dev/mcp
-            </code>
-            :
+            Add any Port4 endpoint to your MCP client config (or click{" "}
+            <code className="font-mono text-xs bg-zinc-100 border border-zinc-200 px-1.5 py-0.5 rounded">
+              MCP JSON
+            </code>{" "}
+            on any endpoint in your Dashboard):
           </p>
-          <div className="cf-card rounded-xl overflow-hidden">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-zinc-200 bg-zinc-50 font-mono text-[11px] text-zinc-500">
-                  <th className="py-2.5 px-4">Header</th>
-                  <th className="py-2.5 px-4">Value</th>
-                  <th className="py-2.5 px-4">When</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-zinc-200 font-mono">
-                <tr>
-                  <td className="py-2.5 px-4 text-zinc-900">MCP-Protocol-Version</td>
-                  <td className="py-2.5 px-4 text-[#C25906]">2026-07-28</td>
-                  <td className="py-2.5 px-4 text-zinc-600 font-sans">Always</td>
-                </tr>
-                <tr>
-                  <td className="py-2.5 px-4 text-zinc-900">Mcp-Method</td>
-                  <td className="py-2.5 px-4 text-[#C25906]">tools/list | tools/call</td>
-                  <td className="py-2.5 px-4 text-zinc-600 font-sans">Matches JSON-RPC method</td>
-                </tr>
-                <tr>
-                  <td className="py-2.5 px-4 text-zinc-900">Mcp-Name</td>
-                  <td className="py-2.5 px-4 text-[#C25906]">&lt;tool_name&gt;</td>
-                  <td className="py-2.5 px-4 text-zinc-600 font-sans">On tools/call</td>
-                </tr>
-                <tr>
-                  <td className="py-2.5 px-4 text-zinc-900">PAYMENT-SIGNATURE</td>
-                  <td className="py-2.5 px-4 text-[#C25906]">Base64 x402 payload</td>
-                  <td className="py-2.5 px-4 text-zinc-600 font-sans">On paid tools/call</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+          <CodeBlock
+            id="mcp-config"
+            title="mcp.json — Cursor / Claude Desktop"
+            code={`{
+  "mcpServers": {
+    "port4-demo": {
+      "url": "https://demo.port4.dev/mcp",
+      "headers": {
+        "MCP-Protocol-Version": "2026-07-28"
+      }
+    }
+  }
+}`}
+          />
         </section>
 
         {/* 2. Discover Tools */}
         <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold text-zinc-900">2. Discover Tools (Free)</h2>
+          <h2 className="text-lg font-semibold text-zinc-900">2. Discover Available Tools (Free)</h2>
           <CodeBlock
             id="list"
             title="cURL — tools/list"
@@ -123,12 +116,21 @@ export function Docs({
           />
         </section>
 
-        {/* 3. Call Paid Tool */}
+        {/* 3. Call Paid Tool from an Agent */}
         <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold text-zinc-900">3. Call a Paid Tool (@x402/fetch)</h2>
+          <h2 className="text-lg font-semibold text-zinc-900">
+            3. Pay & Call from an AI Agent (Real USDC via @x402/fetch)
+          </h2>
+          <p className="text-sm text-zinc-600">
+            Install <code className="font-mono text-xs">@x402/fetch</code>,{" "}
+            <code className="font-mono text-xs">@x402/evm</code>, and{" "}
+            <code className="font-mono text-xs">viem</code>. The wrapper automatically handles the{" "}
+            <code className="font-mono text-xs">402 Payment Required</code> challenge, signs the
+            exact USDC authorization, and retries:
+          </p>
           <CodeBlock
             id="ts-client"
-            title="TypeScript"
+            title="TypeScript — Real Paid MCP Call"
             code={`import { wrapFetchWithPaymentFromConfig } from "@x402/fetch";
 import { ExactEvmScheme } from "@x402/evm";
 import { privateKeyToAccount } from "viem/accounts";
@@ -159,9 +161,11 @@ console.log(await res.json());`}
           />
         </section>
 
-        {/* 4. Create Endpoints via API */}
+        {/* 4. Publish Your Own API */}
         <section className="flex flex-col gap-3">
-          <h2 className="text-lg font-semibold text-zinc-900">4. Create Endpoints via API</h2>
+          <h2 className="text-lg font-semibold text-zinc-900">
+            4. Publish Your Own REST API Programmatically
+          </h2>
           <CodeBlock
             id="api-create"
             title="cURL — POST /api/tenants"
