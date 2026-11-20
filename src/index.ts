@@ -14,9 +14,19 @@ import { sandboxRoutes } from "./routes/sandbox";
 const app = new Hono<AppEnv>();
 
 app.use(
-  "*",
+  "/api/*",
   cors({
-    origin: (origin) => origin || "*",
+    origin: (origin) => origin || "https://port4.dev",
+    allowHeaders: ["Content-Type", "Authorization"],
+    allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    credentials: true
+  })
+);
+
+app.use(
+  "/mcp*",
+  cors({
+    origin: "*",
     allowHeaders: [
       "Content-Type",
       "Authorization",
@@ -33,8 +43,31 @@ app.use(
       "X-Port4-Settlement-Tx",
       "MCP-Protocol-Version"
     ],
-    allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    credentials: true
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    credentials: false
+  })
+);
+
+app.use(
+  "/sandbox/*",
+  cors({
+    origin: "*",
+    allowHeaders: [
+      "Content-Type",
+      "MCP-Protocol-Version",
+      "Mcp-Method",
+      "Mcp-Name",
+      "PAYMENT-SIGNATURE"
+    ],
+    exposeHeaders: [
+      "PAYMENT-REQUIRED",
+      "PAYMENT-RESPONSE",
+      "X-Port4-Tenant",
+      "X-Port4-Settlement-Tx",
+      "MCP-Protocol-Version"
+    ],
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    credentials: false
   })
 );
 
@@ -122,10 +155,33 @@ const healthHandler = (c: Context<AppEnv>) =>
 app.get("/health", healthHandler);
 app.get("/api/health", healthHandler);
 
-// Data Plane: Stateless Paid MCP Endpoint
+// Data Plane: Stateless Paid MCP Endpoint (subdomain OR /mcp/:tenant path fallback)
 app.post(
   "/mcp",
   resolveTenantMiddleware(),
+  mcpHeadersMiddleware,
+  x402GateMiddleware,
+  handleMcpRequest
+);
+
+app.post(
+  "/mcp/:tenant",
+  async (c, next) => {
+    const slug = c.req.param("tenant").trim().toLowerCase();
+    const tenant = await resolveTenant(c.env, slug);
+    if (!tenant) {
+      return c.json(
+        {
+          error: "tenant_not_found_or_suspended",
+          message: `No active Port4 gateway found for '${slug}'.`
+        },
+        404
+      );
+    }
+    c.set("tenantSubdomain", slug);
+    c.set("tenant", tenant);
+    await next();
+  },
   mcpHeadersMiddleware,
   x402GateMiddleware,
   handleMcpRequest

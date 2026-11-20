@@ -136,13 +136,12 @@ export function EndpointForm({
   };
 
   const testToolsListLive = async (tenant: TenantItem) => {
-    setLiveProbe({ tenantId: tenant.id, output: "Calling POST /mcp (tools/list)..." });
+    setLiveProbe({ tenantId: tenant.id, output: `Calling POST /mcp/${tenant.subdomain} (tools/list)...` });
     try {
-      const res = await fetch("/mcp", {
+      const res = await fetch(`/mcp/${encodeURIComponent(tenant.subdomain)}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Port4-Tenant": tenant.subdomain,
           "MCP-Protocol-Version": "2026-07-28",
           "Mcp-Method": "tools/list"
         },
