@@ -48,8 +48,8 @@
 	],
 	"routes": [
 		{
-			"pattern": "port4.dev/*",
-			"zone_name": "port4.dev"
+			"pattern": "port4.dev",
+			"custom_domain": true
 		},
 		{
 			"pattern": "*.port4.dev/*",
