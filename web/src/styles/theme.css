@@ -14,15 +14,24 @@
 @layer base {
   html,
   body {
-    font-family: "Roboto", -apple-system, BlinkMacSystemFont, sans-serif;
+    font-family: "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     background-color: var(--cf-bg);
     color: var(--cf-ink);
+    overflow-x: clip;
+    -webkit-text-size-adjust: 100%;
   }
 
   code,
   pre,
   .font-mono {
     font-family: "Roboto Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  a,
+  button,
+  input,
+  select {
+    touch-action: manipulation;
   }
 }
 

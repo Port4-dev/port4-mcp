@@ -43,9 +43,9 @@ export function RevenueTable({ transactions, summary }: RevenueTableProps) {
         />
       </div>
 
-      <div className="cf-card rounded-2xl overflow-hidden">
+      <div className="cf-card rounded-2xl overflow-hidden min-w-0">
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
+          <table className="w-full text-left border-collapse whitespace-nowrap">
             <thead>
               <tr className="border-b border-zinc-200 bg-zinc-50 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
                 <th className="py-3 px-4">Tool</th>

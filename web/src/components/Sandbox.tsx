@@ -75,24 +75,24 @@ export function Sandbox({ onSettled }: SandboxProps) {
   const running = phase === "running";
 
   return (
-    <section className="cf-card rounded-2xl p-5 md:p-6">
-      <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-zinc-200">
-        <div className="flex items-center gap-2.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-[#F6821F]" />
+    <section className="cf-card rounded-2xl p-4 sm:p-6 min-w-0">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-zinc-200">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <span className="h-2.5 w-2.5 rounded-full bg-[#F6821F] shrink-0" />
           <span className="font-mono text-xs font-medium uppercase tracking-wider text-zinc-900">
             Interactive Sandbox
           </span>
-          <span className="font-mono text-xs text-zinc-500 bg-zinc-100 border border-zinc-200 px-2 py-0.5 rounded">
+          <span className="font-mono text-[11px] text-zinc-500 bg-zinc-100 border border-zinc-200 px-2 py-0.5 rounded truncate max-w-full">
             demo.port4.dev/mcp
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
           <select
             aria-label="Sandbox tool"
             value={tool}
             onChange={(e) => setTool(e.target.value as "ping" | "market_quote" | "edge_dns_lookup")}
-            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-1.5 text-zinc-800 focus:outline-none focus:border-[#F6821F]"
+            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-3 min-h-[44px] sm:min-h-[36px] text-zinc-800 focus:outline-none focus:border-[#F6821F] w-full sm:w-auto"
           >
             <option value="market_quote">market_quote ($0.001)</option>
             <option value="ping">ping ($0.001)</option>
@@ -103,7 +103,7 @@ export function Sandbox({ onSettled }: SandboxProps) {
             type="button"
             onClick={runSandbox}
             disabled={running}
-            className="cf-btn-primary inline-flex items-center gap-2 rounded-lg px-4 py-1.5 text-xs cursor-pointer disabled:opacity-60"
+            className="cf-btn-primary inline-flex items-center justify-center gap-2 rounded-lg px-4 min-h-[44px] sm:min-h-[36px] text-xs cursor-pointer disabled:opacity-60 w-full sm:w-auto"
           >
             {running ? (
               <RefreshCw className="w-3.5 h-3.5 animate-spin" />
@@ -115,7 +115,7 @@ export function Sandbox({ onSettled }: SandboxProps) {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5 my-4">
+      <div className="grid grid-cols-1 xs:grid-cols-2 sm:grid-cols-2 md:grid-cols-4 gap-2.5 my-4">
         <Stage icon={<Terminal className="w-3.5 h-3.5" />} label="1. POST /mcp" sub={tool} done={running || active} tone="orange" />
         <Stage icon={<ShieldAlert className="w-3.5 h-3.5" />} label="2. 402 Required" sub={data ? data.amountUsd + " USDC" : "PAYMENT-REQUIRED"} done={active} tone="amber" />
         <Stage icon={<KeyRound className="w-3.5 h-3.5" />} label="3. Sign USDC" sub="Base Sepolia" done={active} tone="orange" />

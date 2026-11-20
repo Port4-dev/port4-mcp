@@ -263,24 +263,24 @@ export function AdminDashboard({
         <Kpi icon={<Coins className="w-4 h-4 text-emerald-600" />} label="Net Revenue" value={`$${stats?.net_platform_revenue ?? "0.0000"}`} />
       </div>
 
-      <section className="cf-card rounded-2xl overflow-hidden">
-        <div className="p-4 border-b border-zinc-200 flex flex-wrap items-center justify-between gap-3">
+      <section className="cf-card rounded-2xl overflow-hidden min-w-0">
+        <div className="p-4 border-b border-zinc-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <h2 className="text-sm font-semibold text-zinc-900">Tenant Governance</h2>
-          <div className="flex items-center gap-2">
-            <div className="relative">
-              <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-2.5" />
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
+            <div className="relative flex-1 sm:flex-initial">
+              <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-3.5 sm:top-2.5" />
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Search slug or owner..."
-                className="font-mono text-xs bg-white border border-zinc-300 rounded-lg pl-8 pr-3 py-1.5 text-zinc-900 focus:outline-none focus:border-[#F6821F]"
+                className="font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg pl-8 pr-3 min-h-[44px] sm:min-h-[34px] w-full text-zinc-900 focus:outline-none focus:border-[#F6821F]"
               />
             </div>
             <select
               aria-label="Filter status"
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value as "" | "active" | "suspended")}
-              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 py-1.5 text-zinc-800"
+              className="font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[44px] sm:min-h-[34px] text-zinc-800"
             >
               <option value="">All</option>
               <option value="active">Active</option>
@@ -290,7 +290,7 @@ export function AdminDashboard({
         </div>
 
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse font-mono text-xs">
+          <table className="w-full text-left border-collapse font-mono text-xs whitespace-nowrap">
             <thead>
               <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] uppercase text-zinc-500">
                 <th className="py-2.5 px-4">Slug</th>
