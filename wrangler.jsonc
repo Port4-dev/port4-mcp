@@ -71,9 +71,10 @@
 			}
 		]
 	},
-	"analytics_engine_datasets": [
-		{ "binding": "GATEWAY_ANALYTICS", "dataset": "port4_gateway_events" }
-	],
+	// Enable Analytics Engine in Cloudflare Dashboard (Workers -> Analytics Engine) then uncomment:
+	// "analytics_engine_datasets": [
+	// 	{ "binding": "GATEWAY_ANALYTICS", "dataset": "port4_gateway_events" }
+	// ],
 	"routes": [
 		{
 			"pattern": "port4.dev",

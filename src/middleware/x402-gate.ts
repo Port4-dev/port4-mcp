@@ -59,18 +59,28 @@ export function computeFeeSplit(
   };
 }
 
+const USDC_ASSETS_BY_NETWORK: Record<string, string> = {
+  "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // Base Mainnet USDC
+  "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" // Base Sepolia USDC
+};
+
+export function resolveUsdcAsset(network: string, fallback: string): string {
+  return USDC_ASSETS_BY_NETWORK[network] ?? fallback;
+}
+
 export function buildPaymentRequired(
   c: Context<AppEnv>,
   tenant: TenantRoutingRecord,
   tool: ToolRecord
 ): { paymentRequired: X402PaymentRequired; isPlatformFee: boolean } {
   const { payTo, isPlatformFee } = computeFeeSplit(c.env, tenant, c.get("rateLimitSequence"));
+  const network = tenant.network || c.env.X402_NETWORK;
 
   const requirement: X402PaymentRequirement = {
     scheme: "exact",
-    network: tenant.network || c.env.X402_NETWORK,
+    network,
     amount: tool.price_atomic,
-    asset: c.env.X402_USDC_ASSET,
+    asset: resolveUsdcAsset(network, c.env.X402_USDC_ASSET),
     payTo,
     maxTimeoutSeconds: 60,
     extra: {

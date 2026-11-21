@@ -3,6 +3,37 @@ import type { AppEnv, MeteringEvent } from "../types";
 import { executeInternalSandboxTool } from "./sandbox";
 import { hmacSha256Hex, sha256Hex } from "../lib/crypto";
 import { writeGatewayAnalytics } from "../lib/metering";
+import { resolveUsdcAsset } from "../middleware/x402-gate";
+
+export function interpolateUpstreamPath(
+  pathTemplate: string,
+  args: Record<string, unknown>
+): { resolvedPath: string; remainingArgs: Record<string, unknown> } {
+  const usedKeys = new Set<string>();
+  const resolvedPath = pathTemplate
+    .replace(/\{([a-zA-Z0-9_]+)\}/g, (match, key: string) => {
+      if (args[key] !== undefined && args[key] !== null) {
+        usedKeys.add(key);
+        return encodeURIComponent(String(args[key]));
+      }
+      return match;
+    })
+    .replace(/:([a-zA-Z0-9_]+)/g, (match, key: string) => {
+      if (args[key] !== undefined && args[key] !== null) {
+        usedKeys.add(key);
+        return encodeURIComponent(String(args[key]));
+      }
+      return match;
+    });
+
+  const remainingArgs: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (!usedKeys.has(k)) {
+      remainingArgs[k] = v;
+    }
+  }
+  return { resolvedPath, remainingArgs };
+}
 
 const MAX_UPSTREAM_BYTES = 256 * 1024; // 256 KB safety cap to protect 128 MB isolate memory
 
@@ -66,7 +97,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
         x402: {
           scheme: "exact",
           network: tenant.network,
-          asset: c.env.X402_USDC_ASSET,
+          asset: resolveUsdcAsset(tenant.network, c.env.X402_USDC_ASSET),
           priceUsd: `$${tool.price_usd}`,
           amountAtomic: tool.price_atomic,
           payTo: tenant.payout_wallet
@@ -103,30 +134,38 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     }
 
     const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "LOCAL";
+    const requestId = `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const idempotencyKey = c.get("paymentFingerprint") ?? receipt.transaction;
     let upstreamResult: unknown;
 
     if (tenant.upstream_base_url === "internal://sandbox") {
       upstreamResult = executeInternalSandboxTool(tool.name, mcp.arguments, colo);
     } else {
-      const targetUrl = new URL(tool.upstream_path, `${tenant.upstream_base_url}/`);
+      const { resolvedPath, remainingArgs } = interpolateUpstreamPath(
+        tool.upstream_path,
+        mcp.arguments
+      );
+      const targetUrl = new URL(resolvedPath, `${tenant.upstream_base_url}/`);
 
       const upstreamHeaders: Record<string, string> = {
         "Content-Type": "application/json",
         "X-Port4-Tenant": tenant.subdomain,
         "X-Port4-Tool": tool.name,
         "X-Port4-Payer": receipt.payer,
-        "X-Port4-Tx": receipt.transaction
+        "X-Port4-Tx": receipt.transaction,
+        "X-Port4-Request-Id": requestId,
+        "Idempotency-Key": idempotencyKey
       };
 
       let serializedBody = "";
-      if (tool.http_method === "GET") {
-        for (const [k, v] of Object.entries(mcp.arguments)) {
+      if (tool.http_method === "GET" || tool.http_method === "DELETE") {
+        for (const [k, v] of Object.entries(remainingArgs)) {
           if (v !== undefined && v !== null) {
             targetUrl.searchParams.set(k, String(v));
           }
         }
       } else {
-        serializedBody = JSON.stringify(mcp.arguments);
+        serializedBody = JSON.stringify(remainingArgs);
       }
 
       // Cryptographically sign outgoing upstream request so tenant origins can verify Port4 authenticity
@@ -142,7 +181,9 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       const fetchInit: RequestInit = {
         method: tool.http_method,
         headers: upstreamHeaders,
-        ...(tool.http_method === "GET" ? {} : { body: serializedBody })
+        ...(tool.http_method === "GET" || tool.http_method === "DELETE"
+          ? {}
+          : { body: serializedBody })
       };
 
       try {

@@ -5,6 +5,7 @@ export interface AppBindings extends CloudflareBindings {
   PORT4_TREASURY_WALLET?: string;
   DEMO_PAYER_PRIVATE_KEY?: string;
   DEMO_AUTH_ENABLED?: string;
+  GATEWAY_ANALYTICS?: AnalyticsEngineDataset;
   LEDGER_ARCHIVE?: R2Bucket;
   MCP_RATE_LIMIT_PER_MINUTE?: string;
 }
