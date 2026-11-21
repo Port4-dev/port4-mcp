@@ -1,6 +1,8 @@
 import type { Context } from "hono";
-import type { AppEnv } from "../types";
+import type { AppEnv, MeteringEvent } from "../types";
 import { executeInternalSandboxTool } from "./sandbox";
+import { hmacSha256Hex, sha256Hex } from "../lib/crypto";
+import { writeGatewayAnalytics } from "../lib/metering";
 
 const MAX_UPSTREAM_BYTES = 256 * 1024; // 256 KB safety cap to protect 128 MB isolate memory
 
@@ -108,17 +110,15 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     } else {
       const targetUrl = new URL(tool.upstream_path, `${tenant.upstream_base_url}/`);
 
-      const fetchInit: RequestInit = {
-        method: tool.http_method,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Port4-Tenant": tenant.subdomain,
-          "X-Port4-Tool": tool.name,
-          "X-Port4-Payer": receipt.payer,
-          "X-Port4-Tx": receipt.transaction
-        }
+      const upstreamHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        "X-Port4-Tenant": tenant.subdomain,
+        "X-Port4-Tool": tool.name,
+        "X-Port4-Payer": receipt.payer,
+        "X-Port4-Tx": receipt.transaction
       };
 
+      let serializedBody = "";
       if (tool.http_method === "GET") {
         for (const [k, v] of Object.entries(mcp.arguments)) {
           if (v !== undefined && v !== null) {
@@ -126,8 +126,24 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
           }
         }
       } else {
-        fetchInit.body = JSON.stringify(mcp.arguments);
+        serializedBody = JSON.stringify(mcp.arguments);
       }
+
+      // Cryptographically sign outgoing upstream request so tenant origins can verify Port4 authenticity
+      if (tenant.upstream_signing_secret) {
+        const timestamp = String(Math.floor(Date.now() / 1000));
+        const bodyHash = await sha256Hex(serializedBody);
+        const signatureInput = `${timestamp}.${tenant.subdomain}.${tool.name}.${receipt.transaction}.${bodyHash}`;
+        const sig = await hmacSha256Hex(tenant.upstream_signing_secret, signatureInput);
+        upstreamHeaders["X-Port4-Timestamp"] = timestamp;
+        upstreamHeaders["X-Port4-Signature"] = `v1=${sig}`;
+      }
+
+      const fetchInit: RequestInit = {
+        method: tool.http_method,
+        headers: upstreamHeaders,
+        ...(tool.http_method === "GET" ? {} : { body: serializedBody })
+      };
 
       try {
         const upstreamRes = await fetch(targetUrl.toString(), {
@@ -180,33 +196,78 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     const txId = `tx_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const status = receipt.mode === "sandbox" ? "sandbox_settled" : "settled";
 
-    const isPlatformFeeInt = receipt.isPlatformFee ? 1 : 0;
+    const responsePayload = {
+      jsonrpc: "2.0" as const,
+      id: mcp.rpcId,
+      result: {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(upstreamResult, null, 2)
+          }
+        ],
+        isError: false,
+        _meta: {
+          x402: {
+            txHash: receipt.transaction,
+            network: receipt.network,
+            payer: receipt.payer,
+            amountUsd: `$${tool.price_usd}`,
+            latencyMs,
+            mode: receipt.mode
+          }
+        }
+      }
+    };
 
-    // Log settlement & increment call counter in D1 without blocking edge response latency
-    c.executionCtx.waitUntil(
-      c.env.DB.batch([
-        c.env.DB.prepare(
-          `INSERT INTO transactions
-           (id, tenant_id, tool_name, payer_wallet, amount_atomic, amount_usd, network, tx_hash, status, latency_ms, is_platform_fee)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          txId,
-          tenant.id,
-          tool.name,
-          receipt.payer,
-          tool.price_atomic,
-          tool.price_usd,
-          receipt.network,
-          receipt.transaction,
-          status,
-          latencyMs,
-          isPlatformFeeInt
-        ),
-        c.env.DB.prepare("UPDATE tenants SET call_count = call_count + 1 WHERE id = ?").bind(
-          tenant.id
-        )
-      ])
-    );
+    const serializedResponse = JSON.stringify(responsePayload);
+
+    // 1. Zero-D1 hot path: write to Analytics Engine + enqueue batched rollup/R2 archival
+    const meteringEvent: MeteringEvent = {
+      id: txId,
+      tenantId: tenant.id,
+      tenantSubdomain: tenant.subdomain,
+      toolName: tool.name,
+      payerWallet: receipt.payer,
+      amountAtomic: tool.price_atomic,
+      amountUsd: tool.price_usd,
+      network: receipt.network,
+      txHash: receipt.transaction,
+      latencyMs,
+      status,
+      isPlatformFee: receipt.isPlatformFee,
+      occurredAt: new Date().toISOString()
+    };
+
+    writeGatewayAnalytics(c.env, meteringEvent);
+
+    const backgroundTasks: Promise<unknown>[] = [];
+    if (c.env.METERING_EVENTS) {
+      backgroundTasks.push(c.env.METERING_EVENTS.send(meteringEvent));
+    }
+
+    // 2. Durably cache completed response in PaymentReplayGuard DO for idempotent retries
+    const paymentFingerprint = c.get("paymentFingerprint");
+    if (paymentFingerprint) {
+      const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
+        c.env.PAYMENT_REPLAY_GUARD.idFromName(paymentFingerprint)
+      );
+      backgroundTasks.push(
+        replayStub.fetch("https://payment-replay/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            operation: "complete",
+            receipt,
+            responseBody: serializedResponse
+          })
+        })
+      );
+    }
+
+    if (backgroundTasks.length > 0) {
+      c.executionCtx.waitUntil(Promise.allSettled(backgroundTasks));
+    }
 
     console.log(
       JSON.stringify({
@@ -224,30 +285,9 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
 
     c.header("Cache-Control", "no-store");
     c.header("MCP-Protocol-Version", mcp.protocolVersion);
+    c.header("Content-Type", "application/json");
 
-    return c.json({
-      jsonrpc: "2.0",
-      id: mcp.rpcId,
-      result: {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(upstreamResult, null, 2)
-          }
-        ],
-        isError: false,
-        _meta: {
-          x402: {
-            txHash: receipt.transaction,
-            network: receipt.network,
-            payer: receipt.payer,
-            amountUsd: `$${tool.price_usd}`,
-            latencyMs,
-            mode: receipt.mode
-          }
-        }
-      }
-    });
+    return c.body(serializedResponse, 200);
   }
 
   return c.json(

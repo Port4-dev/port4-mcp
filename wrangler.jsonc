@@ -46,6 +46,34 @@
 			"id": "b5d0c5acba7a402d9ad1960ae1c9c184"
 		}
 	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "EDGE_RATE_LIMITER", "class_name": "EdgeRateLimiter" },
+			{ "name": "PAYMENT_REPLAY_GUARD", "class_name": "PaymentReplayGuard" }
+		]
+	},
+	"exports": {
+		"EdgeRateLimiter": { "type": "durable-object", "storage": "sqlite" },
+		"PaymentReplayGuard": { "type": "durable-object", "storage": "sqlite" }
+	},
+	"queues": {
+		"producers": [
+			{ "binding": "METERING_EVENTS", "queue": "port4-metering" }
+		],
+		"consumers": [
+			{
+				"queue": "port4-metering",
+				"max_batch_size": 100,
+				"max_batch_timeout": 5,
+				"max_retries": 5,
+				"dead_letter_queue": "port4-metering-dlq",
+				"retry_delay": 30
+			}
+		]
+	},
+	"analytics_engine_datasets": [
+		{ "binding": "GATEWAY_ANALYTICS", "dataset": "port4_gateway_events" }
+	],
 	"routes": [
 		{
 			"pattern": "port4.dev",

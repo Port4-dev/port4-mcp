@@ -14,6 +14,9 @@ export async function loadTenantFromD1(
   const tenant = await env.DB.prepare(
     `SELECT t.id, t.user_id, t.subdomain, t.name, t.upstream_base_url, t.payout_wallet,
             t.network, t.auth_mode, t.is_active, t.status, t.is_featured, t.call_count,
+            t.upstream_signing_secret, COALESCE(t.upstream_verified, 0) AS upstream_verified,
+            COALESCE(t.rate_limit_rpm, 120) AS rate_limit_rpm,
+            COALESCE(t.daily_quota, 10000) AS daily_quota,
             COALESCE(u.plan, 'free') AS owner_plan
      FROM tenants t
      LEFT JOIN users u ON u.id = t.user_id
@@ -49,6 +52,10 @@ export async function loadTenantFromD1(
     is_featured: tenant.is_featured,
     call_count: tenant.call_count ?? 0,
     owner_plan: tenant.owner_plan === "pro" ? "pro" : "free",
+    upstream_signing_secret: tenant.upstream_signing_secret ?? null,
+    upstream_verified: Number(tenant.upstream_verified ?? 0),
+    rate_limit_rpm: Number(tenant.rate_limit_rpm ?? 120),
+    daily_quota: Number(tenant.daily_quota ?? 10000),
     tools: toolsResult.results ?? [],
     cached_at: new Date().toISOString()
   };

@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { AppEnv, TenantRecord, ToolRecord, TransactionRecord } from "../types";
 import { requireAuth } from "../middleware/auth";
 import { invalidateTenantKv, syncTenantToKv } from "../lib/kv-sync";
-import { randomHex, sha256Hex, usdToAtomicUsdc } from "../lib/crypto";
+import { randomHex, sha256Hex, timingSafeEqualString, usdToAtomicUsdc } from "../lib/crypto";
 
 const RESERVED_SUBDOMAINS = new Set(["www", "api", "app", "admin", "auth", "status", "docs"]);
 const SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
@@ -249,13 +249,31 @@ apiRoutes.post("/tenants", async (c) => {
   const network = body.network || c.env.X402_NETWORK;
   const authMode = "x402";
   const tenantId = `ten_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  const upstreamSigningSecret = `p4_whsec_${randomHex(24)}`;
+  const verificationToken = `port4-verify=${randomHex(16)}`;
+  const rateLimitRpm = user.plan === "pro" ? 600 : 120;
+  const dailyQuota = user.plan === "pro" ? 1_000_000 : 10_000;
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO tenants (id, user_id, subdomain, name, upstream_base_url, payout_wallet, network, auth_mode, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`
+      `INSERT INTO tenants
+       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
     )
-      .bind(tenantId, user.id, subdomain, name, upstreamBaseUrl, payoutWallet, network, authMode)
+      .bind(
+        tenantId,
+        user.id,
+        subdomain,
+        name,
+        upstreamBaseUrl,
+        payoutWallet,
+        network,
+        authMode,
+        upstreamSigningSecret,
+        verificationToken,
+        rateLimitRpm,
+        dailyQuota
+      )
       .run();
   } catch {
     return c.json({ error: "subdomain_taken", message: `Subdomain '${subdomain}' is already registered.` }, 409);
@@ -289,11 +307,82 @@ apiRoutes.post("/tenants", async (c) => {
   const synced = await syncTenantToKv(c.env, subdomain);
   return c.json(
     {
-      tenant: synced,
-      endpoint_url: `https://${subdomain}.port4.dev/mcp`
+      tenant: synced ? { ...synced, upstream_signing_secret: undefined } : null,
+      endpoint_url: `https://${subdomain}.port4.dev/mcp`,
+      upstream_signing_secret: upstreamSigningSecret,
+      verification: {
+        token: verificationToken,
+        well_known_url: `${upstreamBaseUrl}/.well-known/port4-verification.txt`
+      }
     },
     201
   );
+});
+
+/**
+ * Verify tenant upstream domain ownership via `/.well-known/port4-verification.txt`
+ */
+apiRoutes.post("/tenants/:id/verify-upstream", async (c) => {
+  const user = c.get("user")!;
+  const tenantId = c.req.param("id");
+  const tenant = await c.env.DB.prepare(
+    "SELECT id, subdomain, upstream_base_url, verification_token FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+  )
+    .bind(tenantId, user.id)
+    .first<{ id: string; subdomain: string; upstream_base_url: string; verification_token: string | null }>();
+
+  if (!tenant) return c.json({ error: "tenant_not_found" }, 404);
+  if (!tenant.verification_token || tenant.upstream_base_url === "internal://sandbox") {
+    return c.json({ error: "verification_not_applicable" }, 400);
+  }
+
+  try {
+    const verifyUrl = `${tenant.upstream_base_url}/.well-known/port4-verification.txt`;
+    const res = await fetch(verifyUrl, {
+      method: "GET",
+      redirect: "error",
+      signal: AbortSignal.timeout(8_000)
+    });
+    if (!res.ok) {
+      return c.json({ verified: false, error: "verification_file_not_found", status: res.status }, 422);
+    }
+    const text = (await res.text()).trim();
+    const matched = await timingSafeEqualString(text, tenant.verification_token);
+    if (!matched) {
+      return c.json({ verified: false, error: "verification_token_mismatch" }, 422);
+    }
+    await c.env.DB.prepare("UPDATE tenants SET upstream_verified = 1, updated_at = datetime('now') WHERE id = ?")
+      .bind(tenant.id)
+      .run();
+    await syncTenantToKv(c.env, tenant.subdomain);
+    return c.json({ verified: true, subdomain: tenant.subdomain });
+  } catch {
+    return c.json({ verified: false, error: "upstream_unreachable" }, 502);
+  }
+});
+
+/**
+ * Rotate per-tenant HMAC upstream signing secret
+ */
+apiRoutes.post("/tenants/:id/rotate-secret", async (c) => {
+  const user = c.get("user")!;
+  const tenantId = c.req.param("id");
+  const tenant = await c.env.DB.prepare(
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+  )
+    .bind(tenantId, user.id)
+    .first<{ id: string; subdomain: string }>();
+
+  if (!tenant) return c.json({ error: "tenant_not_found" }, 404);
+
+  const newSecret = `p4_whsec_${randomHex(24)}`;
+  await c.env.DB.prepare(
+    "UPDATE tenants SET upstream_signing_secret = ?, updated_at = datetime('now') WHERE id = ?"
+  )
+    .bind(newSecret, tenant.id)
+    .run();
+  await syncTenantToKv(c.env, tenant.subdomain);
+  return c.json({ ok: true, upstream_signing_secret: newSecret });
 });
 
 apiRoutes.delete("/tenants/:id", async (c) => {
@@ -399,29 +488,48 @@ apiRoutes.delete("/tenants/:id/tools/:toolId", async (c) => {
 
 apiRoutes.get("/ledger", async (c) => {
   const user = c.get("user")!;
-  const txRes = await c.env.DB.prepare(
-    `SELECT tx.id, tx.tenant_id, t.subdomain AS tenant_subdomain, tx.tool_name, tx.payer_wallet,
-            tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status, tx.latency_ms, tx.created_at
-     FROM transactions tx
-     INNER JOIN tenants t ON t.id = tx.tenant_id
-     WHERE t.user_id = ?
-     ORDER BY tx.created_at DESC
-     LIMIT 100`
-  )
-    .bind(user.id)
-    .all<TransactionRecord>();
+  const [rollupSummary, txRes] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT COALESCE(SUM(r.call_count), 0) AS total_calls,
+              COALESCE(SUM(r.gross_usd), 0) AS total_usd,
+              COALESCE(SUM(r.total_latency_ms), 0) AS total_latency_ms
+       FROM usage_rollups r
+       INNER JOIN tenants t ON t.id = r.tenant_id
+       WHERE t.user_id = ?`
+    )
+      .bind(user.id)
+      .first<{ total_calls: number; total_usd: number; total_latency_ms: number }>(),
+    c.env.DB.prepare(
+      `SELECT tx.id, tx.tenant_id, t.subdomain AS tenant_subdomain, tx.tool_name, tx.payer_wallet,
+              tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status, tx.latency_ms, tx.created_at
+       FROM transactions tx
+       INNER JOIN tenants t ON t.id = tx.tenant_id
+       WHERE t.user_id = ?
+       ORDER BY tx.created_at DESC
+       LIMIT 100`
+    )
+      .bind(user.id)
+      .all<TransactionRecord>()
+  ]);
 
   const transactions = txRes.results ?? [];
-  const totalAtomic = transactions.reduce((sum, tx) => sum + Number(tx.amount_atomic || 0), 0);
+  const rollupCalls = Number(rollupSummary?.total_calls ?? 0);
+  const totalCalls = rollupCalls > 0 ? rollupCalls : transactions.length;
+  const totalUsd =
+    rollupCalls > 0
+      ? Number(rollupSummary?.total_usd ?? 0).toFixed(4)
+      : (transactions.reduce((sum, tx) => sum + Number(tx.amount_atomic || 0), 0) / 1_000_000).toFixed(4);
   const avgLatencyMs =
-    transactions.length > 0
-      ? Math.round(transactions.reduce((sum, tx) => sum + tx.latency_ms, 0) / transactions.length)
-      : 0;
+    rollupCalls > 0
+      ? Math.round(Number(rollupSummary?.total_latency_ms ?? 0) / rollupCalls)
+      : transactions.length > 0
+        ? Math.round(transactions.reduce((sum, tx) => sum + tx.latency_ms, 0) / transactions.length)
+        : 0;
 
   return c.json({
     summary: {
-      total_calls: transactions.length,
-      total_usd: (totalAtomic / 1_000_000).toFixed(4),
+      total_calls: totalCalls,
+      total_usd: totalUsd,
       avg_latency_ms: avgLatencyMs
     },
     transactions

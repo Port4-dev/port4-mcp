@@ -5,6 +5,24 @@ export interface AppBindings extends CloudflareBindings {
   PORT4_TREASURY_WALLET?: string;
   DEMO_PAYER_PRIVATE_KEY?: string;
   DEMO_AUTH_ENABLED?: string;
+  LEDGER_ARCHIVE?: R2Bucket;
+  MCP_RATE_LIMIT_PER_MINUTE?: string;
+}
+
+export interface MeteringEvent {
+  id: string;
+  tenantId: string;
+  tenantSubdomain: string;
+  toolName: string;
+  payerWallet: string;
+  amountAtomic: string;
+  amountUsd: string;
+  network: string;
+  txHash: string;
+  latencyMs: number;
+  status: "settled" | "sandbox_settled";
+  isPlatformFee: boolean;
+  occurredAt: string;
 }
 
 export interface AuthUser {
@@ -44,6 +62,11 @@ export interface TenantRecord {
   status: TenantStatus;
   is_featured: number;
   call_count: number;
+  upstream_signing_secret?: string | null;
+  upstream_verified?: number;
+  verification_token?: string | null;
+  rate_limit_rpm?: number;
+  daily_quota?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -61,6 +84,10 @@ export interface TenantRoutingRecord {
   is_featured: number;
   call_count: number;
   owner_plan: UserPlan;
+  upstream_signing_secret: string | null;
+  upstream_verified: number;
+  rate_limit_rpm: number;
+  daily_quota: number;
   tools: ToolRecord[];
   cached_at: string;
 }
@@ -164,6 +191,8 @@ export interface AppVariables {
   mcp?: McpValidatedContext;
   selectedTool?: ToolRecord;
   x402Receipt?: X402SettlementReceipt;
+  paymentFingerprint?: string;
+  rateLimitSequence?: number;
   requestStartedAt?: number;
 }
 

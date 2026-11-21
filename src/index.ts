@@ -11,6 +11,9 @@ import { handleMcpRequest } from "./routes/mcp";
 import { apiRoutes } from "./routes/api";
 import { sandboxRoutes } from "./routes/sandbox";
 import { controlPlaneCsrfMiddleware, isTrustedBrowserOrigin } from "./middleware/security";
+import { edgeRateLimitMiddleware } from "./middleware/rate-limit";
+import { consumeMeteringEvents } from "./lib/metering";
+export { EdgeRateLimiter, PaymentReplayGuard } from "./durable-objects";
 
 const app = new Hono<AppEnv>();
 
@@ -152,6 +155,7 @@ app.get("/api/health", healthHandler);
 app.post(
   "/mcp",
   resolveTenantMiddleware(),
+  edgeRateLimitMiddleware,
   mcpHeadersMiddleware,
   x402GateMiddleware,
   handleMcpRequest
@@ -175,6 +179,7 @@ app.post(
     c.set("tenant", tenant);
     await next();
   },
+  edgeRateLimitMiddleware,
   mcpHeadersMiddleware,
   x402GateMiddleware,
   handleMcpRequest
@@ -194,6 +199,7 @@ app.get("/mcp", (c) =>
 app.post(
   "/sandbox/mcp",
   resolveTenantMiddleware("demo"),
+  edgeRateLimitMiddleware,
   mcpHeadersMiddleware,
   x402GateMiddleware,
   handleMcpRequest
@@ -252,5 +258,8 @@ app.onError((err, c) => {
 export default {
   fetch(request: Request, env: AppBindings, ctx: ExecutionContext): Response | Promise<Response> {
     return app.fetch(request, env, ctx);
+  },
+  queue(batch: MessageBatch<unknown>, env: AppBindings): Promise<void> {
+    return consumeMeteringEvents(batch, env);
   }
 } satisfies ExportedHandler<AppBindings>;

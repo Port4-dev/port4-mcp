@@ -34,18 +34,24 @@ async function verifyEnterpriseOAuthV2(
 }
 
 /**
- * Deterministic Non-Custodial Fee Split:
+ * Deterministic Non-Custodial Fee Split using the atomic EdgeRateLimiter DO sequence
+ * (avoids stale KV call_count caching):
  * - 'free' plan (3%): every 33rd call routes payTo to PORT4_TREASURY_WALLET
  * - 'pro' plan (1%): every 100th call routes payTo to PORT4_TREASURY_WALLET
  */
 export function computeFeeSplit(
   env: AppBindings,
-  tenant: TenantRoutingRecord
+  tenant: TenantRoutingRecord,
+  atomicSequence?: number
 ): { payTo: string; isPlatformFee: boolean } {
-  const nextCallNumber = (tenant.call_count ?? 0) + 1;
+  const nextCallNumber =
+    typeof atomicSequence === "number" && atomicSequence > 0
+      ? atomicSequence
+      : (tenant.call_count ?? 0) + 1;
   const interval = tenant.owner_plan === "pro" ? 100 : 33;
   const treasury = env.PORT4_TREASURY_WALLET?.trim();
-  const isPlatformFee = Boolean(treasury && /^0x[a-fA-F0-9]{40}$/.test(treasury)) && nextCallNumber % interval === 0;
+  const isPlatformFee =
+    Boolean(treasury && /^0x[a-fA-F0-9]{40}$/.test(treasury)) && nextCallNumber % interval === 0;
 
   return {
     payTo: isPlatformFee && treasury ? treasury : tenant.payout_wallet,
@@ -58,7 +64,7 @@ export function buildPaymentRequired(
   tenant: TenantRoutingRecord,
   tool: ToolRecord
 ): { paymentRequired: X402PaymentRequired; isPlatformFee: boolean } {
-  const { payTo, isPlatformFee } = computeFeeSplit(c.env, tenant);
+  const { payTo, isPlatformFee } = computeFeeSplit(c.env, tenant, c.get("rateLimitSequence"));
 
   const requirement: X402PaymentRequirement = {
     scheme: "exact",
@@ -328,33 +334,81 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
   }
 
   const paymentFingerprint = await sha256Hex(signatureHeader);
-  const replayClaim = await c.env.DB.prepare(
-    "INSERT OR IGNORE INTO payment_replays (fingerprint, tenant_id, tool_id) VALUES (?, ?, ?)"
-  ).bind(paymentFingerprint, tenant.id, tool.id).run();
-  if ((replayClaim.meta.changes ?? 0) !== 1) {
-    c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
-    return c.json({ error: "payment_already_used", message: "This payment authorization has already been processed." }, 409);
+  const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
+    c.env.PAYMENT_REPLAY_GUARD.idFromName(paymentFingerprint)
+  );
+  const replayClaim = await replayStub.fetch("https://payment-replay/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operation: "claim" })
+  });
+  const replayResult = replayClaim.ok
+    ? ((await replayClaim.json()) as {
+        status?: "claimed" | "retry_upstream" | "completed" | "in_flight";
+        claimed?: boolean;
+        receipt?: X402SettlementReceipt;
+        responseBody?: string;
+      })
+    : { status: "in_flight" as const, claimed: false };
+
+  // 1. Already completed idempotently -> return cached paid response without double-charging
+  if (replayResult.status === "completed" && replayResult.receipt && replayResult.responseBody) {
+    c.header("PAYMENT-RESPONSE", encodeBase64Json(replayResult.receipt));
+    c.header("X-Port4-Settlement-Tx", replayResult.receipt.transaction);
+    c.header("X-Port4-Tenant", tenant.subdomain);
+    c.header("X-Port4-Idempotent-Replay", "true");
+    c.header("Content-Type", "application/json");
+    return c.body(replayResult.responseBody, 200);
   }
 
-  let receipt: X402SettlementReceipt | null = null;
-
-  if (tenant.subdomain === "demo" && decodedSignature.payload?.mode === "port4-sandbox-demo") {
-    receipt = await verifySandboxSignature(c.env, decodedSignature, requirement, isPlatformFee);
-  } else {
-    receipt = await verifyAndSettleViaFacilitator(c.env, decodedSignature, requirement, isPlatformFee);
-  }
-
-  if (!receipt || !receipt.success) {
-    await c.env.DB.prepare("DELETE FROM payment_replays WHERE fingerprint = ?").bind(paymentFingerprint).run();
+  // 2. Concurrent duplicate in-flight -> ask caller to retry briefly
+  if (!replayResult.claimed) {
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
     return c.json(
       {
-        error: "payment_verification_failed",
-        reason: receipt?.errorReason ?? "signature_mismatch",
-        x402: paymentRequired
+        error: "payment_already_used",
+        message: "This payment authorization is already being processed or was already redeemed."
       },
-      402
+      409
     );
+  }
+
+  c.set("paymentFingerprint", paymentFingerprint);
+  let receipt: X402SettlementReceipt | null = null;
+
+  // 3. Previously settled on-chain, upstream had failed -> retry upstream WITHOUT re-settling
+  if (replayResult.status === "retry_upstream" && replayResult.receipt) {
+    receipt = replayResult.receipt;
+  } else {
+    if (tenant.subdomain === "demo" && decodedSignature.payload?.mode === "port4-sandbox-demo") {
+      receipt = await verifySandboxSignature(c.env, decodedSignature, requirement, isPlatformFee);
+    } else {
+      receipt = await verifyAndSettleViaFacilitator(c.env, decodedSignature, requirement, isPlatformFee);
+    }
+
+    if (!receipt || !receipt.success) {
+      await replayStub.fetch("https://payment-replay/release", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operation: "release" })
+      });
+      c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+      return c.json(
+        {
+          error: "payment_verification_failed",
+          reason: receipt?.errorReason ?? "signature_mismatch",
+          x402: paymentRequired
+        },
+        402
+      );
+    }
+
+    // Durably persist settled receipt BEFORE calling upstream so upstream 502s are safely retryable
+    await replayStub.fetch("https://payment-replay/mark_settled", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "mark_settled", receipt })
+    });
   }
 
   c.set("x402Receipt", receipt);
