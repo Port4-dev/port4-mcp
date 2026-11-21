@@ -16,6 +16,13 @@ import {
   sha256Hex,
   timingSafeEqualString
 } from "../lib/crypto";
+import {
+  EVM_ADDRESS_RE,
+  SOLANA_ADDRESS_RE,
+  getNetworkFamily,
+  normalizePayoutWallets,
+  resolveUsdcAssetForNetwork
+} from "../lib/networks";
 
 async function verifyEnterpriseOAuthV2(
   c: Context<AppEnv>,
@@ -42,30 +49,35 @@ async function verifyEnterpriseOAuthV2(
 export function computeFeeSplit(
   env: AppBindings,
   tenant: TenantRoutingRecord,
-  atomicSequence?: number
+  atomicSequence?: number,
+  targetNetwork?: string,
+  targetWallet?: string
 ): { payTo: string; isPlatformFee: boolean } {
   const nextCallNumber =
     typeof atomicSequence === "number" && atomicSequence > 0
       ? atomicSequence
       : (tenant.call_count ?? 0) + 1;
   const interval = tenant.owner_plan === "pro" ? 100 : 33;
-  const treasury = env.PORT4_TREASURY_WALLET?.trim();
-  const isPlatformFee =
-    Boolean(treasury && /^0x[a-fA-F0-9]{40}$/.test(treasury)) && nextCallNumber % interval === 0;
+  const family = getNetworkFamily(targetNetwork || tenant.network);
+  const treasury =
+    family === "solana"
+      ? env.PORT4_TREASURY_SOLANA_WALLET?.trim()
+      : env.PORT4_TREASURY_WALLET?.trim();
+  const validTreasury =
+    family === "solana"
+      ? Boolean(treasury && SOLANA_ADDRESS_RE.test(treasury))
+      : Boolean(treasury && EVM_ADDRESS_RE.test(treasury));
+  const isPlatformFee = validTreasury && nextCallNumber % interval === 0;
+  const fallbackWallet = targetWallet || tenant.payout_wallet;
 
   return {
-    payTo: isPlatformFee && treasury ? treasury : tenant.payout_wallet,
+    payTo: isPlatformFee && treasury ? treasury : fallbackWallet,
     isPlatformFee
   };
 }
 
-const USDC_ASSETS_BY_NETWORK: Record<string, string> = {
-  "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // Base Mainnet USDC
-  "eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e" // Base Sepolia USDC
-};
-
 export function resolveUsdcAsset(network: string, fallback: string): string {
-  return USDC_ASSETS_BY_NETWORK[network] ?? fallback;
+  return resolveUsdcAssetForNetwork(network, fallback);
 }
 
 export function buildPaymentRequired(
@@ -73,28 +85,49 @@ export function buildPaymentRequired(
   tenant: TenantRoutingRecord,
   tool: ToolRecord
 ): { paymentRequired: X402PaymentRequired; isPlatformFee: boolean } {
-  const { payTo, isPlatformFee } = computeFeeSplit(c.env, tenant, c.get("rateLimitSequence"));
-  const network = tenant.network || c.env.X402_NETWORK;
+  const primaryNetwork = tenant.network || c.env.X402_NETWORK;
+  const configuredWallets =
+    Array.isArray(tenant.payout_wallets) && tenant.payout_wallets.length > 0
+      ? tenant.payout_wallets
+      : normalizePayoutWallets(primaryNetwork, tenant.payout_wallet);
 
-  const requirement: X402PaymentRequirement = {
-    scheme: "exact",
-    network,
-    amount: tool.price_atomic,
-    asset: resolveUsdcAsset(network, c.env.X402_USDC_ASSET),
-    payTo,
-    maxTimeoutSeconds: 60,
-    extra: {
-      name: "USD Coin",
-      version: "2",
-      tenant: tenant.subdomain,
-      tool: tool.name,
-      priceUsd: tool.price_usd,
-      isPlatformFee
-    }
-  };
+  const wallets =
+    configuredWallets.length > 0
+      ? configuredWallets
+      : [{ network: primaryNetwork, address: tenant.payout_wallet }];
+
+  const sequence = c.get("rateLimitSequence");
+  let anyPlatformFee = false;
+
+  const accepts: X402PaymentRequirement[] = wallets.map((entry) => {
+    const { payTo, isPlatformFee } = computeFeeSplit(
+      c.env,
+      tenant,
+      sequence,
+      entry.network,
+      entry.address
+    );
+    if (isPlatformFee) anyPlatformFee = true;
+    return {
+      scheme: "exact",
+      network: entry.network,
+      amount: tool.price_atomic,
+      asset: resolveUsdcAsset(entry.network, c.env.X402_USDC_ASSET),
+      payTo,
+      maxTimeoutSeconds: 60,
+      extra: {
+        name: "USD Coin",
+        version: "2",
+        tenant: tenant.subdomain,
+        tool: tool.name,
+        priceUsd: tool.price_usd,
+        isPlatformFee
+      }
+    };
+  });
 
   return {
-    isPlatformFee,
+    isPlatformFee: anyPlatformFee,
     paymentRequired: {
       x402Version: 2,
       resource: {
@@ -102,7 +135,7 @@ export function buildPaymentRequired(
         description: `${tenant.name} — MCP tool '${tool.name}' ($${tool.price_usd} USDC)`,
         mimeType: "application/json"
       },
-      accepts: [requirement]
+      accepts
     }
   };
 }
@@ -300,19 +333,20 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
 
   c.set("selectedTool", tool);
 
-  const { paymentRequired, isPlatformFee } = buildPaymentRequired(c, tenant, tool);
+  const { paymentRequired } = buildPaymentRequired(c, tenant, tool);
   const paymentRequiredHeader = encodeBase64Json(paymentRequired);
-  const requirement = paymentRequired.accepts[0];
+  const primaryRequirement = paymentRequired.accepts[0];
 
   const signatureHeader = c.req.header("PAYMENT-SIGNATURE");
   if (!signatureHeader) {
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
     c.header("X-Port4-Tenant", tenant.subdomain);
     c.header("Cache-Control", "no-store");
+    const networkSummary = paymentRequired.accepts.map((a) => a.network).join(", ");
     return c.json(
       {
         error: "payment_required",
-        message: `Payment of $${tool.price_usd} USDC (${tool.price_atomic} atomic units) on ${requirement.network} required for tool '${tool.name}'.`,
+        message: `Payment of $${tool.price_usd} USDC (${tool.price_atomic} atomic units) on ${networkSummary} required for tool '${tool.name}'.`,
         x402: paymentRequired
       },
       402
@@ -333,15 +367,29 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     );
   }
 
-  if (
-    decodedSignature.x402Version !== 2 ||
-    decodedSignature.scheme !== "exact" ||
-    decodedSignature.network !== requirement.network ||
-    !decodedSignature.payload?.authorization
-  ) {
+  const matchedRequirement = paymentRequired.accepts.find(
+    (req) => req.network === decodedSignature.network && req.scheme === decodedSignature.scheme
+  );
+  const family = matchedRequirement ? getNetworkFamily(matchedRequirement.network) : "evm";
+  const hasValidPayload =
+    family === "solana"
+      ? typeof decodedSignature.payload?.transaction === "string" &&
+        decodedSignature.payload.transaction.length > 16
+      : Boolean(decodedSignature.payload?.authorization);
+
+  if (decodedSignature.x402Version !== 2 || !matchedRequirement || !hasValidPayload) {
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
-    return c.json({ error: "invalid_payment_signature", message: "Payment does not match this x402 requirement." }, 402);
+    return c.json(
+      {
+        error: "invalid_payment_signature",
+        message: `Payment does not match any accepted x402 network (${paymentRequired.accepts.map((a) => a.network).join(", ")}).`
+      },
+      402
+    );
   }
+
+  const requirement = matchedRequirement ?? primaryRequirement;
+  const isPlatformFee = Boolean(requirement.extra.isPlatformFee);
 
   const paymentFingerprint = await sha256Hex(signatureHeader);
   const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(

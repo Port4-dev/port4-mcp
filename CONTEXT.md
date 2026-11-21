@@ -1,44 +1,41 @@
 # Port4 (`port4.dev`) — Live Architecture Context
 
 ## Project Overview
-**Port4** is a $0-cost, multi-tenant **Paid MCP (`2026-07-28`) & x402 v2 API Monetization Gateway** built on the Cloudflare Developer Platform.
-- **Production Domain:** `https://port4.dev` (Wildcard tenants: `https://{tenant}.port4.dev/mcp`)
+**Port4** is a multi-tenant **Paid MCP (`2026-07-28`) & x402 v2 API Monetization Gateway** built on the Cloudflare Developer Platform.
+- **Production Domain:** `https://port4.dev` (Wildcard tenants: `https://{tenant}.port4.dev/mcp` and path fallback `https://port4.dev/mcp/{tenant}`)
 - **Cloudflare Account:** `Port 4` (`34eff427e2830dfba1ed210a8ef4d567`)
-- **Strategic Target:** Cloudflare for Startups Tier 3 ($10,000 credits) verifiable $0/mo MVP.
+- **Supported Settlement Networks (`src/lib/networks.ts`):**
+  - **EVM (`0x...`):** Base Mainnet/Sepolia, Arbitrum One/Sepolia, Optimism, Polygon PoS, Ethereum Mainnet, Avalanche C-Chain
+  - **Solana (`Base58`):** Solana Mainnet & Solana Devnet (SPL USDC)
+  - Multi-chain `accepts[]` per tenant via `payout_wallets_json`, plus browser wallet connect (EIP-6963 + Phantom/Solflare/Backpack).
 
 ## Cloudflare Bindings (`wrangler.jsonc`)
-| Binding | Type | Resource ID | Purpose |
+| Binding | Type | Resource ID / Name | Purpose |
 | :--- | :--- | :--- | :--- |
-| `DB` | D1 Database (`port4-db`) | `833d7aa9-ffaa-4a9c-92e0-dfda811647b1` | Users, API keys, tenants, tools, transactions, RBAC, platform fees |
-| `TENANT_ROUTING` | KV Namespace | `b5d0c5acba7a402d9ad1960ae1c9c184` | Sub-5ms edge cache for tenant config, tools, plan fee rate, and instant kill-switch |
+| `DB` | D1 Database (`port4-db`) | `833d7aa9-ffaa-4a9c-92e0-dfda811647b1` | Control-plane metadata, users, API keys, tenants, tools, hourly `usage_rollups` |
+| `TENANT_ROUTING` | KV Namespace | `b5d0c5acba7a402d9ad1960ae1c9c184` | Sub-5ms edge cache for tenant config, multi-wallet payouts, tools, quotas, and kill-switch |
+| `EDGE_RATE_LIMITER` | Durable Object | `EdgeRateLimiter` | Per-tenant/IP RPM, daily quotas, and atomic sequence for non-custodial fee splits |
+| `PAYMENT_REPLAY_GUARD` | Durable Object | `PaymentReplayGuard` | 3-state durable idempotency (`in_flight` → `settled_pending_upstream` → `completed`) |
+| `METERING_EVENTS` | Queue | `port4-metering` | Async zero-D1 hot-path metering batched into `usage_rollups` & optional R2 archival |
 | `ASSETS` | Workers Static Assets | `./dist` | React + Vite SPA (`run_worker_first: true`, `not_found_handling: "single-page-application"`) |
 
 ## Non-Secret Vars (`wrangler.jsonc`) & Secret Bindings (via `c.env`)
 - **Vars:** `APP_URL`, `FACILITATOR_URL`, `X402_FACILITATOR_URL`, `X402_NETWORK`, `X402_USDC_ASSET`, `SANDBOX_PAYOUT_WALLET`, `ADMIN_GITHUB_LOGIN` (`Ishabarundo`).
-- **Secrets (typed on `CloudflareBindings`, never logged or stored in repo):** `JWT_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `PORT4_TREASURY_WALLET`, `DEMO_PAYER_PRIVATE_KEY`.
+- **Secrets (typed on `CloudflareBindings`, never logged or stored in repo):** `JWT_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `PORT4_TREASURY_WALLET`, `PORT4_TREASURY_SOLANA_WALLET`, `DEMO_PAYER_PRIVATE_KEY`.
 
-## D1 Schema (`migrations/0001_init.sql` + `migrations/0002_admin_and_fees.sql`)
-- `users`: `id`, `github_id`, `login`, `avatar_url`, `email`, `is_admin` (`0|1`), `plan` (`'free'|'pro'`), `created_at`
-- `api_keys`: `id`, `user_id`, `name`, `key_prefix`, `key_hash` (SHA-256), `created_at`, `last_used_at`
-- `tenants`: `id`, `user_id`, `subdomain`, `name`, `upstream_base_url`, `payout_wallet`, `network`, `auth_mode`, `is_active`, `status` (`'active'|'suspended'`), `is_featured` (`0|1`), `call_count`, `created_at`, `updated_at`
-- `tools`: `id`, `tenant_id`, `name`, `description`, `http_method`, `upstream_path`, `input_schema_json`, `price_usd`, `price_atomic`, `is_active`, `created_at`
-- `transactions`: `id`, `tenant_id`, `tool_name`, `payer_wallet`, `amount_atomic`, `amount_usd`, `network`, `tx_hash`, `status`, `latency_ms`, `is_platform_fee` (`0|1`), `created_at`
+## D1 Migrations (`migrations/`)
+1. `0001_init.sql` — `users`, `api_keys`, `tenants`, `tools`, `transactions`, demo seed
+2. `0002_admin_and_fees.sql` — RBAC `is_admin`, `plan`, `status`, `is_featured`, `call_count`, `is_platform_fee`
+3. `0003_payment_replay_protection.sql` — Payment replay guard table
+4. `0004_usage_rollups.sql` — Queue-batched hourly aggregates (`usage_rollups`)
+5. `0005_upstream_security_and_quotas.sql` — `upstream_signing_secret`, `upstream_verified`, `verification_token`, `rate_limit_rpm`, `daily_quota`
+6. `0006_multi_wallet_payouts.sql` — `payout_wallets_json` for multi-chain EVM + Solana x402 v2 `accepts[]`
 
 ## Routes
-- **Health:** `GET /health`, `GET /api/health`
-- **Auth:** `GET /api/auth/github`, `GET /api/auth/github/callback`, `GET /api/auth/me`, `POST /api/auth/logout`, `POST /api/auth/demo` (also aliased at `/auth/*`)
-- **Control Plane:** `/api/tenants`, `/api/tenants/:id/tools`, `/api/ledger`, `/api/keys`, `/api/public/featured`, `/api/public/ledger`
-- **Super-Admin (`requireAdmin` — D1 re-verified):**
-  - `GET /api/admin/stats`
-  - `GET /api/admin/tenants`
-  - `PATCH /api/admin/tenants/:slug/status` (instant KV kill-switch)
-  - `PATCH /api/admin/tenants/:slug/featured`
-  - `GET /api/admin/users`, `PATCH /api/admin/users/:id/plan`
-  - `GET /api/admin/transactions`
+- **Health & Meta:** `GET /health`, `GET /api/health`, `GET /api/networks`
+- **Auth:** `GET /api/auth/github`, `GET /api/auth/github/callback`, `GET /api/auth/me`, `POST /api/auth/logout`
+- **Control Plane:** `/api/tenants`, `PATCH /api/tenants/:id`, `PATCH /api/tenants/:id/tools/:toolId`, `POST /api/tenants/:id/verify-upstream`, `POST /api/tenants/:id/rotate-secret`, `POST /api/tenants/:id/test-call`, `POST /api/tenants/:id/sync-mcp`, `/api/ledger`, `/api/keys`, `/api/public/featured`, `/api/public/ledger`
+- **Super-Admin (`requireAdmin` — D1 re-verified):** `/api/admin/stats`, `/api/admin/tenants`, `/api/admin/tenants/:slug/status`, `/api/admin/tenants/:slug/featured`, `/api/admin/users`, `/api/admin/users/:id/plan`, `/api/admin/transactions`
 - **Sandbox:** `POST /api/sandbox/run`, `POST /sandbox/sign`, `POST /sandbox/mcp`
-- **Data Plane:** `POST /mcp` (Stateless MCP `2026-07-28` + x402 v2 + deterministic non-custodial fee split)
+- **Data Plane:** `POST /mcp` & `POST /mcp/:slug` (Stateless MCP `2026-07-28` + multi-chain x402 v2 + HMAC-SHA256 upstream signing)
 - **SPA Routes:** `/`, `/dashboard`, `/admin`, `/docs`, `/llms.txt`, `/llm.txt`, `/sitemap.xml`, `/robots.txt`
-
-## Current Build Phase
-- [x] Phase 1–5: Live MVP deployed to `https://port4.dev`
-- [x] Phase 6: Super-Admin RBAC & `/admin` suite, non-custodial fee split, `POST /api/sandbox/run`, Blue & Green minimalist UI + Featured Registry (migrated remote D1 `0002_admin_and_fees.sql` and deployed live to `port4.dev`, Version `7720d115-482d-49fe-bc6a-59e53a592e84`)

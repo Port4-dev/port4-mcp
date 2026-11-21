@@ -119,14 +119,17 @@ export function Docs({
         {/* 3. Call Paid Tool from an Agent */}
         <section className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold text-zinc-900">
-            3. Pay & Call from an AI Agent (Real USDC via @x402/fetch)
+            3. Pay & Call from an AI Agent (Multi-Chain EVM &amp; Solana USDC)
           </h2>
           <p className="text-sm text-zinc-600">
-            Install <code className="font-mono text-xs">@x402/fetch</code>,{" "}
-            <code className="font-mono text-xs">@x402/evm</code>, and{" "}
-            <code className="font-mono text-xs">viem</code>. The wrapper automatically handles the{" "}
-            <code className="font-mono text-xs">402 Payment Required</code> challenge, signs the
-            exact USDC authorization, and retries:
+            Port4 supports x402 v2 multi-rail <code className="font-mono text-xs">accepts[]</code>{" "}
+            across <strong>Base, Arbitrum, Optimism, Polygon, Ethereum, Avalanche</strong> (EVM{" "}
+            <code className="font-mono text-xs">0x...</code>) and <strong>Solana</strong> (SVM
+            Base58). Install <code className="font-mono text-xs">@x402/fetch</code> +{" "}
+            <code className="font-mono text-xs">@x402/evm</code> (or{" "}
+            <code className="font-mono text-xs">@x402/svm</code> for Solana) — the wrapper handles
+            the <code className="font-mono text-xs">402 Payment Required</code> challenge, signs the
+            USDC authorization, and retries automatically:
           </p>
           <CodeBlock
             id="ts-client"

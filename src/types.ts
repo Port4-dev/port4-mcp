@@ -1,8 +1,11 @@
+import type { PayoutWalletEntry } from "./lib/networks";
+
 export type UserPlan = "free" | "pro";
 export type TenantStatus = "active" | "suspended";
 
 export interface AppBindings extends CloudflareBindings {
   PORT4_TREASURY_WALLET?: string;
+  PORT4_TREASURY_SOLANA_WALLET?: string;
   DEMO_PAYER_PRIVATE_KEY?: string;
   DEMO_AUTH_ENABLED?: string;
   GATEWAY_ANALYTICS?: AnalyticsEngineDataset;
@@ -57,6 +60,7 @@ export interface TenantRecord {
   name: string;
   upstream_base_url: string;
   payout_wallet: string;
+  payout_wallets_json?: string | null;
   network: string;
   auth_mode: "x402" | "x402+oauth_v2";
   is_active: number;
@@ -79,6 +83,7 @@ export interface TenantRoutingRecord {
   name: string;
   upstream_base_url: string;
   payout_wallet: string;
+  payout_wallets: PayoutWalletEntry[];
   network: string;
   auth_mode: "x402" | "x402+oauth_v2";
   status: TenantStatus;
@@ -161,6 +166,7 @@ export interface X402PaymentSignaturePayload {
   network: string;
   payload: {
     signature?: string;
+    transaction?: string;
     mode?: string;
     authorization?: {
       from: string;

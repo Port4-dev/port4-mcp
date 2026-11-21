@@ -1,4 +1,5 @@
 import type { AppBindings, TenantRecord, TenantRoutingRecord, ToolRecord, UserPlan } from "../types";
+import { parsePayoutWalletsJson } from "./networks";
 
 const KV_PREFIX = "tenant:";
 
@@ -13,7 +14,7 @@ export async function loadTenantFromD1(
   const normalized = subdomain.toLowerCase();
   const tenant = await env.DB.prepare(
     `SELECT t.id, t.user_id, t.subdomain, t.name, t.upstream_base_url, t.payout_wallet,
-            t.network, t.auth_mode, t.is_active, t.status, t.is_featured, t.call_count,
+            t.payout_wallets_json, t.network, t.auth_mode, t.is_active, t.status, t.is_featured, t.call_count,
             t.upstream_signing_secret, COALESCE(t.upstream_verified, 0) AS upstream_verified,
             COALESCE(t.rate_limit_rpm, 120) AS rate_limit_rpm,
             COALESCE(t.daily_quota, 10000) AS daily_quota,
@@ -46,6 +47,11 @@ export async function loadTenantFromD1(
     name: tenant.name,
     upstream_base_url: tenant.upstream_base_url,
     payout_wallet: tenant.payout_wallet,
+    payout_wallets: parsePayoutWalletsJson(
+      tenant.payout_wallets_json,
+      tenant.network,
+      tenant.payout_wallet
+    ),
     network: tenant.network,
     auth_mode: tenant.auth_mode,
     status: tenant.status,

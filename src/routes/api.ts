@@ -3,11 +3,18 @@ import type { AppEnv, TenantRecord, ToolRecord, TransactionRecord } from "../typ
 import { requireAuth } from "../middleware/auth";
 import { invalidateTenantKv, syncTenantToKv } from "../lib/kv-sync";
 import { hmacSha256Hex, randomHex, sha256Hex, timingSafeEqualString, usdToAtomicUsdc } from "../lib/crypto";
+import {
+  SUPPORTED_NETWORKS,
+  isSupportedNetwork,
+  isValidWalletForNetwork,
+  normalizePayoutWallets,
+  parsePayoutWalletsJson,
+  type PayoutWalletEntry
+} from "../lib/networks";
 import { interpolateUpstreamPath } from "./mcp";
 
 const RESERVED_SUBDOMAINS = new Set(["www", "api", "app", "admin", "auth", "status", "docs"]);
 const SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
-const WALLET_RE = /^0x[a-fA-F0-9]{40}$/;
 const TOOL_NAME_RE = /^[a-zA-Z0-9_-]{2,64}$/;
 const HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
 
@@ -73,6 +80,11 @@ function validateToolDefinition(input: {
 }
 
 export const apiRoutes = new Hono<AppEnv>();
+
+// Public list of supported x402 v2 settlement networks (EVM + Solana)
+apiRoutes.get("/networks", (c) => {
+  return c.json({ networks: SUPPORTED_NETWORKS });
+});
 
 // Public Featured Registry for homepage directory
 apiRoutes.get("/public/featured", async (c) => {
@@ -146,7 +158,7 @@ apiRoutes.use("/keys", requireAuth);
 apiRoutes.get("/tenants", async (c) => {
   const user = c.get("user")!;
   const tenantsRes = await c.env.DB.prepare(
-    `SELECT id, user_id, subdomain, name, upstream_base_url, payout_wallet, network, auth_mode, is_active, created_at, updated_at
+    `SELECT id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, created_at, updated_at
      FROM tenants
      WHERE user_id = ?
      ORDER BY created_at DESC`
@@ -180,6 +192,7 @@ apiRoutes.get("/tenants", async (c) => {
   return c.json({
     tenants: tenants.map((t) => ({
       ...t,
+      payout_wallets: parsePayoutWalletsJson(t.payout_wallets_json, t.network, t.payout_wallet),
       endpoint_url: `https://${t.subdomain}.port4.dev/mcp`,
       tools: toolsByTenant.get(t.id) ?? []
     }))
@@ -193,6 +206,7 @@ apiRoutes.post("/tenants", async (c) => {
     name?: string;
     upstream_base_url?: string;
     payout_wallet?: string;
+    payout_wallets?: PayoutWalletEntry[];
     network?: string;
     auth_mode?: "x402" | "x402+oauth_v2";
     initial_tool?: {
@@ -233,13 +247,43 @@ apiRoutes.post("/tenants", async (c) => {
     );
   }
 
-  const payoutWallet = (body.payout_wallet ?? "").trim();
-  if (!WALLET_RE.test(payoutWallet)) {
+  const network = (body.network || c.env.X402_NETWORK).trim();
+  if (!isSupportedNetwork(network)) {
     return c.json(
-      { error: "invalid_payout_wallet", message: "Payout wallet must be a valid 0x EVM address." },
+      { error: "invalid_network", message: `Unsupported settlement network '${network}'.` },
       400
     );
   }
+
+  const payoutWallet = (body.payout_wallet ?? "").trim();
+  if (!isValidWalletForNetwork(network, payoutWallet)) {
+    return c.json(
+      {
+        error: "invalid_payout_wallet",
+        message: network.startsWith("solana:")
+          ? "Payout wallet must be a valid Solana Base58 address."
+          : "Payout wallet must be a valid 0x EVM address."
+      },
+      400
+    );
+  }
+
+  if (body.payout_wallets !== undefined) {
+    if (!Array.isArray(body.payout_wallets) || body.payout_wallets.length > 10) {
+      return c.json({ error: "invalid_payout_wallets", message: "Up to 10 payout wallets are allowed." }, 400);
+    }
+    for (const entry of body.payout_wallets) {
+      if (!entry || typeof entry.network !== "string" || typeof entry.address !== "string" || !isValidWalletForNetwork(entry.network, entry.address)) {
+        return c.json(
+          { error: "invalid_payout_wallets", message: `Invalid wallet address for network '${entry?.network ?? "unknown"}'.` },
+          400
+        );
+      }
+    }
+  }
+
+  const normalizedWallets = normalizePayoutWallets(network, payoutWallet, body.payout_wallets);
+  const payoutWalletsJson = JSON.stringify(normalizedWallets);
 
   if (body.auth_mode === "x402+oauth_v2") {
     return c.json(
@@ -247,7 +291,6 @@ apiRoutes.post("/tenants", async (c) => {
       422
     );
   }
-  const network = body.network || c.env.X402_NETWORK;
   const authMode = "x402";
   const tenantId = `ten_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
   const upstreamSigningSecret = `p4_whsec_${randomHex(24)}`;
@@ -258,8 +301,8 @@ apiRoutes.post("/tenants", async (c) => {
   try {
     await c.env.DB.prepare(
       `INSERT INTO tenants
-       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
+       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
     )
       .bind(
         tenantId,
@@ -268,6 +311,7 @@ apiRoutes.post("/tenants", async (c) => {
         name,
         upstreamBaseUrl,
         payoutWallet,
+        payoutWalletsJson,
         network,
         authMode,
         upstreamSigningSecret,
@@ -393,7 +437,7 @@ apiRoutes.patch("/tenants/:id", async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const existing = await c.env.DB.prepare(
-    "SELECT id, subdomain, name, upstream_base_url, payout_wallet, network FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{
@@ -402,6 +446,7 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       name: string;
       upstream_base_url: string;
       payout_wallet: string;
+      payout_wallets_json: string | null;
       network: string;
     }>();
 
@@ -411,6 +456,7 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     name?: string;
     upstream_base_url?: string;
     payout_wallet?: string;
+    payout_wallets?: PayoutWalletEntry[];
     network?: string;
   };
   try {
@@ -434,33 +480,67 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     nextUpstream = validated;
   }
 
-  let nextWallet = existing.payout_wallet;
-  if (body.payout_wallet !== undefined) {
-    const trimmed = body.payout_wallet.trim();
-    if (!WALLET_RE.test(trimmed)) {
-      return c.json(
-        { error: "invalid_payout_wallet", message: "Payout wallet must be a valid 0x EVM address." },
-        400
-      );
-    }
-    nextWallet = trimmed;
-  }
-
   let nextNetwork = existing.network;
   if (body.network !== undefined) {
-    if (body.network !== "eip155:84532" && body.network !== "eip155:8453") {
+    if (!isSupportedNetwork(body.network.trim())) {
       return c.json(
-        { error: "invalid_network", message: "Supported networks: eip155:84532 (Base Sepolia) or eip155:8453 (Base Mainnet)." },
+        { error: "invalid_network", message: `Unsupported settlement network '${body.network}'.` },
         400
       );
     }
-    nextNetwork = body.network;
+    nextNetwork = body.network.trim();
+  }
+
+  let nextWallet = existing.payout_wallet;
+  if (body.payout_wallet !== undefined) {
+    nextWallet = body.payout_wallet.trim();
+  }
+  if (!isValidWalletForNetwork(nextNetwork, nextWallet)) {
+    return c.json(
+      {
+        error: "invalid_payout_wallet",
+        message: nextNetwork.startsWith("solana:")
+          ? "Payout wallet must be a valid Solana Base58 address."
+          : "Payout wallet must be a valid 0x EVM address."
+      },
+      400
+    );
+  }
+
+  let nextPayoutWallets: PayoutWalletEntry[];
+  if (body.payout_wallets !== undefined) {
+    if (!Array.isArray(body.payout_wallets) || body.payout_wallets.length > 10) {
+      return c.json({ error: "invalid_payout_wallets", message: "Up to 10 payout wallets are allowed." }, 400);
+    }
+    for (const entry of body.payout_wallets) {
+      if (!entry || typeof entry.network !== "string" || typeof entry.address !== "string" || !isValidWalletForNetwork(entry.network, entry.address)) {
+        return c.json(
+          { error: "invalid_payout_wallets", message: `Invalid wallet address for network '${entry?.network ?? "unknown"}'.` },
+          400
+        );
+      }
+    }
+    nextPayoutWallets = normalizePayoutWallets(nextNetwork, nextWallet, body.payout_wallets);
+  } else {
+    const existingExtras = parsePayoutWalletsJson(
+      existing.payout_wallets_json,
+      existing.network,
+      existing.payout_wallet
+    ).filter((w) => w.network !== existing.network && w.network !== nextNetwork);
+    nextPayoutWallets = normalizePayoutWallets(nextNetwork, nextWallet, existingExtras);
   }
 
   await c.env.DB.prepare(
-    "UPDATE tenants SET name = ?, upstream_base_url = ?, payout_wallet = ?, network = ?, updated_at = datetime('now') WHERE id = ?"
+    "UPDATE tenants SET name = ?, upstream_base_url = ?, payout_wallet = ?, payout_wallets_json = ?, network = ?, updated_at = datetime('now') WHERE id = ?"
   )
-    .bind(nextName, nextUpstream, nextWallet, nextNetwork, existing.id)
+    .bind(
+      nextName,
+      nextUpstream,
+      nextWallet,
+      JSON.stringify(nextPayoutWallets),
+      nextNetwork,
+      existing.id
+    )
     .run();
 
   const synced = await syncTenantToKv(c.env, existing.subdomain);

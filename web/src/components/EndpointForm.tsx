@@ -13,6 +13,14 @@ import {
   Trash2,
   X
 } from "lucide-react";
+import {
+  NETWORK_OPTIONS,
+  getNetworkFamily,
+  getNetworkOption,
+  isValidWalletAddress,
+  type PayoutWalletEntry
+} from "../lib/wallets";
+import { WalletConnectButton } from "./WalletConnectButton";
 
 export interface ToolItem {
   id: string;
@@ -30,6 +38,7 @@ export interface TenantItem {
   name: string;
   upstream_base_url: string;
   payout_wallet: string;
+  payout_wallets?: PayoutWalletEntry[];
   network: string;
   endpoint_url: string;
   tools: ToolItem[];
@@ -43,14 +52,14 @@ interface EndpointFormProps {
 }
 
 const DRAFT_KEY = "port4_endpoint_draft_v1";
-const WALLET_RE = /^0x[a-fA-F0-9]{40}$/;
 
 interface DraftState {
   subdomain: string;
   name: string;
   upstreamUrl: string;
   payoutWallet: string;
-  network: "eip155:84532" | "eip155:8453";
+  network: string;
+  extraWallets: PayoutWalletEntry[];
   toolName: string;
   toolDescription: string;
   toolMethod: "GET" | "POST" | "PUT" | "DELETE";
@@ -65,6 +74,7 @@ const EMPTY_DRAFT: DraftState = {
   upstreamUrl: "",
   payoutWallet: "",
   network: "eip155:84532",
+  extraWallets: [],
   toolName: "",
   toolDescription: "",
   toolMethod: "POST",
@@ -103,11 +113,18 @@ export function EndpointForm({
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [editingTenantId, setEditingTenantId] = useState<string | null>(null);
-  const [tenantEdit, setTenantEdit] = useState({
+  const [tenantEdit, setTenantEdit] = useState<{
+    name: string;
+    upstream_base_url: string;
+    payout_wallet: string;
+    network: string;
+    extra_wallets: PayoutWalletEntry[];
+  }>({
     name: "",
     upstream_base_url: "",
     payout_wallet: "",
-    network: "eip155:84532"
+    network: "eip155:84532",
+    extra_wallets: []
   });
 
   const [editingTool, setEditingTool] = useState<{
@@ -155,9 +172,20 @@ export function EndpointForm({
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (!WALLET_RE.test(draft.payoutWallet.trim())) {
-      setError("Enter your own valid 0x EVM payout wallet address.");
+    if (!isValidWalletAddress(draft.network, draft.payoutWallet)) {
+      setError(
+        getNetworkFamily(draft.network) === "solana"
+          ? "Enter a valid Solana Base58 payout wallet address."
+          : "Enter your own valid 0x EVM payout wallet address."
+      );
       return;
+    }
+    const cleanedExtras = (draft.extraWallets ?? []).filter((w) => w.address.trim().length > 0);
+    for (const extra of cleanedExtras) {
+      if (!isValidWalletAddress(extra.network, extra.address)) {
+        setError(`Invalid payout wallet address for ${getNetworkOption(extra.network)?.shortLabel ?? extra.network}.`);
+        return;
+      }
     }
     try {
       JSON.parse(draft.inputSchemaJson || "{}");
@@ -179,6 +207,7 @@ export function EndpointForm({
           name: draft.name.trim() || draft.subdomain.trim(),
           upstream_base_url: draft.upstreamUrl.trim(),
           payout_wallet: draft.payoutWallet.trim(),
+          payout_wallets: cleanedExtras.length > 0 ? cleanedExtras : undefined,
           network: draft.network,
           initial_tool: draft.toolName.trim()
             ? {
@@ -222,19 +251,28 @@ export function EndpointForm({
 
   const startEditTenant = (t: TenantItem) => {
     setEditingTenantId(t.id);
+    const extras = (t.payout_wallets ?? []).filter((w) => w.network !== t.network);
     setTenantEdit({
       name: t.name,
       upstream_base_url: t.upstream_base_url,
       payout_wallet: t.payout_wallet,
-      network: t.network
+      network: t.network,
+      extra_wallets: extras
     });
   };
 
   const saveEditTenant = async (tenantId: string) => {
+    const cleanedExtras = tenantEdit.extra_wallets.filter((w) => w.address.trim().length > 0);
     const res = await fetch(`/api/tenants/${tenantId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(tenantEdit)
+      body: JSON.stringify({
+        name: tenantEdit.name,
+        upstream_base_url: tenantEdit.upstream_base_url,
+        payout_wallet: tenantEdit.payout_wallet,
+        network: tenantEdit.network,
+        payout_wallets: cleanedExtras
+      })
     });
     if (!res.ok) {
       const err = (await res.json()) as { message?: string; error?: string };
@@ -471,30 +509,136 @@ export function EndpointForm({
             />
           </label>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="flex flex-col gap-3">
             <label className="flex flex-col gap-1">
-              <span className="text-[11px] font-medium text-zinc-600">Payout Wallet (0x USDC)</span>
-              <input
-                required
-                value={draft.payoutWallet}
-                onChange={(e) => updateDraft("payoutWallet", e.target.value)}
-                placeholder="0xYourWalletAddress..."
-                className="font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg px-3 min-h-[44px] sm:min-h-[38px] text-zinc-900 focus:outline-none focus:border-[#F6821F]"
-              />
-            </label>
-            <label className="flex flex-col gap-1">
-              <span className="text-[11px] font-medium text-zinc-600">Settlement Network</span>
+              <span className="text-[11px] font-medium text-zinc-600">Primary Settlement Network</span>
               <select
                 value={draft.network}
-                onChange={(e) =>
-                  updateDraft("network", e.target.value as "eip155:84532" | "eip155:8453")
-                }
+                onChange={(e) => updateDraft("network", e.target.value)}
                 className="font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[44px] sm:min-h-[38px] text-zinc-900 focus:outline-none focus:border-[#F6821F]"
               >
-                <option value="eip155:84532">Base Sepolia (Testnet)</option>
-                <option value="eip155:8453">Base Mainnet (Real USDC)</option>
+                <optgroup label="EVM Chains (0x USDC)">
+                  {NETWORK_OPTIONS.filter((n) => n.family === "evm").map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.label}
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="Solana (SVM SPL USDC)">
+                  {NETWORK_OPTIONS.filter((n) => n.family === "solana").map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.label}
+                    </option>
+                  ))}
+                </optgroup>
               </select>
             </label>
+
+            <div className="flex flex-col gap-1">
+              <span className="text-[11px] font-medium text-zinc-600">
+                Primary Payout Wallet ({getNetworkFamily(draft.network) === "solana" ? "Solana Base58" : "0x EVM"})
+              </span>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  required
+                  value={draft.payoutWallet}
+                  onChange={(e) => updateDraft("payoutWallet", e.target.value)}
+                  placeholder={
+                    getNetworkFamily(draft.network) === "solana"
+                      ? "YourSolanaBase58Address..."
+                      : "0xYourWalletAddress..."
+                  }
+                  className="flex-1 min-w-0 font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg px-3 min-h-[44px] sm:min-h-[38px] text-zinc-900 focus:outline-none focus:border-[#F6821F]"
+                />
+                <WalletConnectButton
+                  family={getNetworkFamily(draft.network)}
+                  onConnected={(addr) => updateDraft("payoutWallet", addr)}
+                />
+              </div>
+            </div>
+
+            {/* Additional Multi-Chain Payout Wallets (x402 v2 accepts[]) */}
+            <div className="flex flex-col gap-2 rounded-xl bg-zinc-50 border border-zinc-200 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium text-zinc-700">
+                  Additional Payout Wallets <span className="text-zinc-400">(Multi-Chain accepts[])</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const used = new Set([draft.network, ...(draft.extraWallets ?? []).map((w) => w.network)]);
+                    const nextNet =
+                      NETWORK_OPTIONS.find((n) => !used.has(n.id))?.id ??
+                      "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+                    updateDraft("extraWallets", [
+                      ...(draft.extraWallets ?? []),
+                      { network: nextNet, address: "" }
+                    ]);
+                  }}
+                  className="inline-flex items-center gap-1 font-mono text-[11px] text-[#C25906] hover:underline cursor-pointer"
+                >
+                  <Plus className="w-3 h-3" />
+                  Add Chain
+                </button>
+              </div>
+              {(draft.extraWallets ?? []).map((item, idx) => (
+                <div key={`${item.network}-${idx}`} className="flex flex-col gap-1.5 pt-1.5 border-t border-zinc-200/80">
+                  <div className="flex items-center gap-1.5">
+                    <select
+                      value={item.network}
+                      onChange={(e) => {
+                        const next = [...(draft.extraWallets ?? [])];
+                        next[idx] = { ...item, network: e.target.value };
+                        updateDraft("extraWallets", next);
+                      }}
+                      className="flex-1 font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2 min-h-[34px]"
+                    >
+                      {NETWORK_OPTIONS.map((n) => (
+                        <option key={n.id} value={n.id}>
+                          {n.label}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = (draft.extraWallets ?? []).filter((_, i) => i !== idx);
+                        updateDraft("extraWallets", next);
+                      }}
+                      className="p-1.5 text-zinc-400 hover:text-rose-600 cursor-pointer"
+                      title="Remove chain"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      value={item.address}
+                      onChange={(e) => {
+                        const next = [...(draft.extraWallets ?? [])];
+                        next[idx] = { ...item, address: e.target.value };
+                        updateDraft("extraWallets", next);
+                      }}
+                      placeholder={
+                        getNetworkFamily(item.network) === "solana"
+                          ? "Solana Base58 address..."
+                          : "0x EVM address..."
+                      }
+                      className="flex-1 min-w-0 font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[34px]"
+                    />
+                    <WalletConnectButton
+                      compact
+                      family={getNetworkFamily(item.network)}
+                      onConnected={(addr) => {
+                        const next = [...(draft.extraWallets ?? [])];
+                        next[idx] = { ...item, address: addr };
+                        updateDraft("extraWallets", next);
+                      }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="pt-2 border-t border-zinc-200 flex flex-col gap-2.5">
@@ -582,7 +726,9 @@ export function EndpointForm({
             </div>
           ) : (
             tenants.map((tenant) => {
-              const isMainnet = tenant.network === "eip155:8453";
+              const netInfo = getNetworkOption(tenant.network);
+              const isMainnet = netInfo?.isMainnet ?? false;
+              const extraChainCount = Math.max(0, (tenant.payout_wallets?.length ?? 1) - 1);
               return (
                 <div key={tenant.id} className="cf-card rounded-2xl p-4 flex flex-col gap-3 min-w-0">
                   <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
@@ -597,8 +743,15 @@ export function EndpointForm({
                               : "bg-[#F6821F]/10 text-[#C25906] border-[#F6821F]/25"
                           }`}
                         >
-                          {isMainnet ? "Base Mainnet · Real USDC" : "Base Sepolia · Testnet"}
+                          {netInfo
+                            ? `${netInfo.shortLabel} · ${isMainnet ? "Real USDC" : "Testnet"}`
+                            : tenant.network}
                         </span>
+                        {extraChainCount > 0 && (
+                          <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-zinc-100 text-zinc-700 border-zinc-200">
+                            +{extraChainCount} {extraChainCount === 1 ? "chain" : "chains"}
+                          </span>
+                        )}
                       </div>
                       <div className="font-mono text-xs text-zinc-600 mt-1 break-all">
                         {tenant.endpoint_url}
@@ -690,8 +843,20 @@ export function EndpointForm({
                           }
                           className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[38px]"
                         >
-                          <option value="eip155:84532">Base Sepolia (Testnet)</option>
-                          <option value="eip155:8453">Base Mainnet (Real USDC)</option>
+                          <optgroup label="EVM Chains (0x USDC)">
+                            {NETWORK_OPTIONS.filter((n) => n.family === "evm").map((n) => (
+                              <option key={n.id} value={n.id}>
+                                {n.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="Solana (SVM SPL USDC)">
+                            {NETWORK_OPTIONS.filter((n) => n.family === "solana").map((n) => (
+                              <option key={n.id} value={n.id}>
+                                {n.label}
+                              </option>
+                            ))}
+                          </optgroup>
                         </select>
                       </div>
                       <input
@@ -702,14 +867,114 @@ export function EndpointForm({
                         placeholder="https://api.example.com"
                         className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[38px]"
                       />
-                      <input
-                        value={tenantEdit.payout_wallet}
-                        onChange={(e) =>
-                          setTenantEdit((p) => ({ ...p, payout_wallet: e.target.value }))
-                        }
-                        placeholder="0xPayoutWallet"
-                        className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[38px]"
-                      />
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        <input
+                          value={tenantEdit.payout_wallet}
+                          onChange={(e) =>
+                            setTenantEdit((p) => ({ ...p, payout_wallet: e.target.value }))
+                          }
+                          placeholder={
+                            getNetworkFamily(tenantEdit.network) === "solana"
+                              ? "Solana Base58 Payout Wallet"
+                              : "0xPayoutWallet"
+                          }
+                          className="flex-1 min-w-0 font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[38px]"
+                        />
+                        <WalletConnectButton
+                          compact
+                          family={getNetworkFamily(tenantEdit.network)}
+                          onConnected={(addr) =>
+                            setTenantEdit((p) => ({ ...p, payout_wallet: addr }))
+                          }
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1.5 pt-1 border-t border-zinc-200">
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono text-[10px] text-zinc-500 uppercase">
+                            Additional Payout Chains
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const used = new Set([
+                                tenantEdit.network,
+                                ...tenantEdit.extra_wallets.map((w) => w.network)
+                              ]);
+                              const nextNet =
+                                NETWORK_OPTIONS.find((n) => !used.has(n.id))?.id ??
+                                "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+                              setTenantEdit((p) => ({
+                                ...p,
+                                extra_wallets: [...p.extra_wallets, { network: nextNet, address: "" }]
+                              }));
+                            }}
+                            className="inline-flex items-center gap-1 font-mono text-[11px] text-[#C25906] hover:underline cursor-pointer"
+                          >
+                            <Plus className="w-3 h-3" />
+                            Add Chain
+                          </button>
+                        </div>
+                        {tenantEdit.extra_wallets.map((w, idx) => (
+                          <div key={`${w.network}-${idx}`} className="flex flex-wrap sm:flex-nowrap items-center gap-1.5">
+                            <select
+                              value={w.network}
+                              onChange={(e) =>
+                                setTenantEdit((p) => {
+                                  const next = [...p.extra_wallets];
+                                  next[idx] = { ...w, network: e.target.value };
+                                  return { ...p, extra_wallets: next };
+                                })
+                              }
+                              className="font-mono text-[11px] bg-white border border-zinc-300 rounded-lg px-2 min-h-[34px]"
+                            >
+                              {NETWORK_OPTIONS.map((n) => (
+                                <option key={n.id} value={n.id}>
+                                  {n.shortLabel}
+                                </option>
+                              ))}
+                            </select>
+                            <input
+                              value={w.address}
+                              onChange={(e) =>
+                                setTenantEdit((p) => {
+                                  const next = [...p.extra_wallets];
+                                  next[idx] = { ...w, address: e.target.value };
+                                  return { ...p, extra_wallets: next };
+                                })
+                              }
+                              placeholder={
+                                getNetworkFamily(w.network) === "solana"
+                                  ? "Solana Base58..."
+                                  : "0x EVM..."
+                              }
+                              className="flex-1 min-w-0 font-mono text-[11px] bg-white border border-zinc-300 rounded-lg px-2 min-h-[34px]"
+                            />
+                            <WalletConnectButton
+                              compact
+                              family={getNetworkFamily(w.network)}
+                              onConnected={(addr) =>
+                                setTenantEdit((p) => {
+                                  const next = [...p.extra_wallets];
+                                  next[idx] = { ...w, address: addr };
+                                  return { ...p, extra_wallets: next };
+                                })
+                              }
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setTenantEdit((p) => ({
+                                  ...p,
+                                  extra_wallets: p.extra_wallets.filter((_, i) => i !== idx)
+                                }))
+                              }
+                              className="p-1 text-zinc-400 hover:text-rose-600 cursor-pointer"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
                       <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                         <div className="flex items-center gap-2">
                           <button
