@@ -17,22 +17,20 @@ import {
   timingSafeEqualString
 } from "../lib/crypto";
 
-async function verifyEnterpriseOAuthV2Stub(
+async function verifyEnterpriseOAuthV2(
   c: Context<AppEnv>,
   tenant: TenantRoutingRecord
-): Promise<{ ok: true } | { ok: false; status: 401; error: string }> {
+): Promise<{ ok: true } | { ok: false; status: 401 | 503; error: string }> {
   if (tenant.auth_mode !== "x402+oauth_v2") {
     return { ok: true };
   }
-  const auth = c.req.header("Authorization");
-  if (!auth || !auth.startsWith("Bearer ")) {
-    return {
-      ok: false,
-      status: 401,
-      error: "Enterprise tenant requires OAuth 2.1 Bearer token (CIMD / RFC 9207)."
-    };
-  }
-  return { ok: true };
+  // A Bearer header is not authentication. Do not advertise OAuth protection until
+  // this gateway has tenant-specific issuer, audience, JWKS, and claim validation.
+  return {
+    ok: false,
+    status: 503,
+    error: "OAuth-protected tenants are disabled until token verification is configured."
+  };
 }
 
 /**
@@ -257,7 +255,7 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     return;
   }
 
-  const enterpriseAuth = await verifyEnterpriseOAuthV2Stub(c, tenant);
+  const enterpriseAuth = await verifyEnterpriseOAuthV2(c, tenant);
   if (!enterpriseAuth.ok) {
     return c.json(
       {

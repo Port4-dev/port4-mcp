@@ -240,8 +240,14 @@ apiRoutes.post("/tenants", async (c) => {
     );
   }
 
+  if (body.auth_mode === "x402+oauth_v2") {
+    return c.json(
+      { error: "oauth_mode_unavailable", message: "OAuth tenant mode is unavailable until token verification is configured." },
+      422
+    );
+  }
   const network = body.network || c.env.X402_NETWORK;
-  const authMode = body.auth_mode === "x402+oauth_v2" ? "x402+oauth_v2" : "x402";
+  const authMode = "x402";
   const tenantId = `ten_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 
   try {

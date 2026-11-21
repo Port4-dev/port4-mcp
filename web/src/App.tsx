@@ -173,9 +173,11 @@ export default function App() {
     void loadData();
   }, [loadData]);
 
-  const handleDemoLogin = async () => {
-    await fetch("/api/auth/demo", { method: "POST" });
-    await loadData();
+  const requireAuthentication = async () => {
+    if (auth.githubConfigured) {
+      window.location.assign("/api/auth/github");
+    }
+    throw new Error("Sign in with GitHub to manage endpoints and API keys.");
   };
 
   const handleLogout = async () => {
@@ -188,7 +190,7 @@ export default function App() {
 
   const handleCreateApiKey = async () => {
     if (!auth.authenticated) {
-      await handleDemoLogin();
+      await requireAuthentication();
     }
     const res = await fetch("/api/keys", {
       method: "POST",
@@ -202,7 +204,7 @@ export default function App() {
   };
 
   const copyCurl = () => {
-    const snippet = `curl -i -X POST https://demo.port4.dev/mcp \\
+    const snippet = `curl -i -X POST https://port4.dev/mcp/demo \\
   -H "Content-Type: application/json" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping"}}'`;
     void navigator.clipboard.writeText(snippet);
@@ -294,7 +296,6 @@ export default function App() {
                 <button
                   type="button"
                   onClick={async () => {
-                    await handleDemoLogin();
                     navigate("dashboard");
                   }}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 bg-white px-3 min-h-[36px] text-xs font-medium text-zinc-800 hover:border-[#F6821F] cursor-pointer"
@@ -365,7 +366,6 @@ export default function App() {
                 <button
                   type="button"
                   onClick={async () => {
-                    await handleDemoLogin();
                     navigate("dashboard");
                   }}
                   className="cf-btn-primary inline-flex items-center justify-center rounded-xl min-h-[44px] text-xs"
@@ -491,7 +491,7 @@ export default function App() {
                 <EndpointForm
                   tenants={tenants}
                   authenticated={auth.authenticated}
-                  onRequireDemoLogin={handleDemoLogin}
+                  onRequireDemoLogin={requireAuthentication}
                   onRefresh={loadData}
                 />
               )}
@@ -513,7 +513,7 @@ export default function App() {
                       </button>
                     </div>
                     <pre className="font-mono text-[11px] leading-relaxed bg-[#18181B] border border-zinc-800 rounded-xl p-3.5 text-zinc-200 overflow-x-auto">
-{`curl -i -X POST https://demo.port4.dev/mcp \\
+{`curl -i -X POST https://port4.dev/mcp/demo \\
   -H "Content-Type: application/json" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping"}}'`}
                     </pre>

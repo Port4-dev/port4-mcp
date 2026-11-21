@@ -92,7 +92,7 @@ export function Docs({
             code={`{
   "mcpServers": {
     "port4-demo": {
-      "url": "https://demo.port4.dev/mcp",
+      "url": "https://port4.dev/mcp/demo",
       "headers": {
         "MCP-Protocol-Version": "2026-07-28"
       }
@@ -108,7 +108,7 @@ export function Docs({
           <CodeBlock
             id="list"
             title="cURL — tools/list"
-            code={`curl -X POST https://demo.port4.dev/mcp \\
+            code={`curl -X POST https://port4.dev/mcp/demo \\
   -H "Content-Type: application/json" \\
   -H "MCP-Protocol-Version: 2026-07-28" \\
   -H "Mcp-Method: tools/list" \\
@@ -141,7 +141,7 @@ const fetchWithPayment = wrapFetchWithPaymentFromConfig(fetch, {
   schemes: [{ network: "eip155:84532", client: new ExactEvmScheme(account) }]
 });
 
-const res = await fetchWithPayment("https://demo.port4.dev/mcp", {
+const res = await fetchWithPayment("https://port4.dev/mcp/demo", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",

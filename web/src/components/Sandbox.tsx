@@ -83,7 +83,7 @@ export function Sandbox({ onSettled }: SandboxProps) {
             Interactive Sandbox
           </span>
           <span className="font-mono text-[11px] text-zinc-500 bg-zinc-100 border border-zinc-200 px-2 py-0.5 rounded truncate max-w-full">
-            demo.port4.dev/mcp
+            port4.dev/mcp/demo
           </span>
         </div>
 
@@ -148,7 +148,7 @@ export function Sandbox({ onSettled }: SandboxProps) {
                 )
               : JSON.stringify(
                   {
-                    endpoint: "POST https://demo.port4.dev/mcp",
+                    endpoint: "POST https://port4.dev/mcp/demo",
                     method: "tools/call",
                     tool
                   },
