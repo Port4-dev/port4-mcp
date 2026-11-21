@@ -106,10 +106,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     if (tenant.upstream_base_url === "internal://sandbox") {
       upstreamResult = executeInternalSandboxTool(tool.name, mcp.arguments, colo);
     } else {
-      const targetUrl = new URL(
-        tool.upstream_path.startsWith("/") ? tool.upstream_path : `/${tool.upstream_path}`,
-        tenant.upstream_base_url
-      );
+      const targetUrl = new URL(tool.upstream_path, `${tenant.upstream_base_url}/`);
 
       const fetchInit: RequestInit = {
         method: tool.http_method,
@@ -133,9 +130,20 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       }
 
       try {
-        const upstreamRes = await fetch(targetUrl.toString(), fetchInit);
+        const upstreamRes = await fetch(targetUrl.toString(), {
+          ...fetchInit,
+          redirect: "error",
+          signal: AbortSignal.timeout(15_000)
+        });
         const contentType = upstreamRes.headers.get("content-type") ?? "";
         const rawText = await readBoundedText(upstreamRes);
+        if (!upstreamRes.ok) {
+          console.error(JSON.stringify({ event: "upstream_non_success", tenant: tenant.subdomain, tool: tool.name, status: upstreamRes.status }));
+          return c.json(
+            { jsonrpc: "2.0", id: mcp.rpcId, error: { code: -32000, message: "Upstream service returned an error." } },
+            502
+          );
+        }
         if (contentType.includes("application/json")) {
           try {
             upstreamResult = JSON.parse(rawText) as unknown;
@@ -149,20 +157,19 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
           };
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Upstream fetch failed";
         console.error(
           JSON.stringify({
             event: "upstream_fetch_failed",
             tenant: tenant.subdomain,
             tool: tool.name,
-            error: msg
+            error: err instanceof Error ? err.name : "unknown"
           })
         );
         return c.json(
           {
             jsonrpc: "2.0",
             id: mcp.rpcId,
-            error: { code: -32000, message: `Upstream error: ${msg}` }
+            error: { code: -32000, message: "Upstream service is unavailable." }
           },
           502
         );

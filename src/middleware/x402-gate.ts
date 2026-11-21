@@ -113,6 +113,15 @@ async function verifySandboxSignature(
   }
 
   if (
+    decoded.x402Version !== 2 ||
+    decoded.scheme !== "exact" ||
+    decoded.network !== requirement.network ||
+    !/^0x[a-fA-F0-9]{40}$/.test(auth.from) ||
+    !/^0x[a-fA-F0-9]{64}$/.test(auth.nonce) ||
+    !/^\d+$/.test(auth.validAfter) ||
+    !/^\d+$/.test(auth.validBefore) ||
+    Number(auth.validAfter) > Math.floor(Date.now() / 1000) ||
+    Number(auth.validBefore) < Math.floor(Date.now() / 1000) ||
     auth.to.toLowerCase() !== requirement.payTo.toLowerCase() ||
     auth.value !== requirement.amount
   ) {
@@ -156,7 +165,8 @@ async function verifyAndSettleViaFacilitator(
   const verifyRes = await fetch(`${baseUrl}/verify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(10_000)
   });
 
   if (!verifyRes.ok) {
@@ -195,7 +205,8 @@ async function verifyAndSettleViaFacilitator(
   const settleRes = await fetch(`${baseUrl}/settle`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(10_000)
   });
 
   if (!settleRes.ok) {
@@ -308,6 +319,25 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     );
   }
 
+  if (
+    decodedSignature.x402Version !== 2 ||
+    decodedSignature.scheme !== "exact" ||
+    decodedSignature.network !== requirement.network ||
+    !decodedSignature.payload?.authorization
+  ) {
+    c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+    return c.json({ error: "invalid_payment_signature", message: "Payment does not match this x402 requirement." }, 402);
+  }
+
+  const paymentFingerprint = await sha256Hex(signatureHeader);
+  const replayClaim = await c.env.DB.prepare(
+    "INSERT OR IGNORE INTO payment_replays (fingerprint, tenant_id, tool_id) VALUES (?, ?, ?)"
+  ).bind(paymentFingerprint, tenant.id, tool.id).run();
+  if ((replayClaim.meta.changes ?? 0) !== 1) {
+    c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+    return c.json({ error: "payment_already_used", message: "This payment authorization has already been processed." }, 409);
+  }
+
   let receipt: X402SettlementReceipt | null = null;
 
   if (tenant.subdomain === "demo" && decodedSignature.payload?.mode === "port4-sandbox-demo") {
@@ -317,6 +347,7 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
   }
 
   if (!receipt || !receipt.success) {
+    await c.env.DB.prepare("DELETE FROM payment_replays WHERE fingerprint = ?").bind(paymentFingerprint).run();
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
     return c.json(
       {

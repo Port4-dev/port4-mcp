@@ -29,6 +29,15 @@ function rpcError(
 export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => {
   c.set("requestStartedAt", Date.now());
 
+  const contentLength = Number(c.req.header("Content-Length") ?? "0");
+  if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > 64 * 1024) {
+    return c.json(rpcError(null, -32600, "Request body exceeds the 64 KiB limit."), 413);
+  }
+  const contentType = c.req.header("Content-Type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return c.json(rpcError(null, -32600, "Content-Type must be application/json."), 415);
+  }
+
   if (c.req.header("Mcp-Session-Id")) {
     return c.json(
       rpcError(null, -32600, "Stateless MCP 2026-07-28 forbids Mcp-Session-Id headers."),

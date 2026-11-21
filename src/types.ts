@@ -4,6 +4,7 @@ export type TenantStatus = "active" | "suspended";
 export interface AppBindings extends CloudflareBindings {
   PORT4_TREASURY_WALLET?: string;
   DEMO_PAYER_PRIVATE_KEY?: string;
+  DEMO_AUTH_ENABLED?: string;
 }
 
 export interface AuthUser {

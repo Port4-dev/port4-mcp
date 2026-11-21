@@ -59,9 +59,13 @@ export function decodeBase64Json<T>(base64: string): T {
 
 export function usdToAtomicUsdc(priceUsd: string): string {
   const cleaned = priceUsd.replace(/^\$/, "").trim();
-  const parsed = Number(cleaned);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return "1000";
+  if (!/^\d+(?:\.\d{1,6})?$/.test(cleaned)) {
+    throw new Error("Price must be a positive USD decimal with no more than 6 fractional digits.");
   }
-  return Math.max(1, Math.round(parsed * 1_000_000)).toString();
+  const [whole, fraction = ""] = cleaned.split(".");
+  const atomic = BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
+  if (atomic <= 0n || atomic > 1_000_000_000_000n) {
+    throw new Error("Price must be between 0.000001 and 1,000,000 USD.");
+  }
+  return atomic.toString();
 }

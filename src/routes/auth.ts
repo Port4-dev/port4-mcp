@@ -302,6 +302,9 @@ authRoutes.get("/github/callback", async (c) => {
 });
 
 authRoutes.post("/demo", async (c) => {
+  if (c.env.DEMO_AUTH_ENABLED !== "true") {
+    return c.json({ error: "demo_auth_disabled" }, 404);
+  }
   const existing = await fetchUserById(c, "usr_port4_sandbox");
 
   const user: AuthUser = existing ?? {

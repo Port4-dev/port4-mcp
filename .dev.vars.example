@@ -2,3 +2,4 @@
 JWT_SECRET=dev-local-port4-jwt-secret-change-in-prod-32bytes
 GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
+DEMO_AUTH_ENABLED=false

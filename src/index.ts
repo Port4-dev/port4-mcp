@@ -10,13 +10,14 @@ import { x402GateMiddleware } from "./middleware/x402-gate";
 import { handleMcpRequest } from "./routes/mcp";
 import { apiRoutes } from "./routes/api";
 import { sandboxRoutes } from "./routes/sandbox";
+import { controlPlaneCsrfMiddleware, isTrustedBrowserOrigin } from "./middleware/security";
 
 const app = new Hono<AppEnv>();
 
 app.use(
   "/api/*",
   cors({
-    origin: (origin) => origin || "https://port4.dev",
+    origin: (origin, c) => (isTrustedBrowserOrigin(origin, c.env.APP_URL) ? origin : "https://port4.dev"),
     allowHeaders: ["Content-Type", "Authorization"],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     credentials: true
@@ -72,11 +73,6 @@ app.use(
 );
 
 function extractTenantSubdomain(c: Context<AppEnv>): string | null {
-  const explicitHeader = c.req.header("X-Port4-Tenant")?.trim().toLowerCase();
-  if (explicitHeader) {
-    return explicitHeader;
-  }
-
   let urlHostname = "";
   try {
     urlHostname = new URL(c.req.url).hostname.toLowerCase();
@@ -84,11 +80,7 @@ function extractTenantSubdomain(c: Context<AppEnv>): string | null {
     // ignore
   }
 
-  const hostCandidates = [
-    c.req.header("X-Forwarded-Host"),
-    c.req.header("Host"),
-    urlHostname
-  ];
+  const hostCandidates = [urlHostname];
 
   for (const rawHost of hostCandidates) {
     if (!rawHost) continue;
@@ -113,7 +105,8 @@ const resolveTenantMiddleware = (forcedSubdomain?: string): MiddlewareHandler<Ap
   return async (c, next) => {
     const cfIp = c.req.header("CF-Connecting-IP");
     const isLocalDev = !cfIp || cfIp === "127.0.0.1" || cfIp === "::1";
-    const subdomain = forcedSubdomain ?? extractTenantSubdomain(c) ?? (isLocalDev ? "demo" : null);
+    const explicitHeader = isLocalDev ? c.req.header("X-Port4-Tenant")?.trim().toLowerCase() : null;
+    const subdomain = forcedSubdomain ?? explicitHeader ?? extractTenantSubdomain(c) ?? (isLocalDev ? "demo" : null);
     if (!subdomain) {
       return c.json(
         {
@@ -210,6 +203,7 @@ app.route("/sandbox", sandboxRoutes);
 app.route("/api/sandbox", sandboxRoutes);
 
 // Control Plane: Auth, Super-Admin, & Developer API
+app.use("/api/*", controlPlaneCsrfMiddleware);
 app.route("/auth", authRoutes);
 app.route("/api/auth", authRoutes);
 app.route("/api/admin", adminRoutes);

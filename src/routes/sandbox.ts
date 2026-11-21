@@ -9,6 +9,8 @@ import {
 } from "../lib/crypto";
 import { buildPaymentRequired, getSandboxSigningSecret } from "../middleware/x402-gate";
 import { resolveTenant } from "../lib/kv-sync";
+import { requireAdmin } from "./auth";
+import { controlPlaneCsrfMiddleware } from "../middleware/security";
 
 const DEMO_PRICES: Record<string, { price: number; change24h: number; volume24h: string }> = {
   "ETH-USD": { price: 3482.15, change24h: 2.84, volume24h: "$18.4B" },
@@ -212,7 +214,7 @@ sandboxRoutes.post("/run", async (c) => {
   });
 });
 
-sandboxRoutes.post("/sign", async (c) => {
+sandboxRoutes.post("/sign", controlPlaneCsrfMiddleware, requireAdmin, async (c) => {
   let body: { paymentRequiredHeader?: string; payerWallet?: string };
   try {
     body = (await c.req.json()) as { paymentRequiredHeader?: string; payerWallet?: string };

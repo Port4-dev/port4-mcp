@@ -7,6 +7,69 @@ import { randomHex, sha256Hex, usdToAtomicUsdc } from "../lib/crypto";
 const RESERVED_SUBDOMAINS = new Set(["www", "api", "app", "admin", "auth", "status", "docs"]);
 const SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const WALLET_RE = /^0x[a-fA-F0-9]{40}$/;
+const TOOL_NAME_RE = /^[a-zA-Z0-9_-]{2,64}$/;
+const HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
+
+function validateUpstreamBaseUrl(value: string): string | null {
+  if (value === "internal://sandbox") return value;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return null;
+    const hostname = url.hostname.toLowerCase();
+    if (
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname === "0.0.0.0" ||
+      hostname === "::" ||
+      hostname === "::1" ||
+      hostname.startsWith("fc") ||
+      hostname.startsWith("fd") ||
+      hostname.startsWith("fe80:") ||
+      hostname.startsWith("::ffff:") ||
+      /^127\./.test(hostname) ||
+      /^10\./.test(hostname) ||
+      /^192\.168\./.test(hostname) ||
+      /^169\.254\./.test(hostname) ||
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(hostname) ||
+      /^198\.(1[89])\./.test(hostname) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
+    ) {
+      return null;
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function validateToolDefinition(input: {
+  name?: string;
+  description?: string;
+  http_method?: string;
+  upstream_path?: string;
+  price_usd?: string;
+  input_schema_json?: string;
+}): { value: Required<typeof input> & { price_atomic: string } } | { error: string } {
+  const name = (input.name ?? "").trim();
+  const description = (input.description ?? "").trim();
+  const upstreamPath = (input.upstream_path ?? "").trim();
+  const method = input.http_method ?? "POST";
+  const priceUsd = (input.price_usd ?? "0.001").replace(/^\$/, "").trim();
+  const schema = input.input_schema_json ?? '{"type":"object","properties":{}}';
+
+  if (!TOOL_NAME_RE.test(name) || description.length > 1_024 || !upstreamPath.startsWith("/") || upstreamPath.startsWith("//") || upstreamPath.length > 512 || !HTTP_METHODS.has(method)) {
+    return { error: "invalid_tool_definition" };
+  }
+  try {
+    const parsed = JSON.parse(schema) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || schema.length > 32 * 1024) {
+      return { error: "invalid_input_schema" };
+    }
+    return { value: { name, description, http_method: method, upstream_path: upstreamPath, price_usd: priceUsd, input_schema_json: schema, price_atomic: usdToAtomicUsdc(priceUsd) } };
+  } catch {
+    return { error: "invalid_price_or_input_schema" };
+  }
+}
 
 export const apiRoutes = new Hono<AppEnv>();
 
@@ -158,13 +221,13 @@ apiRoutes.post("/tenants", async (c) => {
   }
 
   const name = (body.name ?? subdomain).trim();
-  const upstreamBaseUrl = (body.upstream_base_url ?? "").trim();
-  if (
-    upstreamBaseUrl !== "internal://sandbox" &&
-    !/^https?:\/\/.+/.test(upstreamBaseUrl)
-  ) {
+  if (!name || name.length > 128) {
+    return c.json({ error: "invalid_name" }, 400);
+  }
+  const upstreamBaseUrl = validateUpstreamBaseUrl((body.upstream_base_url ?? "").trim());
+  if (!upstreamBaseUrl) {
     return c.json(
-      { error: "invalid_upstream_url", message: "Upstream URL must start with https:// or http://." },
+      { error: "invalid_upstream_url", message: "Upstream URL must be a public HTTPS origin without credentials." },
       400
     );
   }
@@ -192,23 +255,27 @@ apiRoutes.post("/tenants", async (c) => {
     return c.json({ error: "subdomain_taken", message: `Subdomain '${subdomain}' is already registered.` }, 409);
   }
 
-  if (body.initial_tool && body.initial_tool.name && body.initial_tool.upstream_path) {
+  if (body.initial_tool) {
+    const validatedTool = validateToolDefinition(body.initial_tool);
+    if ("error" in validatedTool) {
+      await c.env.DB.prepare("DELETE FROM tenants WHERE id = ? AND user_id = ?").bind(tenantId, user.id).run();
+      return c.json({ error: validatedTool.error }, 400);
+    }
     const toolId = `tool_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const priceUsd = body.initial_tool.price_usd.replace(/^\$/, "").trim() || "0.001";
-    const priceAtomic = usdToAtomicUsdc(priceUsd);
     await c.env.DB.prepare(
-      `INSERT INTO tools (id, tenant_id, name, description, http_method, upstream_path, price_usd, price_atomic)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO tools (id, tenant_id, name, description, http_method, upstream_path, input_schema_json, price_usd, price_atomic)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         toolId,
         tenantId,
-        body.initial_tool.name.trim(),
-        body.initial_tool.description.trim() || `Paid MCP tool for ${name}`,
-        body.initial_tool.http_method ?? "POST",
-        body.initial_tool.upstream_path.trim(),
-        priceUsd,
-        priceAtomic
+        validatedTool.value.name,
+        validatedTool.value.description || `Paid MCP tool for ${name}`,
+        validatedTool.value.http_method,
+        validatedTool.value.upstream_path,
+        validatedTool.value.input_schema_json,
+        validatedTool.value.price_usd,
+        validatedTool.value.price_atomic
       )
       .run();
   }
@@ -276,14 +343,8 @@ apiRoutes.post("/tenants/:id/tools", async (c) => {
     return c.json({ error: "invalid_json" }, 400);
   }
 
-  const toolName = (body.name ?? "").trim();
-  const upstreamPath = (body.upstream_path ?? "").trim();
-  if (!/^[a-zA-Z0-9_-]{2,64}$/.test(toolName) || !upstreamPath) {
-    return c.json({ error: "invalid_tool_definition" }, 400);
-  }
-
-  const priceUsd = (body.price_usd ?? "0.001").replace(/^\$/, "").trim();
-  const priceAtomic = usdToAtomicUsdc(priceUsd);
+  const validatedTool = validateToolDefinition(body);
+  if ("error" in validatedTool) return c.json({ error: validatedTool.error }, 400);
   const toolId = `tool_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 
   await c.env.DB.prepare(
@@ -293,13 +354,13 @@ apiRoutes.post("/tenants/:id/tools", async (c) => {
     .bind(
       toolId,
       tenantId,
-      toolName,
-      (body.description ?? `Paid MCP tool ${toolName}`).trim(),
-      body.http_method ?? "POST",
-      upstreamPath,
-      body.input_schema_json ?? '{"type":"object","properties":{}}',
-      priceUsd,
-      priceAtomic
+      validatedTool.value.name,
+      validatedTool.value.description || `Paid MCP tool ${validatedTool.value.name}`,
+      validatedTool.value.http_method,
+      validatedTool.value.upstream_path,
+      validatedTool.value.input_schema_json,
+      validatedTool.value.price_usd,
+      validatedTool.value.price_atomic
     )
     .run();
 
