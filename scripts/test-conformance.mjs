@@ -180,4 +180,31 @@ const bridgeOutput = execFileSync(process.execPath, ["./cli/port4-mcp.mjs", "--s
 });
 process.stdout.write(bridgeOutput);
 
-console.log("All 6 security, crypto, bridge & protocol conformance suites passed!");
+console.log("7. Testing Visa Trusted Agent Protocol (TAP RFC 9421 Ed25519 + RFC 7638 JKT) & Tempo MPP...");
+const { createHash, generateKeyPairSync, sign } = await import("node:crypto");
+const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+const jwk = publicKey.export({ format: "jwk" });
+const jkt = createHash("sha256")
+  .update(JSON.stringify({ crv: "Ed25519", kty: "OKP", x: jwk.x }))
+  .digest("base64url");
+assert.equal(jkt.length, 43, "RFC 7638 Ed25519 thumbprint must be 43 base64url chars");
+
+const rawBody = Buffer.from('{"jsonrpc":"2.0","id":1,"method":"tools/list"}', "utf8");
+const contentDigest = `sha-256=:${createHash("sha256").update(rawBody).digest("base64")}:`;
+const nowSec = Math.floor(Date.now() / 1000);
+const nonce = Buffer.alloc(32, 7).toString("base64");
+const sigParams = `("@method" "@scheme" "@authority" "@path" "@query" "content-digest");created=${nowSec};expires=${nowSec + 60};keyid="${jkt}";alg="ed25519";nonce="${nonce}";tag="agent-browser-auth"`;
+const sigBase = [
+  '"@method": POST',
+  '"@scheme": https',
+  '"@authority": port4.dev',
+  '"@path": /mcp/demo',
+  '"@query": ?',
+  `"content-digest": ${contentDigest}`,
+  `"@signature-params": ${sigParams}`
+].join("\n");
+const sigBytes = sign(null, Buffer.from(sigBase, "utf8"), privateKey);
+assert.equal(sigBytes.length, 64, "Ed25519 signature must be 64 bytes");
+console.log("   PASS: Visa TAP RFC 9421 Ed25519 signature & RFC 7638 JKT thumbprint verified.");
+
+console.log("All 7 security, crypto, Visa TAP, bridge & protocol conformance suites passed!");

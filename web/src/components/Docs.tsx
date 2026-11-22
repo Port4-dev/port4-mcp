@@ -179,19 +179,19 @@ console.log(await res.json());`}
         {/* 4. Code Mode & Cloudflare One Zero Trust */}
         <section className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold text-zinc-900">
-            4. Organize Large APIs with Cloudflare Code Mode &amp; Zero Trust
+            4. Organize Large APIs with Cloudflare Code Mode, Visa TAP &amp; Tempo OUSD
           </h2>
           <p className="text-sm text-zinc-600">
             Switch any endpoint in <code className="font-mono text-xs">/dashboard</code> to{" "}
             <strong>Code Mode</strong> (<code className="font-mono text-xs">code</code>) or{" "}
             <strong>OpenAPI Code Mode</strong> (<code className="font-mono text-xs">search</code> +{" "}
-            <code className="font-mono text-xs">execute</code>). Agents run typed JavaScript inside
-            an isolated Cloudflare Dynamic Worker (<code className="font-mono text-xs">globalOutbound: null</code>)
-            while Port4 signs every <code className="font-mono text-xs">codemode.*</code> sub-call
-            with HMAC-SHA256. For enterprise endpoints, enable{" "}
-            <strong>Cloudflare One Access</strong> (<code className="font-mono text-xs">x402+oauth_v2</code>)
-            and authenticate agents via <code className="font-mono text-xs">CF-Access-Client-Id</code> /{" "}
-            <code className="font-mono text-xs">CF-Access-Client-Secret</code>.
+            <code className="font-mono text-xs">execute</code>). Enable{" "}
+            <strong>Visa TAP Verified Agent</strong> (<code className="font-mono text-xs">require_visa_tap</code>)
+            to verify RFC 9421 Ed25519 signatures against <code className="font-mono text-xs">auth.visacli.sh</code>.
+            Every endpoint also serves <code className="font-mono text-xs">/mcp/&#123;tenant&#125;/openapi.json</code>{" "}
+            with <code className="font-mono text-xs">x-payment-info</code> and dual{" "}
+            <code className="font-mono text-xs">PAYMENT-REQUIRED</code> (x402 USDC) +{" "}
+            <code className="font-mono text-xs">WWW-Authenticate: Payment</code> (Visa MPP Tempo OUSD) headers.
           </p>
           <CodeBlock
             id="codemode-call"

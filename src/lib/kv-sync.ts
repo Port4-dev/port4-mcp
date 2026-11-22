@@ -18,6 +18,8 @@ export async function loadTenantFromD1(
             COALESCE(t.settled_call_sequence, t.call_count, 0) AS settled_call_sequence,
             t.upstream_signing_secret, COALESCE(t.upstream_verified, 0) AS upstream_verified,
             COALESCE(t.require_upstream_verified, 0) AS require_upstream_verified,
+            COALESCE(t.require_visa_tap, 0) AS require_visa_tap,
+            COALESCE(t.allow_tap_simulated, 0) AS allow_tap_simulated,
             COALESCE(t.upstream_auth_type, 'none') AS upstream_auth_type,
             t.upstream_auth_header, t.upstream_auth_secret,
             COALESCE(t.rate_limit_rpm, 120) AS rate_limit_rpm,
@@ -82,6 +84,8 @@ export async function loadTenantFromD1(
     upstream_signing_secret: tenant.upstream_signing_secret ?? null,
     upstream_verified: Number(tenant.upstream_verified ?? 0),
     require_upstream_verified: Number(tenant.require_upstream_verified ?? 0),
+    require_visa_tap: Number(tenant.require_visa_tap ?? 0),
+    allow_tap_simulated: Number(tenant.allow_tap_simulated ?? 0),
     upstream_auth_type:
       tenant.upstream_auth_type === "bearer" || tenant.upstream_auth_type === "api_key_header"
         ? tenant.upstream_auth_type

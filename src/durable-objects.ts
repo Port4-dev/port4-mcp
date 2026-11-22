@@ -2,10 +2,11 @@ import { DurableObject } from "cloudflare:workers";
 import type { PaymentExecutionContext, X402SettlementReceipt } from "./types";
 
 interface RateLimitRequest {
-  operation?: "consume" | "next_fee_sequence";
+  operation?: "consume" | "next_fee_sequence" | "reserve_tap_nonce";
   limit?: number;
   windowSeconds?: number;
   dailyQuota?: number;
+  expiresEpochSec?: number;
 }
 
 interface RateLimitState {
@@ -34,6 +35,19 @@ export class EdgeRateLimiter extends DurableObject {
       const nextSeq = currentSeq + 1;
       await this.ctx.storage.put("paid_sequence", nextSeq);
       return Response.json({ sequence: nextSeq });
+    }
+
+    // Atomic distributed nonce reservation for Visa Trusted Agent Protocol (TAP RFC 9421)
+    if (input.operation === "reserve_tap_nonce") {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const expiresSec = Number(input.expiresEpochSec ?? nowSec + 60);
+      const existingUntil = await this.ctx.storage.get<number>("tap_nonce_until");
+      if (existingUntil && existingUntil > nowSec) {
+        return Response.json({ reserved: false });
+      }
+      await this.ctx.storage.put("tap_nonce_until", expiresSec);
+      await this.ctx.storage.setAlarm(expiresSec * 1000 + 5_000);
+      return Response.json({ reserved: true });
     }
 
     const limit = input.limit ?? 120;

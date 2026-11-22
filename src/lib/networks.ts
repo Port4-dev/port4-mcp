@@ -92,6 +92,24 @@ export const SUPPORTED_NETWORKS: readonly SupportedNetwork[] = [
     explorerTxPrefix: "https://snowtrace.io/tx/"
   },
   {
+    id: "eip155:4217",
+    label: "Tempo Mainnet (Visa CLI OUSD)",
+    shortLabel: "Tempo OUSD",
+    family: "evm",
+    isMainnet: true,
+    usdcAsset: "0x20c0000000000000000000006a37da5c996874be",
+    explorerTxPrefix: "https://explorer.tempo.xyz/tx/"
+  },
+  {
+    id: "eip155:42431",
+    label: "Tempo Testnet (Visa CLI OUSD)",
+    shortLabel: "Tempo Testnet",
+    family: "evm",
+    isMainnet: false,
+    usdcAsset: "0x20c0000000000000000000006a37da5c996874be",
+    explorerTxPrefix: "https://testnet.explorer.tempo.xyz/tx/"
+  },
+  {
     id: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
     label: "Solana Mainnet (Real USDC)",
     shortLabel: "Solana Mainnet",

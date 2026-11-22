@@ -112,8 +112,15 @@ async function dispatchUpstreamTool(params: {
   colo: string;
   requestId: string;
   idempotencyKey: string;
+  tapVerified?: {
+    keyId: string;
+    jkt: string;
+    agentId: string | null;
+    agentName: string;
+  };
 }): Promise<unknown> {
-  const { jwtSecret, tenant, tool, args, receipt, colo, requestId, idempotencyKey } = params;
+  const { jwtSecret, tenant, tool, args, receipt, colo, requestId, idempotencyKey, tapVerified } =
+    params;
 
   if (tenant.upstream_base_url === "internal://sandbox" || tool.source_type === "internal") {
     return executeInternalSandboxTool(tool.name, args, colo);
@@ -141,6 +148,14 @@ async function dispatchUpstreamTool(params: {
     "X-Port4-Request-Id": requestId,
     "Idempotency-Key": idempotencyKey
   };
+
+  if (tapVerified) {
+    upstreamHeaders["X-Port4-Tap-Verified"] = "true";
+    upstreamHeaders["X-Port4-Tap-Key-Id"] = tapVerified.keyId;
+    if (tapVerified.agentId) {
+      upstreamHeaders["X-Port4-Tap-Agent-Id"] = tapVerified.agentId;
+    }
+  }
 
   // Decrypt and inject upstream credentials if configured by the tenant owner
   if (tenant.upstream_auth_secret && tenant.upstream_auth_type !== "none") {
@@ -329,6 +344,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "LOCAL";
     const requestId = `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const idempotencyKey = c.get("paymentFingerprint") ?? receipt.transaction;
+    const tapVerified = c.get("tapVerified");
     let upstreamResult: unknown;
 
     const isCodeModeExec =
@@ -351,7 +367,8 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
             receipt,
             colo,
             requestId: `${requestId}_s${subcallIndex}`,
-            idempotencyKey: `${idempotencyKey}:${subTool.name}:${subcallIndex}`
+            idempotencyKey: `${idempotencyKey}:${subTool.name}:${subcallIndex}`,
+            tapVerified
           })
       });
 
@@ -403,7 +420,8 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
           receipt,
           colo,
           requestId,
-          idempotencyKey
+          idempotencyKey,
+          tapVerified
         });
       } catch (err) {
         console.error(

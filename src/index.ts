@@ -13,6 +13,7 @@ import { sandboxRoutes } from "./routes/sandbox";
 import { controlPlaneCsrfMiddleware, isTrustedBrowserOrigin } from "./middleware/security";
 import { edgeRateLimitMiddleware } from "./middleware/rate-limit";
 import { consumeMeteringEvents } from "./lib/metering";
+import { buildTenantOpenApiDocument } from "./lib/mpp-tempo";
 export { EdgeRateLimiter, PaymentReplayGuard } from "./durable-objects";
 
 const app = new Hono<AppEnv>();
@@ -41,13 +42,21 @@ app.use(
       "Mcp-Method",
       "Mcp-Name",
       "PAYMENT-SIGNATURE",
+      "Signature",
+      "Signature-Input",
+      "Content-Digest",
+      "Signature-Agent",
+      "Idempotency-Key",
       "X-Port4-Tenant"
     ],
     exposeHeaders: [
       "PAYMENT-REQUIRED",
       "PAYMENT-RESPONSE",
+      "WWW-Authenticate",
+      "Payment-Receipt",
       "X-Port4-Tenant",
       "X-Port4-Mcp-Mode",
+      "X-Port4-Tap-Agent",
       "X-Port4-Settlement-Tx",
       "MCP-Protocol-Version"
     ],
@@ -152,6 +161,8 @@ const healthHandler = (c: Context<AppEnv>) =>
     network: c.env.X402_NETWORK,
     capabilities: {
       codemodeLoader: Boolean(c.env.LOADER),
+      visaTap: true,
+      tempoMpp: true,
       r2Archive: Boolean(c.env.LEDGER_ARCHIVE),
       analyticsEngine: Boolean(c.env.GATEWAY_ANALYTICS),
       mainnetFacilitatorConfigured: Boolean(c.env.X402_MAINNET_FACILITATOR_URL)
@@ -160,6 +171,29 @@ const healthHandler = (c: Context<AppEnv>) =>
 
 app.get("/health", healthHandler);
 app.get("/api/health", healthHandler);
+
+// Auto-generated OpenAPI 3.1.0 with Visa CLI `x-payment-info` (for `discover` on Tempo OUSD)
+app.get("/openapi.json", resolveTenantMiddleware(), (c) => {
+  const tenant = c.get("tenant")!;
+  const reqUrl = new URL(c.req.url);
+  const publicOrigin =
+    reqUrl.hostname.endsWith(".port4.dev") || reqUrl.hostname === "port4.dev"
+      ? `https://${reqUrl.hostname}`
+      : c.env.APP_URL.replace(/\/$/, "");
+  c.header("Cache-Control", "public, max-age=300");
+  return c.json(buildTenantOpenApiDocument(tenant, publicOrigin));
+});
+
+app.get("/mcp/:tenant/openapi.json", async (c) => {
+  const slug = c.req.param("tenant").trim().toLowerCase();
+  const tenant = await resolveTenant(c.env, slug);
+  if (!tenant) {
+    return c.json({ error: "tenant_not_found_or_suspended" }, 404);
+  }
+  const publicOrigin = c.env.APP_URL.replace(/\/$/, "");
+  c.header("Cache-Control", "public, max-age=300");
+  return c.json(buildTenantOpenApiDocument(tenant, publicOrigin));
+});
 
 // Data Plane: Stateless Paid MCP Endpoint (subdomain OR /mcp/:tenant path fallback)
 app.post(

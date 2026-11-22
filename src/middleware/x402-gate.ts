@@ -21,6 +21,7 @@ import {
 } from "../lib/crypto";
 import { verifyCloudflareAccessJwt } from "../lib/cloudflare-access";
 import { fetchFacilitatorVerify, resolveFacilitatorConfig } from "../lib/facilitator";
+import { buildMppAuthenticateHeader, resolveTempoRecipient } from "../lib/mpp-tempo";
 import {
   EVM_ADDRESS_RE,
   SOLANA_ADDRESS_RE,
@@ -485,13 +486,30 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
   const signatureHeader = c.req.header("PAYMENT-SIGNATURE");
   if (!signatureHeader) {
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+    const tempoRecipient = resolveTempoRecipient(tenant, primaryRequirement.payTo);
+    if (tempoRecipient) {
+      const reqUrl = new URL(c.req.url);
+      const isTestnet =
+        primaryRequirement.network === "eip155:84532" ||
+        primaryRequirement.network === "eip155:421614" ||
+        primaryRequirement.network === "eip155:42431" ||
+        primaryRequirement.network === "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+      const mppHeader = buildMppAuthenticateHeader({
+        challengeId: `ch_${randomHex(12)}`,
+        realm: reqUrl.host,
+        amountAtomic: tool.price_atomic,
+        recipient: tempoRecipient,
+        isTestnet
+      });
+      c.header("WWW-Authenticate", mppHeader);
+    }
     c.header("X-Port4-Tenant", tenant.subdomain);
     c.header("Cache-Control", "no-store");
     const networkSummary = paymentRequired.accepts.map((a) => a.network).join(", ");
     return c.json(
       {
         error: "payment_required",
-        message: `Payment of $${tool.price_usd} USDC (${tool.price_atomic} atomic units) on ${networkSummary} required for tool '${tool.name}'.`,
+        message: `Payment of $${tool.price_usd} USDC/OUSD (${tool.price_atomic} atomic units) on ${networkSummary} required for tool '${tool.name}'.`,
         x402: paymentRequired
       },
       402

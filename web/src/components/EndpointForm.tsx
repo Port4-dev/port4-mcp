@@ -47,6 +47,8 @@ export interface TenantItem {
   upstream_auth_type?: "none" | "bearer" | "api_key_header";
   upstream_auth_header?: string | null;
   has_upstream_auth_secret?: boolean;
+  require_visa_tap?: number;
+  allow_tap_simulated?: number;
   cf_access_team_domain?: string | null;
   cf_access_aud?: string | null;
   endpoint_url: string;
@@ -141,6 +143,8 @@ export function EndpointForm({
     upstream_auth_header: string;
     upstream_auth_secret: string;
     has_upstream_auth_secret: boolean;
+    require_visa_tap: boolean;
+    allow_tap_simulated: boolean;
     auth_mode: "x402" | "x402+oauth_v2";
     cf_access_team_domain: string;
     cf_access_aud: string;
@@ -157,6 +161,8 @@ export function EndpointForm({
     upstream_auth_header: "X-API-Key",
     upstream_auth_secret: "",
     has_upstream_auth_secret: false,
+    require_visa_tap: false,
+    allow_tap_simulated: false,
     auth_mode: "x402",
     cf_access_team_domain: "",
     cf_access_aud: ""
@@ -310,6 +316,8 @@ export function EndpointForm({
       upstream_auth_header: t.upstream_auth_header ?? "X-API-Key",
       upstream_auth_secret: "",
       has_upstream_auth_secret: Boolean(t.has_upstream_auth_secret),
+      require_visa_tap: t.require_visa_tap === 1,
+      allow_tap_simulated: t.allow_tap_simulated === 1,
       auth_mode: t.auth_mode ?? "x402",
       cf_access_team_domain: t.cf_access_team_domain ?? "",
       cf_access_aud: t.cf_access_aud ?? ""
@@ -339,6 +347,8 @@ export function EndpointForm({
         ...(tenantEdit.upstream_auth_secret.trim().length > 0
           ? { upstream_auth_secret: tenantEdit.upstream_auth_secret.trim() }
           : {}),
+        require_visa_tap: tenantEdit.require_visa_tap ? 1 : 0,
+        allow_tap_simulated: tenantEdit.allow_tap_simulated ? 1 : 0,
         auth_mode: tenantEdit.auth_mode,
         cf_access_team_domain: tenantEdit.cf_access_team_domain.trim() || null,
         cf_access_aud: tenantEdit.cf_access_aud.trim() || null
@@ -904,6 +914,11 @@ export function EndpointForm({
                             CF Access Zero Trust
                           </span>
                         )}
+                        {tenant.require_visa_tap === 1 && (
+                          <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-indigo-50 text-indigo-700 border-indigo-200">
+                            Visa TAP Verified
+                          </span>
+                        )}
                       </div>
                       <div className="font-mono text-xs text-zinc-600 mt-1 break-all">
                         {tenant.endpoint_url}
@@ -1217,6 +1232,39 @@ export function EndpointForm({
                               }
                               className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
                             />
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white border border-zinc-200 px-3 py-2">
+                          <label className="inline-flex items-center gap-2 font-mono text-xs text-zinc-800 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={tenantEdit.require_visa_tap}
+                              onChange={(e) =>
+                                setTenantEdit((p) => ({
+                                  ...p,
+                                  require_visa_tap: e.target.checked
+                                }))
+                              }
+                              className="accent-[#F6821F]"
+                            />
+                            <span>Require Visa TAP Verified Agent (RFC 9421 Ed25519)</span>
+                          </label>
+                          {tenantEdit.require_visa_tap && (
+                            <label className="inline-flex items-center gap-1.5 font-mono text-[11px] text-zinc-600 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={tenantEdit.allow_tap_simulated}
+                                onChange={(e) =>
+                                  setTenantEdit((p) => ({
+                                    ...p,
+                                    allow_tap_simulated: e.target.checked
+                                  }))
+                                }
+                                className="accent-[#F6821F]"
+                              />
+                              <span>Allow TAP Sandbox Keys</span>
+                            </label>
                           )}
                         </div>
 

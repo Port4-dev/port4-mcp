@@ -14,6 +14,7 @@ export interface AppBindings extends CloudflareBindings {
   ADMIN_GITHUB_ID?: string;
   X402_MAINNET_FACILITATOR_URL?: string;
   X402_FACILITATOR_API_KEY?: string;
+  VISA_TAP_REGISTRY_URL?: string;
   GATEWAY_ANALYTICS?: AnalyticsEngineDataset;
   LEDGER_ARCHIVE?: R2Bucket;
   MCP_RATE_LIMIT_PER_MINUTE?: string;
@@ -81,6 +82,8 @@ export interface TenantRecord {
   upstream_signing_secret?: string | null;
   upstream_verified?: number;
   require_upstream_verified?: number;
+  require_visa_tap?: number;
+  allow_tap_simulated?: number;
   verification_token?: string | null;
   upstream_auth_type?: UpstreamAuthType;
   upstream_auth_header?: string | null;
@@ -115,6 +118,8 @@ export interface TenantRoutingRecord {
   upstream_signing_secret: string | null;
   upstream_verified: number;
   require_upstream_verified: number;
+  require_visa_tap: number;
+  allow_tap_simulated: number;
   upstream_auth_type: UpstreamAuthType;
   upstream_auth_header: string | null;
   upstream_auth_secret: string | null;
@@ -245,6 +250,15 @@ export interface AppVariables {
   paymentContext?: PaymentExecutionContext;
   rateLimitSequence?: number;
   requestStartedAt?: number;
+  rawBodyText?: string;
+  tapVerified?: {
+    keyId: string;
+    jkt: string;
+    agentId: string | null;
+    agentName: string;
+    simulated: boolean;
+    tag: "agent-browser-auth" | "agent-payer-auth";
+  };
 }
 
 export interface AppEnv {

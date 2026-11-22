@@ -1,6 +1,8 @@
 import type { MiddlewareHandler } from "hono";
 import type { AppEnv, McpJsonRpcRequest } from "../types";
 import { isAllowedMcpOrigin } from "../lib/schema-validator";
+import { createTapVerifier } from "../lib/visa-tap";
+import { sha256Hex } from "../lib/crypto";
 
 export const MCP_PROTOCOL_VERSION = "2026-07-28";
 const MAX_BODY_BYTES = 64 * 1024; // 64 KiB enforced on actual read bytes
@@ -74,6 +76,81 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
   const actualBytes = new TextEncoder().encode(rawText).byteLength;
   if (actualBytes > MAX_BODY_BYTES) {
     return c.json(rpcError(null, -32600, "Request body exceeds the 64 KiB limit."), 413);
+  }
+  c.set("rawBodyText", rawText);
+
+  // Visa Trusted Agent Protocol (TAP RFC 9421) Verification Gate
+  const tenant = c.get("tenant");
+  const hasTapHeaders = Boolean(c.req.header("Signature-Input") || c.req.header("Signature"));
+  if ((tenant && tenant.require_visa_tap === 1) || hasTapHeaders) {
+    const reqUrl = new URL(c.req.url);
+    const pinnedPublicOrigin =
+      reqUrl.hostname.endsWith(".port4.dev") || reqUrl.hostname === "port4.dev"
+        ? `https://${reqUrl.hostname}`
+        : (c.env.APP_URL || "https://port4.dev").replace(/\/$/, "");
+    const targetPathAndQuery = `${reqUrl.pathname}${reqUrl.search}`;
+
+    const headersLower: Record<string, string> = {};
+    c.req.raw.headers.forEach((val, key) => {
+      headersLower[key.toLowerCase()] = val;
+    });
+
+    const verifier = createTapVerifier({
+      registryOrigin: c.env.VISA_TAP_REGISTRY_URL || "https://auth.visacli.sh",
+      acceptSimulated: Boolean(tenant?.allow_tap_simulated === 1),
+      reserveNonce: async (nonceKey, expiresEpochSec) => {
+        const doKey = await sha256Hex(`tap-nonce:${nonceKey}`);
+        const stub = c.env.EDGE_RATE_LIMITER.get(c.env.EDGE_RATE_LIMITER.idFromName(doKey));
+        const res = await stub.fetch("https://rate-limit/tap-nonce", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            operation: "reserve_tap_nonce",
+            expiresEpochSec
+          })
+        });
+        if (!res.ok) throw new Error("tap_nonce_do_failed");
+        const data = (await res.json()) as { reserved?: boolean };
+        return Boolean(data.reserved);
+      }
+    });
+
+    const tapOutcome = await verifier({
+      method: c.req.method,
+      publicOrigin: pinnedPublicOrigin,
+      target: targetPathAndQuery,
+      headers: headersLower,
+      rawBody: rawText
+    });
+
+    if (!tapOutcome.ok) {
+      if (tapOutcome.status === 503 && tapOutcome.retryAfterSeconds) {
+        c.header("Retry-After", String(tapOutcome.retryAfterSeconds));
+      }
+      if (tenant?.require_visa_tap === 1 || hasTapHeaders) {
+        return c.json(
+          {
+            ok: false,
+            code: tapOutcome.code,
+            reason: tapOutcome.reason,
+            message: tapOutcome.message,
+            judged: tapOutcome.judged,
+            ...(tapOutcome.header ? { header: tapOutcome.header } : {})
+          },
+          tapOutcome.status
+        );
+      }
+    } else {
+      c.set("tapVerified", {
+        keyId: tapOutcome.keyId,
+        jkt: tapOutcome.jkt,
+        agentId: tapOutcome.agentId,
+        agentName: tapOutcome.agentName,
+        simulated: tapOutcome.simulated,
+        tag: tapOutcome.tag
+      });
+      c.header("X-Port4-Tap-Agent", tapOutcome.agentId || tapOutcome.keyId);
+    }
   }
 
   let body: McpJsonRpcRequest;

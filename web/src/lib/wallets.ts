@@ -25,6 +25,8 @@ export const NETWORK_OPTIONS: readonly NetworkOption[] = [
   { id: "eip155:137", label: "Polygon PoS (Real USDC)", shortLabel: "Polygon", family: "evm", isMainnet: true },
   { id: "eip155:1", label: "Ethereum Mainnet (Real USDC)", shortLabel: "Ethereum", family: "evm", isMainnet: true },
   { id: "eip155:43114", label: "Avalanche C-Chain (Real USDC)", shortLabel: "Avalanche", family: "evm", isMainnet: true },
+  { id: "eip155:4217", label: "Tempo Mainnet (Visa CLI OUSD)", shortLabel: "Tempo OUSD", family: "evm", isMainnet: true },
+  { id: "eip155:42431", label: "Tempo Testnet (Visa CLI OUSD)", shortLabel: "Tempo Testnet", family: "evm", isMainnet: false },
   { id: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", label: "Solana Mainnet (Real USDC)", shortLabel: "Solana Mainnet", family: "solana", isMainnet: true },
   { id: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", label: "Solana Devnet (Testnet)", shortLabel: "Solana Devnet", family: "solana", isMainnet: false }
 ] as const;

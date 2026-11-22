@@ -186,6 +186,8 @@ apiRoutes.get("/tenants", async (c) => {
             COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
             COALESCE(upstream_verified, 0) AS upstream_verified,
             COALESCE(require_upstream_verified, 0) AS require_upstream_verified,
+            COALESCE(require_visa_tap, 0) AS require_visa_tap,
+            COALESCE(allow_tap_simulated, 0) AS allow_tap_simulated,
             COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
             upstream_auth_header, upstream_auth_secret,
             cf_access_team_domain, cf_access_aud,
@@ -545,6 +547,8 @@ apiRoutes.patch("/tenants/:id", async (c) => {
             COALESCE(codemode_price_usd, '0.01') AS codemode_price_usd,
             COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
             COALESCE(require_upstream_verified, 0) AS require_upstream_verified,
+            COALESCE(require_visa_tap, 0) AS require_visa_tap,
+            COALESCE(allow_tap_simulated, 0) AS allow_tap_simulated,
             COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
             upstream_auth_header, upstream_auth_secret,
             cf_access_team_domain, cf_access_aud
@@ -564,6 +568,8 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       codemode_price_usd: string;
       codemode_max_subcalls: number;
       require_upstream_verified: number;
+      require_visa_tap: number;
+      allow_tap_simulated: number;
       upstream_auth_type: "none" | "bearer" | "api_key_header";
       upstream_auth_header: string | null;
       upstream_auth_secret: string | null;
@@ -584,6 +590,8 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     codemode_price_usd?: string;
     codemode_max_subcalls?: number;
     require_upstream_verified?: boolean | number;
+    require_visa_tap?: boolean | number;
+    allow_tap_simulated?: boolean | number;
     upstream_auth_type?: "none" | "bearer" | "api_key_header";
     upstream_auth_header?: string | null;
     upstream_auth_secret?: string | null;
@@ -762,11 +770,26 @@ apiRoutes.patch("/tenants/:id", async (c) => {
         : 0
       : existing.require_upstream_verified;
 
+  const nextRequireVisaTap =
+    body.require_visa_tap !== undefined
+      ? body.require_visa_tap === true || body.require_visa_tap === 1
+        ? 1
+        : 0
+      : existing.require_visa_tap;
+
+  const nextAllowTapSimulated =
+    body.allow_tap_simulated !== undefined
+      ? body.allow_tap_simulated === true || body.allow_tap_simulated === 1
+        ? 1
+        : 0
+      : existing.allow_tap_simulated;
+
   await c.env.DB.prepare(
     `UPDATE tenants
      SET name = ?, upstream_base_url = ?, payout_wallet = ?, payout_wallets_json = ?, network = ?,
          auth_mode = ?, mcp_mode = ?, codemode_price_usd = ?, codemode_max_subcalls = ?,
-         require_upstream_verified = ?, upstream_auth_type = ?, upstream_auth_header = ?, upstream_auth_secret = ?,
+         require_upstream_verified = ?, require_visa_tap = ?, allow_tap_simulated = ?,
+         upstream_auth_type = ?, upstream_auth_header = ?, upstream_auth_secret = ?,
          cf_access_team_domain = ?, cf_access_aud = ?, updated_at = datetime('now')
      WHERE id = ?`
   )
@@ -781,6 +804,8 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       nextCodePrice,
       nextMaxSubcalls,
       nextRequireVerified,
+      nextRequireVisaTap,
+      nextAllowTapSimulated,
       nextUpstreamAuthType,
       nextUpstreamAuthHeader,
       nextUpstreamAuthSecret,
