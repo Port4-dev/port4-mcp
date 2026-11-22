@@ -14,8 +14,10 @@ import {
   encodeBase64Json,
   hmacSha256Hex,
   sha256Hex,
-  timingSafeEqualString
+  timingSafeEqualString,
+  usdToAtomicUsdc
 } from "../lib/crypto";
+import { verifyCloudflareAccessJwt } from "../lib/cloudflare-access";
 import {
   EVM_ADDRESS_RE,
   SOLANA_ADDRESS_RE,
@@ -27,17 +29,44 @@ import {
 async function verifyEnterpriseOAuthV2(
   c: Context<AppEnv>,
   tenant: TenantRoutingRecord
-): Promise<{ ok: true } | { ok: false; status: 401 | 503; error: string }> {
+): Promise<{ ok: true } | { ok: false; status: 401 | 403 | 503; error: string }> {
   if (tenant.auth_mode !== "x402+oauth_v2") {
     return { ok: true };
   }
-  // A Bearer header is not authentication. Do not advertise OAuth protection until
-  // this gateway has tenant-specific issuer, audience, JWKS, and claim validation.
-  return {
-    ok: false,
-    status: 503,
-    error: "OAuth-protected tenants are disabled until token verification is configured."
-  };
+  if (!tenant.cf_access_team_domain || !tenant.cf_access_aud) {
+    return {
+      ok: false,
+      status: 503,
+      error: "Cloudflare Access team domain and AUD tag must be configured for x402+oauth_v2 tenants."
+    };
+  }
+
+  const cfAssertion = c.req.header("Cf-Access-Jwt-Assertion")?.trim();
+  const authHeader = c.req.header("Authorization")?.trim();
+  const bearerToken =
+    authHeader && authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice(7).trim()
+      : null;
+  const token = cfAssertion || bearerToken;
+
+  if (!token) {
+    return {
+      ok: false,
+      status: 401,
+      error:
+        "Cloudflare Access JWT required (send Cf-Access-Jwt-Assertion via Access Service Token or Authorization: Bearer <jwt>)."
+    };
+  }
+
+  const verified = await verifyCloudflareAccessJwt({
+    token,
+    teamDomain: tenant.cf_access_team_domain,
+    expectedAud: tenant.cf_access_aud
+  });
+  if (!verified.ok) {
+    return verified;
+  }
+  return { ok: true };
 }
 
 /**
@@ -316,7 +345,41 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     );
   }
 
-  const tool = tenant.tools.find((t) => t.name === mcp.toolName);
+  // Free progressive discovery tool in OpenAPI Code Mode (`search`)
+  if (tenant.mcp_mode === "openapi_codemode" && mcp.toolName === "search") {
+    await next();
+    return;
+  }
+
+  let tool: ToolRecord | undefined;
+  const isCodeModeExec =
+    (tenant.mcp_mode === "codemode" && mcp.toolName === "code") ||
+    (tenant.mcp_mode === "openapi_codemode" && mcp.toolName === "execute");
+
+  if (isCodeModeExec) {
+    const cmPrice = tenant.codemode_price_usd || "0.01";
+    let cmAtomic = "10000";
+    try {
+      cmAtomic = usdToAtomicUsdc(cmPrice);
+    } catch {
+      cmAtomic = "10000";
+    }
+    tool = {
+      id: `codemode_${tenant.id}`,
+      tenant_id: tenant.id,
+      name: mcp.toolName!,
+      description: `Code Mode sandbox execution on ${tenant.name}`,
+      http_method: "POST",
+      upstream_path: "/_codemode",
+      input_schema_json: '{"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}',
+      price_usd: cmPrice,
+      price_atomic: cmAtomic,
+      is_active: 1
+    };
+  } else {
+    tool = tenant.tools.find((t) => t.name === mcp.toolName);
+  }
+
   if (!tool) {
     return c.json(
       {

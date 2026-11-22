@@ -164,10 +164,44 @@ console.log(await res.json());`}
           />
         </section>
 
-        {/* 4. Publish Your Own API */}
+        {/* 4. Code Mode & Cloudflare One Zero Trust */}
         <section className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold text-zinc-900">
-            4. Publish Your Own REST API Programmatically
+            4. Organize Large APIs with Cloudflare Code Mode &amp; Zero Trust
+          </h2>
+          <p className="text-sm text-zinc-600">
+            Switch any endpoint in <code className="font-mono text-xs">/dashboard</code> to{" "}
+            <strong>Code Mode</strong> (<code className="font-mono text-xs">code</code>) or{" "}
+            <strong>OpenAPI Code Mode</strong> (<code className="font-mono text-xs">search</code> +{" "}
+            <code className="font-mono text-xs">execute</code>). Agents run typed JavaScript inside
+            an isolated Cloudflare Dynamic Worker (<code className="font-mono text-xs">globalOutbound: null</code>)
+            while Port4 signs every <code className="font-mono text-xs">codemode.*</code> sub-call
+            with HMAC-SHA256. For enterprise endpoints, enable{" "}
+            <strong>Cloudflare One Access</strong> (<code className="font-mono text-xs">x402+oauth_v2</code>)
+            and authenticate agents via <code className="font-mono text-xs">CF-Access-Client-Id</code> /{" "}
+            <code className="font-mono text-xs">CF-Access-Client-Secret</code>.
+          </p>
+          <CodeBlock
+            id="codemode-call"
+            title="Code Mode — Multi-Step Plan in 1 Paid Turn"
+            code={`{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "code",
+    "arguments": {
+      "code": "async () => { const q = await codemode.market_quote({ symbol: 'ETH-USD' }); const d = await codemode.edge_dns_lookup({ domain: 'port4.dev' }); return { eth: q.price_usd, colo: d.cloudflare_colo }; }"
+    }
+  }
+}`}
+          />
+        </section>
+
+        {/* 5. Publish Your Own API */}
+        <section className="flex flex-col gap-3">
+          <h2 className="text-lg font-semibold text-zinc-900">
+            5. Publish Your Own REST API Programmatically
           </h2>
           <CodeBlock
             id="api-create"

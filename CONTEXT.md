@@ -16,6 +16,7 @@
 | `TENANT_ROUTING` | KV Namespace | `b5d0c5acba7a402d9ad1960ae1c9c184` | Sub-5ms edge cache for tenant config, multi-wallet payouts, tools, quotas, and kill-switch |
 | `EDGE_RATE_LIMITER` | Durable Object | `EdgeRateLimiter` | Per-tenant/IP RPM, daily quotas, and atomic sequence for non-custodial fee splits |
 | `PAYMENT_REPLAY_GUARD` | Durable Object | `PaymentReplayGuard` | 3-state durable idempotency (`in_flight` → `settled_pending_upstream` → `completed`) |
+| `LOADER` | Worker Loader | `worker_loaders` | Isolated Dynamic Worker sandbox (`globalOutbound: null`) for `@cloudflare/codemode` |
 | `METERING_EVENTS` | Queue | `port4-metering` | Async zero-D1 hot-path metering batched into `usage_rollups` & optional R2 archival |
 | `ASSETS` | Workers Static Assets | `./dist` | React + Vite SPA (`run_worker_first: true`, `not_found_handling: "single-page-application"`) |
 
@@ -30,6 +31,7 @@
 4. `0004_usage_rollups.sql` — Queue-batched hourly aggregates (`usage_rollups`)
 5. `0005_upstream_security_and_quotas.sql` — `upstream_signing_secret`, `upstream_verified`, `verification_token`, `rate_limit_rpm`, `daily_quota`
 6. `0006_multi_wallet_payouts.sql` — `payout_wallets_json` for multi-chain EVM + Solana x402 v2 `accepts[]`
+7. `0007_codemode_and_zero_trust.sql` — `mcp_mode` (`direct`/`codemode`/`openapi_codemode`), `codemode_price_usd`, `codemode_max_subcalls`, `cf_access_team_domain`, `cf_access_aud`
 
 ## Routes
 - **Health & Meta:** `GET /health`, `GET /api/health`, `GET /api/networks`

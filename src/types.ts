@@ -2,6 +2,7 @@ import type { PayoutWalletEntry } from "./lib/networks";
 
 export type UserPlan = "free" | "pro";
 export type TenantStatus = "active" | "suspended";
+export type McpMode = "direct" | "codemode" | "openapi_codemode";
 
 export interface AppBindings extends CloudflareBindings {
   PORT4_TREASURY_WALLET?: string;
@@ -72,6 +73,11 @@ export interface TenantRecord {
   verification_token?: string | null;
   rate_limit_rpm?: number;
   daily_quota?: number;
+  mcp_mode?: McpMode;
+  codemode_price_usd?: string;
+  codemode_max_subcalls?: number;
+  cf_access_team_domain?: string | null;
+  cf_access_aud?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -94,6 +100,11 @@ export interface TenantRoutingRecord {
   upstream_verified: number;
   rate_limit_rpm: number;
   daily_quota: number;
+  mcp_mode: McpMode;
+  codemode_price_usd: string;
+  codemode_max_subcalls: number;
+  cf_access_team_domain: string | null;
+  cf_access_aud: string | null;
   tools: ToolRecord[];
   cached_at: string;
 }

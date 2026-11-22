@@ -3,6 +3,8 @@ import type { AppEnv, TenantRecord, ToolRecord, TransactionRecord } from "../typ
 import { requireAuth } from "../middleware/auth";
 import { invalidateTenantKv, syncTenantToKv } from "../lib/kv-sync";
 import { hmacSha256Hex, randomHex, sha256Hex, timingSafeEqualString, usdToAtomicUsdc } from "../lib/crypto";
+import { normalizeAccessTeamDomain } from "../lib/cloudflare-access";
+import { parseOpenApiSpecToTools } from "../lib/openapi-import";
 import {
   SUPPORTED_NETWORKS,
   isSupportedNetwork,
@@ -12,6 +14,8 @@ import {
   type PayoutWalletEntry
 } from "../lib/networks";
 import { interpolateUpstreamPath } from "./mcp";
+
+const MCP_MODES = new Set(["direct", "codemode", "openapi_codemode"]);
 
 const RESERVED_SUBDOMAINS = new Set(["www", "api", "app", "admin", "auth", "status", "docs"]);
 const SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
@@ -158,7 +162,13 @@ apiRoutes.use("/keys", requireAuth);
 apiRoutes.get("/tenants", async (c) => {
   const user = c.get("user")!;
   const tenantsRes = await c.env.DB.prepare(
-    `SELECT id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, created_at, updated_at
+    `SELECT id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json,
+            network, auth_mode, is_active,
+            COALESCE(mcp_mode, 'direct') AS mcp_mode,
+            COALESCE(codemode_price_usd, '0.01') AS codemode_price_usd,
+            COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
+            cf_access_team_domain, cf_access_aud,
+            created_at, updated_at
      FROM tenants
      WHERE user_id = ?
      ORDER BY created_at DESC`
@@ -209,6 +219,11 @@ apiRoutes.post("/tenants", async (c) => {
     payout_wallets?: PayoutWalletEntry[];
     network?: string;
     auth_mode?: "x402" | "x402+oauth_v2";
+    mcp_mode?: "direct" | "codemode" | "openapi_codemode";
+    codemode_price_usd?: string;
+    codemode_max_subcalls?: number;
+    cf_access_team_domain?: string;
+    cf_access_aud?: string;
     initial_tool?: {
       name: string;
       description: string;
@@ -285,13 +300,39 @@ apiRoutes.post("/tenants", async (c) => {
   const normalizedWallets = normalizePayoutWallets(network, payoutWallet, body.payout_wallets);
   const payoutWalletsJson = JSON.stringify(normalizedWallets);
 
-  if (body.auth_mode === "x402+oauth_v2") {
-    return c.json(
-      { error: "oauth_mode_unavailable", message: "OAuth tenant mode is unavailable until token verification is configured." },
-      422
-    );
+  const mcpMode = body.mcp_mode && MCP_MODES.has(body.mcp_mode) ? body.mcp_mode : "direct";
+  const codemodePriceUsd = (body.codemode_price_usd ?? "0.01").replace(/^\$/, "").trim();
+  try {
+    usdToAtomicUsdc(codemodePriceUsd);
+  } catch {
+    return c.json({ error: "invalid_codemode_price", message: "Code Mode price must be a valid USD decimal." }, 400);
   }
-  const authMode = "x402";
+  const codemodeMaxSubcalls = Math.min(50, Math.max(1, Math.floor(Number(body.codemode_max_subcalls ?? 10) || 10)));
+
+  let cfAccessTeamDomain: string | null = null;
+  let cfAccessAud: string | null = null;
+  let authMode: "x402" | "x402+oauth_v2" = "x402";
+
+  if (body.auth_mode === "x402+oauth_v2") {
+    const normalizedDomain = body.cf_access_team_domain
+      ? normalizeAccessTeamDomain(body.cf_access_team_domain)
+      : null;
+    const trimmedAud = (body.cf_access_aud ?? "").trim();
+    if (!normalizedDomain || trimmedAud.length < 16 || trimmedAud.length > 128) {
+      return c.json(
+        {
+          error: "invalid_cloudflare_access_config",
+          message:
+            "Cloudflare One Access requires a valid <team>.cloudflareaccess.com domain and AUD tag."
+        },
+        400
+      );
+    }
+    cfAccessTeamDomain = normalizedDomain;
+    cfAccessAud = trimmedAud;
+    authMode = "x402+oauth_v2";
+  }
+
   const tenantId = `ten_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
   const upstreamSigningSecret = `p4_whsec_${randomHex(24)}`;
   const verificationToken = `port4-verify=${randomHex(16)}`;
@@ -301,8 +342,8 @@ apiRoutes.post("/tenants", async (c) => {
   try {
     await c.env.DB.prepare(
       `INSERT INTO tenants
-       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
+       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota, mcp_mode, codemode_price_usd, codemode_max_subcalls, cf_access_team_domain, cf_access_aud)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         tenantId,
@@ -317,7 +358,12 @@ apiRoutes.post("/tenants", async (c) => {
         upstreamSigningSecret,
         verificationToken,
         rateLimitRpm,
-        dailyQuota
+        dailyQuota,
+        mcpMode,
+        codemodePriceUsd,
+        codemodeMaxSubcalls,
+        cfAccessTeamDomain,
+        cfAccessAud
       )
       .run();
   } catch {
@@ -437,7 +483,12 @@ apiRoutes.patch("/tenants/:id", async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const existing = await c.env.DB.prepare(
-    "SELECT id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    `SELECT id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network,
+            auth_mode, COALESCE(mcp_mode, 'direct') AS mcp_mode,
+            COALESCE(codemode_price_usd, '0.01') AS codemode_price_usd,
+            COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
+            cf_access_team_domain, cf_access_aud
+     FROM tenants WHERE id = ? AND user_id = ? LIMIT 1`
   )
     .bind(tenantId, user.id)
     .first<{
@@ -448,6 +499,12 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       payout_wallet: string;
       payout_wallets_json: string | null;
       network: string;
+      auth_mode: "x402" | "x402+oauth_v2";
+      mcp_mode: "direct" | "codemode" | "openapi_codemode";
+      codemode_price_usd: string;
+      codemode_max_subcalls: number;
+      cf_access_team_domain: string | null;
+      cf_access_aud: string | null;
     }>();
 
   if (!existing) return c.json({ error: "tenant_not_found" }, 404);
@@ -458,6 +515,12 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     payout_wallet?: string;
     payout_wallets?: PayoutWalletEntry[];
     network?: string;
+    auth_mode?: "x402" | "x402+oauth_v2";
+    mcp_mode?: "direct" | "codemode" | "openapi_codemode";
+    codemode_price_usd?: string;
+    codemode_max_subcalls?: number;
+    cf_access_team_domain?: string | null;
+    cf_access_aud?: string | null;
   };
   try {
     body = await c.req.json();
@@ -530,8 +593,64 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     nextPayoutWallets = normalizePayoutWallets(nextNetwork, nextWallet, existingExtras);
   }
 
+  let nextMcpMode = existing.mcp_mode;
+  if (body.mcp_mode !== undefined) {
+    if (!MCP_MODES.has(body.mcp_mode)) {
+      return c.json({ error: "invalid_mcp_mode", message: "Supported modes: direct, codemode, openapi_codemode." }, 400);
+    }
+    nextMcpMode = body.mcp_mode;
+  }
+
+  let nextCodePrice = existing.codemode_price_usd;
+  if (body.codemode_price_usd !== undefined) {
+    const cleaned = body.codemode_price_usd.replace(/^\$/, "").trim();
+    try {
+      usdToAtomicUsdc(cleaned);
+    } catch {
+      return c.json({ error: "invalid_codemode_price" }, 400);
+    }
+    nextCodePrice = cleaned;
+  }
+
+  const nextMaxSubcalls =
+    body.codemode_max_subcalls !== undefined
+      ? Math.min(50, Math.max(1, Math.floor(Number(body.codemode_max_subcalls) || 10)))
+      : existing.codemode_max_subcalls;
+
+  let nextAuthMode = existing.auth_mode;
+  let nextAccessDomain = existing.cf_access_team_domain;
+  let nextAccessAud = existing.cf_access_aud;
+
+  if (body.auth_mode !== undefined) {
+    nextAuthMode = body.auth_mode === "x402+oauth_v2" ? "x402+oauth_v2" : "x402";
+  }
+  if (body.cf_access_team_domain !== undefined) {
+    nextAccessDomain = body.cf_access_team_domain
+      ? normalizeAccessTeamDomain(body.cf_access_team_domain)
+      : null;
+    if (body.cf_access_team_domain && !nextAccessDomain) {
+      return c.json({ error: "invalid_cf_access_team_domain", message: "Use <team>.cloudflareaccess.com" }, 400);
+    }
+  }
+  if (body.cf_access_aud !== undefined) {
+    nextAccessAud = body.cf_access_aud ? body.cf_access_aud.trim() : null;
+  }
+  if (nextAuthMode === "x402+oauth_v2" && (!nextAccessDomain || !nextAccessAud || nextAccessAud.length < 16)) {
+    return c.json(
+      {
+        error: "invalid_cloudflare_access_config",
+        message: "Cloudflare Access requires both <team>.cloudflareaccess.com and an AUD tag."
+      },
+      400
+    );
+  }
+
   await c.env.DB.prepare(
-    "UPDATE tenants SET name = ?, upstream_base_url = ?, payout_wallet = ?, payout_wallets_json = ?, network = ?, updated_at = datetime('now') WHERE id = ?"
+    `UPDATE tenants
+     SET name = ?, upstream_base_url = ?, payout_wallet = ?, payout_wallets_json = ?, network = ?,
+         auth_mode = ?, mcp_mode = ?, codemode_price_usd = ?, codemode_max_subcalls = ?,
+         cf_access_team_domain = ?, cf_access_aud = ?, updated_at = datetime('now')
+     WHERE id = ?`
   )
     .bind(
       nextName,
@@ -539,6 +658,12 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       nextWallet,
       JSON.stringify(nextPayoutWallets),
       nextNetwork,
+      nextAuthMode,
+      nextMcpMode,
+      nextCodePrice,
+      nextMaxSubcalls,
+      nextAccessDomain,
+      nextAccessAud,
       existing.id
     )
     .run();
@@ -547,6 +672,127 @@ apiRoutes.patch("/tenants/:id", async (c) => {
   return c.json({
     ok: true,
     tenant: synced ? { ...synced, upstream_signing_secret: undefined } : null
+  });
+});
+
+/**
+ * Import an OpenAPI 3.x JSON spec (inline `spec` or public HTTPS `spec_url`) into Port4 tools,
+ * and optionally enable Code Mode (`codemode` or `openapi_codemode`) in one click.
+ */
+apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
+  const user = c.get("user")!;
+  const tenantId = c.req.param("id");
+  const tenant = await c.env.DB.prepare(
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+  )
+    .bind(tenantId, user.id)
+    .first<{ id: string; subdomain: string }>();
+
+  if (!tenant) return c.json({ error: "tenant_not_found" }, 404);
+
+  let body: {
+    spec?: unknown;
+    spec_url?: string;
+    default_price_usd?: string;
+    mcp_mode?: "direct" | "codemode" | "openapi_codemode";
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+
+  let rawSpec: unknown = body.spec;
+  if (!rawSpec && body.spec_url) {
+    const validatedUrl = validateUpstreamBaseUrl(body.spec_url.trim());
+    if (!validatedUrl || validatedUrl === "internal://sandbox") {
+      return c.json({ error: "invalid_spec_url", message: "OpenAPI spec URL must be a public HTTPS URL." }, 400);
+    }
+    try {
+      const res = await fetch(validatedUrl, {
+        method: "GET",
+        redirect: "error",
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(10_000)
+      });
+      if (!res.ok) {
+        return c.json({ error: "spec_fetch_failed", status: res.status }, 502);
+      }
+      rawSpec = await res.json();
+    } catch {
+      return c.json({ error: "spec_fetch_failed", message: "Unable to fetch OpenAPI JSON from URL." }, 502);
+    }
+  }
+
+  let imported;
+  try {
+    imported = parseOpenApiSpecToTools(rawSpec, 100);
+  } catch (err) {
+    return c.json(
+      { error: "invalid_openapi_spec", message: err instanceof Error ? err.message : "Invalid OpenAPI JSON." },
+      400
+    );
+  }
+
+  if (imported.length === 0) {
+    return c.json({ error: "no_operations_found", message: "No GET/POST/PUT/DELETE paths found in OpenAPI spec." }, 400);
+  }
+
+  const defaultPrice = (body.default_price_usd ?? "0.005").replace(/^\$/, "").trim();
+  let priceAtomic: string;
+  try {
+    priceAtomic = usdToAtomicUsdc(defaultPrice);
+  } catch {
+    return c.json({ error: "invalid_price" }, 400);
+  }
+
+  const existingTools = await c.env.DB.prepare("SELECT name FROM tools WHERE tenant_id = ?")
+    .bind(tenant.id)
+    .all<{ name: string }>();
+  const existingNames = new Set((existingTools.results ?? []).map((t) => t.name));
+
+  let added = 0;
+  const statements: D1PreparedStatement[] = [];
+  for (const item of imported) {
+    if (existingNames.has(item.name)) continue;
+    existingNames.add(item.name);
+    const toolId = `tool_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    statements.push(
+      c.env.DB.prepare(
+        `INSERT INTO tools (id, tenant_id, name, description, http_method, upstream_path, input_schema_json, price_usd, price_atomic)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        toolId,
+        tenant.id,
+        item.name,
+        item.description,
+        item.http_method,
+        item.upstream_path,
+        item.input_schema_json,
+        defaultPrice,
+        priceAtomic
+      )
+    );
+    added += 1;
+  }
+
+  if (body.mcp_mode && MCP_MODES.has(body.mcp_mode)) {
+    statements.push(
+      c.env.DB.prepare("UPDATE tenants SET mcp_mode = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(body.mcp_mode, tenant.id)
+    );
+  }
+
+  if (statements.length > 0) {
+    await c.env.DB.batch(statements);
+  }
+
+  await syncTenantToKv(c.env, tenant.subdomain);
+  return c.json({
+    ok: true,
+    imported_count: added,
+    total_spec_operations: imported.length,
+    mcp_mode: body.mcp_mode ?? undefined
   });
 });
 

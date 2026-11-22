@@ -1,9 +1,20 @@
 import type { Context } from "hono";
-import type { AppEnv, MeteringEvent } from "../types";
+import type {
+  AppEnv,
+  MeteringEvent,
+  TenantRoutingRecord,
+  ToolRecord,
+  X402SettlementReceipt
+} from "../types";
 import { executeInternalSandboxTool } from "./sandbox";
 import { hmacSha256Hex, sha256Hex } from "../lib/crypto";
 import { writeGatewayAnalytics } from "../lib/metering";
 import { resolveUsdcAsset } from "../middleware/x402-gate";
+import {
+  buildCodeModeMcpTools,
+  executeCodeModePlan,
+  searchTenantTools
+} from "../lib/codemode";
 
 export function interpolateUpstreamPath(
   pathTemplate: string,
@@ -79,6 +90,94 @@ function safeParseSchema(raw: string): Record<string, unknown> {
   return { type: "object", properties: {} };
 }
 
+async function dispatchUpstreamTool(params: {
+  tenant: TenantRoutingRecord;
+  tool: ToolRecord;
+  args: Record<string, unknown>;
+  receipt: X402SettlementReceipt;
+  colo: string;
+  requestId: string;
+  idempotencyKey: string;
+}): Promise<unknown> {
+  const { tenant, tool, args, receipt, colo, requestId, idempotencyKey } = params;
+
+  if (tenant.upstream_base_url === "internal://sandbox") {
+    return executeInternalSandboxTool(tool.name, args, colo);
+  }
+
+  const { resolvedPath, remainingArgs } = interpolateUpstreamPath(tool.upstream_path, args);
+  const targetUrl = new URL(resolvedPath, `${tenant.upstream_base_url}/`);
+
+  const upstreamHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Port4-Tenant": tenant.subdomain,
+    "X-Port4-Tool": tool.name,
+    "X-Port4-Payer": receipt.payer,
+    "X-Port4-Tx": receipt.transaction,
+    "X-Port4-Request-Id": requestId,
+    "Idempotency-Key": idempotencyKey
+  };
+
+  let serializedBody = "";
+  if (tool.http_method === "GET" || tool.http_method === "DELETE") {
+    for (const [k, v] of Object.entries(remainingArgs)) {
+      if (v !== undefined && v !== null) {
+        targetUrl.searchParams.set(k, String(v));
+      }
+    }
+  } else {
+    serializedBody = JSON.stringify(remainingArgs);
+  }
+
+  // Cryptographically sign outgoing upstream request so tenant origins can verify Port4 authenticity
+  if (tenant.upstream_signing_secret) {
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const bodyHash = await sha256Hex(serializedBody);
+    const signatureInput = `${timestamp}.${tenant.subdomain}.${tool.name}.${receipt.transaction}.${bodyHash}`;
+    const sig = await hmacSha256Hex(tenant.upstream_signing_secret, signatureInput);
+    upstreamHeaders["X-Port4-Timestamp"] = timestamp;
+    upstreamHeaders["X-Port4-Signature"] = `v1=${sig}`;
+  }
+
+  const fetchInit: RequestInit = {
+    method: tool.http_method,
+    headers: upstreamHeaders,
+    ...(tool.http_method === "GET" || tool.http_method === "DELETE"
+      ? {}
+      : { body: serializedBody })
+  };
+
+  const upstreamRes = await fetch(targetUrl.toString(), {
+    ...fetchInit,
+    redirect: "error",
+    signal: AbortSignal.timeout(15_000)
+  });
+  const contentType = upstreamRes.headers.get("content-type") ?? "";
+  const rawText = await readBoundedText(upstreamRes);
+  if (!upstreamRes.ok) {
+    console.error(
+      JSON.stringify({
+        event: "upstream_non_success",
+        tenant: tenant.subdomain,
+        tool: tool.name,
+        status: upstreamRes.status
+      })
+    );
+    throw new Error(`Upstream service returned HTTP ${upstreamRes.status}.`);
+  }
+  if (contentType.includes("application/json")) {
+    try {
+      return JSON.parse(rawText) as unknown;
+    } catch {
+      return { status: upstreamRes.status, body: rawText.slice(0, 4096) };
+    }
+  }
+  return {
+    status: upstreamRes.status,
+    body: rawText.slice(0, 4096)
+  };
+}
+
 export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
   const mcp = c.get("mcp");
   const tenant = c.get("tenant");
@@ -87,26 +186,31 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     return c.json({ error: "gateway_context_missing" }, 500);
   }
 
-  // 1. Edge-cached stateless tool discovery
+  // 1. Edge-cached stateless tool discovery (Direct MCP or Code Mode)
   if (mcp.method === "tools/list") {
-    const tools = tenant.tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: safeParseSchema(tool.input_schema_json),
-      _meta: {
-        x402: {
-          scheme: "exact",
-          network: tenant.network,
-          asset: resolveUsdcAsset(tenant.network, c.env.X402_USDC_ASSET),
-          priceUsd: `$${tool.price_usd}`,
-          amountAtomic: tool.price_atomic,
-          payTo: tenant.payout_wallet
-        }
-      }
-    }));
+    const resolvedAsset = resolveUsdcAsset(tenant.network, c.env.X402_USDC_ASSET);
+    const tools =
+      tenant.mcp_mode !== "direct"
+        ? buildCodeModeMcpTools(tenant, resolvedAsset)
+        : tenant.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: safeParseSchema(tool.input_schema_json),
+            _meta: {
+              x402: {
+                scheme: "exact",
+                network: tenant.network,
+                asset: resolvedAsset,
+                priceUsd: `$${tool.price_usd}`,
+                amountAtomic: tool.price_atomic,
+                payTo: tenant.payout_wallet
+              }
+            }
+          }));
 
     c.header("Cache-Control", "public, max-age=300");
     c.header("X-Port4-Tenant", tenant.subdomain);
+    c.header("X-Port4-Mcp-Mode", tenant.mcp_mode);
     c.header("MCP-Protocol-Version", mcp.protocolVersion);
 
     return c.json({
@@ -116,8 +220,27 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     });
   }
 
-  // 2. Paid tool invocation (x402GateMiddleware already verified & settled payment)
+  // 2. Tool invocation (free `search` in openapi_codemode, or x402-settled `code`/`execute`/direct)
   if (mcp.method === "tools/call") {
+    // 2a. Free progressive discovery (`search`) in OpenAPI Code Mode
+    if (tenant.mcp_mode === "openapi_codemode" && mcp.toolName === "search") {
+      const query = typeof mcp.arguments.query === "string" ? mcp.arguments.query : "";
+      const limit = typeof mcp.arguments.limit === "number" ? mcp.arguments.limit : 12;
+      const searchResult = searchTenantTools(tenant, query, limit);
+      c.header("Cache-Control", "public, max-age=60");
+      c.header("X-Port4-Tenant", tenant.subdomain);
+      c.header("X-Port4-Mcp-Mode", tenant.mcp_mode);
+      c.header("MCP-Protocol-Version", mcp.protocolVersion);
+      return c.json({
+        jsonrpc: "2.0",
+        id: mcp.rpcId,
+        result: {
+          content: [{ type: "text", text: JSON.stringify(searchResult, null, 2) }],
+          isError: false
+        }
+      });
+    }
+
     const tool = c.get("selectedTool");
     const receipt = c.get("x402Receipt");
     const startedAt = c.get("requestStartedAt") ?? Date.now();
@@ -138,88 +261,78 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     const idempotencyKey = c.get("paymentFingerprint") ?? receipt.transaction;
     let upstreamResult: unknown;
 
-    if (tenant.upstream_base_url === "internal://sandbox") {
-      upstreamResult = executeInternalSandboxTool(tool.name, mcp.arguments, colo);
+    const isCodeModeExec =
+      (tenant.mcp_mode === "codemode" && mcp.toolName === "code") ||
+      (tenant.mcp_mode === "openapi_codemode" && mcp.toolName === "execute");
+
+    if (isCodeModeExec) {
+      const code = typeof mcp.arguments.code === "string" ? mcp.arguments.code : "";
+      const execOutcome = await executeCodeModePlan({
+        env: c.env,
+        tenant,
+        code,
+        dispatchTool: async (subTool, subArgs) =>
+          dispatchUpstreamTool({
+            tenant,
+            tool: subTool,
+            args: subArgs,
+            receipt,
+            colo,
+            requestId,
+            idempotencyKey: `${idempotencyKey}:${subTool.name}`
+          })
+      });
+
+      if (!execOutcome.ok) {
+        return c.json(
+          {
+            jsonrpc: "2.0",
+            id: mcp.rpcId,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      error: execOutcome.error,
+                      logs: execOutcome.logs ?? [],
+                      subcalls: execOutcome.subcalls
+                    },
+                    null,
+                    2
+                  )
+                }
+              ],
+              isError: true
+            }
+          },
+          200
+        );
+      }
+
+      upstreamResult = {
+        result: execOutcome.result,
+        ...(execOutcome.logs && execOutcome.logs.length > 0 ? { logs: execOutcome.logs } : {}),
+        _codemode: { subcalls: execOutcome.subcalls, mode: tenant.mcp_mode }
+      };
     } else {
-      const { resolvedPath, remainingArgs } = interpolateUpstreamPath(
-        tool.upstream_path,
-        mcp.arguments
-      );
-      const targetUrl = new URL(resolvedPath, `${tenant.upstream_base_url}/`);
-
-      const upstreamHeaders: Record<string, string> = {
-        "Content-Type": "application/json",
-        "X-Port4-Tenant": tenant.subdomain,
-        "X-Port4-Tool": tool.name,
-        "X-Port4-Payer": receipt.payer,
-        "X-Port4-Tx": receipt.transaction,
-        "X-Port4-Request-Id": requestId,
-        "Idempotency-Key": idempotencyKey
-      };
-
-      let serializedBody = "";
-      if (tool.http_method === "GET" || tool.http_method === "DELETE") {
-        for (const [k, v] of Object.entries(remainingArgs)) {
-          if (v !== undefined && v !== null) {
-            targetUrl.searchParams.set(k, String(v));
-          }
-        }
-      } else {
-        serializedBody = JSON.stringify(remainingArgs);
-      }
-
-      // Cryptographically sign outgoing upstream request so tenant origins can verify Port4 authenticity
-      if (tenant.upstream_signing_secret) {
-        const timestamp = String(Math.floor(Date.now() / 1000));
-        const bodyHash = await sha256Hex(serializedBody);
-        const signatureInput = `${timestamp}.${tenant.subdomain}.${tool.name}.${receipt.transaction}.${bodyHash}`;
-        const sig = await hmacSha256Hex(tenant.upstream_signing_secret, signatureInput);
-        upstreamHeaders["X-Port4-Timestamp"] = timestamp;
-        upstreamHeaders["X-Port4-Signature"] = `v1=${sig}`;
-      }
-
-      const fetchInit: RequestInit = {
-        method: tool.http_method,
-        headers: upstreamHeaders,
-        ...(tool.http_method === "GET" || tool.http_method === "DELETE"
-          ? {}
-          : { body: serializedBody })
-      };
-
       try {
-        const upstreamRes = await fetch(targetUrl.toString(), {
-          ...fetchInit,
-          redirect: "error",
-          signal: AbortSignal.timeout(15_000)
+        upstreamResult = await dispatchUpstreamTool({
+          tenant,
+          tool,
+          args: mcp.arguments,
+          receipt,
+          colo,
+          requestId,
+          idempotencyKey
         });
-        const contentType = upstreamRes.headers.get("content-type") ?? "";
-        const rawText = await readBoundedText(upstreamRes);
-        if (!upstreamRes.ok) {
-          console.error(JSON.stringify({ event: "upstream_non_success", tenant: tenant.subdomain, tool: tool.name, status: upstreamRes.status }));
-          return c.json(
-            { jsonrpc: "2.0", id: mcp.rpcId, error: { code: -32000, message: "Upstream service returned an error." } },
-            502
-          );
-        }
-        if (contentType.includes("application/json")) {
-          try {
-            upstreamResult = JSON.parse(rawText) as unknown;
-          } catch {
-            upstreamResult = { status: upstreamRes.status, body: rawText.slice(0, 4096) };
-          }
-        } else {
-          upstreamResult = {
-            status: upstreamRes.status,
-            body: rawText.slice(0, 4096)
-          };
-        }
       } catch (err) {
         console.error(
           JSON.stringify({
             event: "upstream_fetch_failed",
             tenant: tenant.subdomain,
             tool: tool.name,
-            error: err instanceof Error ? err.name : "unknown"
+            error: err instanceof Error ? err.message : "unknown"
           })
         );
         return c.json(

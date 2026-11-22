@@ -34,6 +34,9 @@ app.use(
     allowHeaders: [
       "Content-Type",
       "Authorization",
+      "Cf-Access-Jwt-Assertion",
+      "CF-Access-Client-Id",
+      "CF-Access-Client-Secret",
       "MCP-Protocol-Version",
       "Mcp-Method",
       "Mcp-Name",
@@ -44,6 +47,7 @@ app.use(
       "PAYMENT-REQUIRED",
       "PAYMENT-RESPONSE",
       "X-Port4-Tenant",
+      "X-Port4-Mcp-Mode",
       "X-Port4-Settlement-Tx",
       "MCP-Protocol-Version"
     ],

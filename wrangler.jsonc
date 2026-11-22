@@ -46,6 +46,11 @@
 			"id": "b5d0c5acba7a402d9ad1960ae1c9c184"
 		}
 	],
+	"worker_loaders": [
+		{
+			"binding": "LOADER"
+		}
+	],
 	"durable_objects": {
 		"bindings": [
 			{ "name": "EDGE_RATE_LIMITER", "class_name": "EdgeRateLimiter" },

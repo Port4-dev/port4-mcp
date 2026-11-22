@@ -40,6 +40,12 @@ export interface TenantItem {
   payout_wallet: string;
   payout_wallets?: PayoutWalletEntry[];
   network: string;
+  auth_mode?: "x402" | "x402+oauth_v2";
+  mcp_mode?: "direct" | "codemode" | "openapi_codemode";
+  codemode_price_usd?: string;
+  codemode_max_subcalls?: number;
+  cf_access_team_domain?: string | null;
+  cf_access_aud?: string | null;
   endpoint_url: string;
   tools: ToolItem[];
 }
@@ -60,6 +66,9 @@ interface DraftState {
   payoutWallet: string;
   network: string;
   extraWallets: PayoutWalletEntry[];
+  mcpMode: "direct" | "codemode" | "openapi_codemode";
+  codemodePriceUsd: string;
+  codemodeMaxSubcalls: string;
   toolName: string;
   toolDescription: string;
   toolMethod: "GET" | "POST" | "PUT" | "DELETE";
@@ -75,6 +84,9 @@ const EMPTY_DRAFT: DraftState = {
   payoutWallet: "",
   network: "eip155:84532",
   extraWallets: [],
+  mcpMode: "direct",
+  codemodePriceUsd: "0.01",
+  codemodeMaxSubcalls: "10",
   toolName: "",
   toolDescription: "",
   toolMethod: "POST",
@@ -119,13 +131,32 @@ export function EndpointForm({
     payout_wallet: string;
     network: string;
     extra_wallets: PayoutWalletEntry[];
+    mcp_mode: "direct" | "codemode" | "openapi_codemode";
+    codemode_price_usd: string;
+    codemode_max_subcalls: number;
+    auth_mode: "x402" | "x402+oauth_v2";
+    cf_access_team_domain: string;
+    cf_access_aud: string;
   }>({
     name: "",
     upstream_base_url: "",
     payout_wallet: "",
     network: "eip155:84532",
-    extra_wallets: []
+    extra_wallets: [],
+    mcp_mode: "direct",
+    codemode_price_usd: "0.01",
+    codemode_max_subcalls: 10,
+    auth_mode: "x402",
+    cf_access_team_domain: "",
+    cf_access_aud: ""
   });
+  const [openApiImport, setOpenApiImport] = useState<{
+    tenantId: string;
+    specUrl: string;
+    defaultPrice: string;
+    enableMode: "codemode" | "openapi_codemode";
+    busy: boolean;
+  } | null>(null);
 
   const [editingTool, setEditingTool] = useState<{
     tenantId: string;
@@ -209,6 +240,9 @@ export function EndpointForm({
           payout_wallet: draft.payoutWallet.trim(),
           payout_wallets: cleanedExtras.length > 0 ? cleanedExtras : undefined,
           network: draft.network,
+          mcp_mode: draft.mcpMode,
+          codemode_price_usd: draft.codemodePriceUsd.trim() || "0.01",
+          codemode_max_subcalls: Number(draft.codemodeMaxSubcalls) || 10,
           initial_tool: draft.toolName.trim()
             ? {
                 name: draft.toolName.trim(),
@@ -257,11 +291,18 @@ export function EndpointForm({
       upstream_base_url: t.upstream_base_url,
       payout_wallet: t.payout_wallet,
       network: t.network,
-      extra_wallets: extras
+      extra_wallets: extras,
+      mcp_mode: t.mcp_mode ?? "direct",
+      codemode_price_usd: t.codemode_price_usd ?? "0.01",
+      codemode_max_subcalls: t.codemode_max_subcalls ?? 10,
+      auth_mode: t.auth_mode ?? "x402",
+      cf_access_team_domain: t.cf_access_team_domain ?? "",
+      cf_access_aud: t.cf_access_aud ?? ""
     });
   };
 
   const saveEditTenant = async (tenantId: string) => {
+    setError(null);
     const cleanedExtras = tenantEdit.extra_wallets.filter((w) => w.address.trim().length > 0);
     const res = await fetch(`/api/tenants/${tenantId}`, {
       method: "PATCH",
@@ -271,7 +312,13 @@ export function EndpointForm({
         upstream_base_url: tenantEdit.upstream_base_url,
         payout_wallet: tenantEdit.payout_wallet,
         network: tenantEdit.network,
-        payout_wallets: cleanedExtras
+        payout_wallets: cleanedExtras,
+        mcp_mode: tenantEdit.mcp_mode,
+        codemode_price_usd: tenantEdit.codemode_price_usd,
+        codemode_max_subcalls: tenantEdit.codemode_max_subcalls,
+        auth_mode: tenantEdit.auth_mode,
+        cf_access_team_domain: tenantEdit.cf_access_team_domain.trim() || null,
+        cf_access_aud: tenantEdit.cf_access_aud.trim() || null
       })
     });
     if (!res.ok) {
@@ -281,6 +328,37 @@ export function EndpointForm({
     }
     setEditingTenantId(null);
     await onRefresh();
+  };
+
+  const runOpenApiImport = async () => {
+    if (!openApiImport || !openApiImport.specUrl.trim()) return;
+    setOpenApiImport((p) => (p ? { ...p, busy: true } : null));
+    setLiveProbe({ tenantId: openApiImport.tenantId, output: "Importing OpenAPI 3.x spec..." });
+    try {
+      const res = await fetch(`/api/tenants/${openApiImport.tenantId}/import-openapi`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spec_url: openApiImport.specUrl.trim(),
+          default_price_usd: openApiImport.defaultPrice.trim() || "0.005",
+          mcp_mode: openApiImport.enableMode
+        })
+      });
+      const data = await res.json();
+      setLiveProbe({ tenantId: openApiImport.tenantId, output: JSON.stringify(data, null, 2) });
+      if (res.ok) {
+        setOpenApiImport(null);
+        await onRefresh();
+      } else {
+        setOpenApiImport((p) => (p ? { ...p, busy: false } : null));
+      }
+    } catch (err) {
+      setLiveProbe({
+        tenantId: openApiImport.tenantId,
+        output: err instanceof Error ? err.message : "OpenAPI import failed"
+      });
+      setOpenApiImport((p) => (p ? { ...p, busy: false } : null));
+    }
   };
 
   const rotateSecret = async (tenant: TenantItem) => {
@@ -641,6 +719,47 @@ export function EndpointForm({
             </div>
           </div>
 
+          <div className="flex flex-col gap-2 pt-2 border-t border-zinc-200">
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] font-medium text-zinc-600">MCP Organization Mode</span>
+              <select
+                value={draft.mcpMode}
+                onChange={(e) =>
+                  updateDraft("mcpMode", e.target.value as "direct" | "codemode" | "openapi_codemode")
+                }
+                className="font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[44px] sm:min-h-[38px] text-zinc-900 focus:outline-none focus:border-[#F6821F]"
+              >
+                <option value="direct">Direct Native MCP (1 tool = 1 paid call)</option>
+                <option value="codemode">Cloudflare Code Mode (Single `code` tool)</option>
+                <option value="openapi_codemode">OpenAPI Code Mode (`search` + `execute`)</option>
+              </select>
+            </label>
+            {draft.mcpMode !== "direct" && (
+              <div className="grid grid-cols-2 gap-2">
+                <label className="flex flex-col gap-1">
+                  <span className="text-[10px] font-mono text-zinc-500">Exec Price (USD)</span>
+                  <input
+                    value={draft.codemodePriceUsd}
+                    onChange={(e) => updateDraft("codemodePriceUsd", e.target.value)}
+                    placeholder="0.01"
+                    className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-[10px] font-mono text-zinc-500">Max Sub-Calls</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={draft.codemodeMaxSubcalls}
+                    onChange={(e) => updateDraft("codemodeMaxSubcalls", e.target.value)}
+                    className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+
           <div className="pt-2 border-t border-zinc-200 flex flex-col gap-2.5">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
               Initial Tool Definition
@@ -750,6 +869,16 @@ export function EndpointForm({
                         {extraChainCount > 0 && (
                           <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-zinc-100 text-zinc-700 border-zinc-200">
                             +{extraChainCount} {extraChainCount === 1 ? "chain" : "chains"}
+                          </span>
+                        )}
+                        {tenant.mcp_mode && tenant.mcp_mode !== "direct" && (
+                          <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-orange-50 text-[#C25906] border-[#F6821F]/30">
+                            {tenant.mcp_mode === "openapi_codemode" ? "Code Mode · Search+Exec" : "Code Mode"}
+                          </span>
+                        )}
+                        {tenant.auth_mode === "x402+oauth_v2" && (
+                          <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-sky-50 text-sky-700 border-sky-200">
+                            CF Access Zero Trust
                           </span>
                         )}
                       </div>
@@ -975,8 +1104,143 @@ export function EndpointForm({
                           </div>
                         ))}
                       </div>
+                      {/* Code Mode & Cloudflare One Access Settings */}
+                      <div className="flex flex-col gap-2 pt-2 border-t border-zinc-200">
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <select
+                            value={tenantEdit.mcp_mode}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({
+                                ...p,
+                                mcp_mode: e.target.value as "direct" | "codemode" | "openapi_codemode"
+                              }))
+                            }
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2 min-h-[36px]"
+                          >
+                            <option value="direct">Direct MCP</option>
+                            <option value="codemode">Code Mode (`code`)</option>
+                            <option value="openapi_codemode">OpenAPI (`search`+`execute`)</option>
+                          </select>
+                          <input
+                            value={tenantEdit.codemode_price_usd}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({ ...p, codemode_price_usd: e.target.value }))
+                            }
+                            placeholder="Code Mode $0.01"
+                            title="Code Mode execution price (USD)"
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                          />
+                          <input
+                            type="number"
+                            min={1}
+                            max={50}
+                            value={tenantEdit.codemode_max_subcalls}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({
+                                ...p,
+                                codemode_max_subcalls: Number(e.target.value) || 10
+                              }))
+                            }
+                            title="Max upstream sub-calls per Code Mode run"
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <select
+                            value={tenantEdit.auth_mode}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({
+                                ...p,
+                                auth_mode: e.target.value as "x402" | "x402+oauth_v2"
+                              }))
+                            }
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2 min-h-[36px]"
+                          >
+                            <option value="x402">Auth: x402 Public</option>
+                            <option value="x402+oauth_v2">Auth: x402 + CF Access</option>
+                          </select>
+                          {tenantEdit.auth_mode === "x402+oauth_v2" && (
+                            <>
+                              <input
+                                value={tenantEdit.cf_access_team_domain}
+                                onChange={(e) =>
+                                  setTenantEdit((p) => ({
+                                    ...p,
+                                    cf_access_team_domain: e.target.value
+                                  }))
+                                }
+                                placeholder="team.cloudflareaccess.com"
+                                className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                              />
+                              <input
+                                value={tenantEdit.cf_access_aud}
+                                onChange={(e) =>
+                                  setTenantEdit((p) => ({ ...p, cf_access_aud: e.target.value }))
+                                }
+                                placeholder="Access Application AUD tag"
+                                className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                              />
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      {openApiImport?.tenantId === tenant.id && (
+                        <div className="rounded-lg bg-white border border-[#F6821F]/30 p-2.5 flex flex-col gap-2">
+                          <span className="font-mono text-[11px] font-semibold text-zinc-800">
+                            Import OpenAPI 3.x Spec URL
+                          </span>
+                          <input
+                            value={openApiImport.specUrl}
+                            onChange={(e) =>
+                              setOpenApiImport((p) => (p ? { ...p, specUrl: e.target.value } : null))
+                            }
+                            placeholder="https://api.example.com/openapi.json"
+                            className="font-mono text-xs bg-zinc-50 border border-zinc-300 rounded-lg px-2.5 min-h-[34px]"
+                          />
+                          <div className="flex flex-wrap items-center gap-2">
+                            <input
+                              value={openApiImport.defaultPrice}
+                              onChange={(e) =>
+                                setOpenApiImport((p) =>
+                                  p ? { ...p, defaultPrice: e.target.value } : null
+                                )
+                              }
+                              placeholder="0.005"
+                              className="w-24 font-mono text-xs bg-zinc-50 border border-zinc-300 rounded-lg px-2 min-h-[34px]"
+                            />
+                            <select
+                              value={openApiImport.enableMode}
+                              onChange={(e) =>
+                                setOpenApiImport((p) =>
+                                  p
+                                    ? {
+                                        ...p,
+                                        enableMode: e.target.value as "codemode" | "openapi_codemode"
+                                      }
+                                    : null
+                                )
+                              }
+                              className="font-mono text-xs bg-zinc-50 border border-zinc-300 rounded-lg px-2 min-h-[34px]"
+                            >
+                              <option value="openapi_codemode">Enable OpenAPI Code Mode</option>
+                              <option value="codemode">Enable Single `code` Mode</option>
+                            </select>
+                            <button
+                              type="button"
+                              disabled={openApiImport.busy}
+                              onClick={() => void runOpenApiImport()}
+                              className="cf-btn-primary rounded-lg px-3 py-1.5 text-xs cursor-pointer disabled:opacity-60"
+                            >
+                              {openApiImport.busy ? "Importing..." : "Import"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
                       <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <button
                             type="button"
                             onClick={() => rotateSecret(tenant)}
@@ -992,6 +1256,26 @@ export function EndpointForm({
                           >
                             <RefreshCw className="w-3 h-3" />
                             Sync MCP
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setOpenApiImport(
+                                openApiImport?.tenantId === tenant.id
+                                  ? null
+                                  : {
+                                      tenantId: tenant.id,
+                                      specUrl: "",
+                                      defaultPrice: "0.005",
+                                      enableMode: "openapi_codemode",
+                                      busy: false
+                                    }
+                              )
+                            }
+                            className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 font-mono text-[11px] text-zinc-700 hover:border-[#F6821F] cursor-pointer"
+                          >
+                            <Plus className="w-3 h-3" />
+                            Import OpenAPI
                           </button>
                         </div>
                         <button
