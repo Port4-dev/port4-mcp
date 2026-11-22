@@ -1,0 +1,52 @@
+{
+  "name": "port4-mcp",
+  "version": "1.0.0",
+  "description": "Official CLI & STDIO-to-HTTP x402 MCP Bridge for Port4 (port4.dev) — connect Cursor, Claude Desktop, and Windsurf to Paid MCP & Cloudflare Code Mode servers with client-side spend caps.",
+  "license": "MIT",
+  "author": "Port4 <info@port4.dev> (https://port4.dev)",
+  "homepage": "https://port4.dev/docs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Port4-dev/port4-mcp.git",
+    "directory": "packages/port4-mcp"
+  },
+  "type": "module",
+  "bin": {
+    "port4-mcp": "./bin/port4-mcp.mjs",
+    "port4": "./bin/port4-mcp.mjs"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node ./bin/port4-mcp.mjs --self-test"
+  },
+  "peerDependencies": {
+    "@x402/evm": "^2.0.0",
+    "viem": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@x402/evm": {
+      "optional": true
+    },
+    "viem": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "x402",
+    "port4",
+    "cloudflare",
+    "codemode",
+    "usdc",
+    "ai-agents",
+    "cursor",
+    "claude"
+  ]
+}
