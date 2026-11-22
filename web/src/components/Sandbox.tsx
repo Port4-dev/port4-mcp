@@ -15,6 +15,7 @@ interface SandboxProps {
 
 interface SandboxRunResponse {
   ok: boolean;
+  simulated?: boolean;
   tool: string;
   network: string;
   amountUsd: string;
@@ -22,7 +23,7 @@ interface SandboxRunResponse {
   payTo: string;
   isPlatformFee: boolean;
   txHash: string;
-  basescanUrl: string;
+  basescanUrl: string | null;
   latencyMs: number;
   step1_402: {
     status: number;
@@ -181,19 +182,25 @@ export function Sandbox({ onSettled }: SandboxProps) {
         <div className="mt-4 pt-3 border-t border-zinc-200 flex flex-wrap items-center justify-between gap-2 font-mono text-xs">
           <div className="flex items-center gap-2 text-emerald-700">
             <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-            <span>Tx:</span>
+            <span>Receipt:</span>
             <code className="text-zinc-800">
               {data.txHash.slice(0, 14)}...{data.txHash.slice(-8)}
             </code>
           </div>
-          <a
-            href={data.basescanUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
-          >
-            BaseScan <ExternalLink className="w-3.5 h-3.5" />
-          </a>
+          {data.basescanUrl ? (
+            <a
+              href={data.basescanUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
+            >
+              Block Explorer <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          ) : (
+            <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[11px]">
+              Simulated Off-Chain Receipt (HMAC)
+            </span>
+          )}
         </div>
       )}
     </section>

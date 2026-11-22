@@ -1,7 +1,9 @@
 import type { MiddlewareHandler } from "hono";
 import type { AppEnv, McpJsonRpcRequest } from "../types";
+import { isAllowedMcpOrigin } from "../lib/schema-validator";
 
 export const MCP_PROTOCOL_VERSION = "2026-07-28";
+const MAX_BODY_BYTES = 64 * 1024; // 64 KiB enforced on actual read bytes
 
 function rpcError(
   id: string | number | null,
@@ -22,27 +24,30 @@ function rpcError(
 
 /**
  * Enforces Stateless MCP 2026-07-28 specification:
- * - Rejects stateful Mcp-Session-Id headers and `initialize` handshake calls.
- * - Validates `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` headers against
- *   the JSON-RPC 2.0 body, rejecting any mismatch with 400 Bad Request.
+ * - Validates Origin header against DNS rebinding attacks.
+ * - Enforces 64 KiB body limit on actual payload bytes (not trusting Content-Length alone).
+ * - Ignores Mcp-Session-Id headers per MCP 2026-07-28 stateless rules (never creates/echoes sessions).
+ * - Validates MCP-Protocol-Version, Mcp-Method, Mcp-Name, and params._meta consistency.
  */
 export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => {
   c.set("requestStartedAt", Date.now());
 
+  const originHeader = c.req.header("Origin");
+  if (!isAllowedMcpOrigin(originHeader)) {
+    return c.json(
+      rpcError(null, -32600, "Forbidden Origin header for MCP transport."),
+      403
+    );
+  }
+
   const contentLength = Number(c.req.header("Content-Length") ?? "0");
-  if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > 64 * 1024) {
+  if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
     return c.json(rpcError(null, -32600, "Request body exceeds the 64 KiB limit."), 413);
   }
+
   const contentType = c.req.header("Content-Type") ?? "";
   if (!contentType.toLowerCase().includes("application/json")) {
     return c.json(rpcError(null, -32600, "Content-Type must be application/json."), 415);
-  }
-
-  if (c.req.header("Mcp-Session-Id")) {
-    return c.json(
-      rpcError(null, -32600, "Stateless MCP 2026-07-28 forbids Mcp-Session-Id headers."),
-      400
-    );
   }
 
   const rawProtocolVersion = c.req.header("MCP-Protocol-Version");
@@ -51,7 +56,7 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
       rpcError(
         null,
         -32600,
-        `Invalid MCP-Protocol-Version header. Expected '${MCP_PROTOCOL_VERSION}'.`,
+        `Unsupported MCP-Protocol-Version header. Expected '${MCP_PROTOCOL_VERSION}'.`,
         { expected: MCP_PROTOCOL_VERSION, received: rawProtocolVersion }
       ),
       400
@@ -59,9 +64,21 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
   }
   const protocolVersion = rawProtocolVersion ?? MCP_PROTOCOL_VERSION;
 
+  let rawText: string;
+  try {
+    rawText = await c.req.text();
+  } catch {
+    return c.json(rpcError(null, -32700, "Unable to read request body."), 400);
+  }
+
+  const actualBytes = new TextEncoder().encode(rawText).byteLength;
+  if (actualBytes > MAX_BODY_BYTES) {
+    return c.json(rpcError(null, -32600, "Request body exceeds the 64 KiB limit."), 413);
+  }
+
   let body: McpJsonRpcRequest;
   try {
-    body = (await c.req.json()) as McpJsonRpcRequest;
+    body = JSON.parse(rawText) as McpJsonRpcRequest;
   } catch {
     return c.json(rpcError(null, -32700, "Parse error: invalid JSON-RPC 2.0 body."), 400);
   }
@@ -82,6 +99,16 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
         -32600,
         "Stateless MCP 2026-07-28 does not use initialize handshakes. Call tools/list or tools/call directly."
       ),
+      400
+    );
+  }
+
+  if (
+    body.params?._meta !== undefined &&
+    (!body.params._meta || typeof body.params._meta !== "object" || Array.isArray(body.params._meta))
+  ) {
+    return c.json(
+      rpcError(rpcId, -32602, "Invalid params: _meta must be a JSON object when provided."),
       400
     );
   }
@@ -131,7 +158,9 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
     toolName: bodyToolName,
     rpcId,
     arguments:
-      body.params?.arguments && typeof body.params.arguments === "object"
+      body.params?.arguments &&
+      typeof body.params.arguments === "object" &&
+      !Array.isArray(body.params.arguments)
         ? body.params.arguments
         : {}
   });

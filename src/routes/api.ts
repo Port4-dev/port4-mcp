@@ -7,6 +7,7 @@ import { normalizeAccessTeamDomain } from "../lib/cloudflare-access";
 import { parseOpenApiSpecToTools } from "../lib/openapi-import";
 import {
   SUPPORTED_NETWORKS,
+  getSupportedNetwork,
   isSupportedNetwork,
   isValidWalletForNetwork,
   normalizePayoutWallets,
@@ -14,8 +15,10 @@ import {
   type PayoutWalletEntry
 } from "../lib/networks";
 import { interpolateUpstreamPath } from "./mcp";
+import { executeInternalSandboxTool } from "./sandbox";
 
 const MCP_MODES = new Set(["direct", "codemode", "openapi_codemode"]);
+const UPSTREAM_AUTH_TYPES = new Set(["none", "bearer", "api_key_header"]);
 
 const RESERVED_SUBDOMAINS = new Set(["www", "api", "app", "admin", "auth", "status", "docs"]);
 const SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
@@ -31,6 +34,11 @@ function validateUpstreamBaseUrl(value: string): string | null {
     if (
       hostname === "localhost" ||
       hostname.endsWith(".localhost") ||
+      hostname.endsWith(".internal") ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".arpa") ||
+      hostname.endsWith(".home") ||
+      hostname.endsWith(".lan") ||
       hostname === "0.0.0.0" ||
       hostname === "::" ||
       hostname === "::1" ||
@@ -42,7 +50,7 @@ function validateUpstreamBaseUrl(value: string): string | null {
       /^10\./.test(hostname) ||
       /^192\.168\./.test(hostname) ||
       /^169\.254\./.test(hostname) ||
-      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(hostname) ||
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[01-7])\./.test(hostname) ||
       /^198\.(1[89])\./.test(hostname) ||
       /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
     ) {
@@ -167,10 +175,14 @@ apiRoutes.get("/tenants", async (c) => {
             COALESCE(mcp_mode, 'direct') AS mcp_mode,
             COALESCE(codemode_price_usd, '0.01') AS codemode_price_usd,
             COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
+            COALESCE(upstream_verified, 0) AS upstream_verified,
+            COALESCE(require_upstream_verified, 0) AS require_upstream_verified,
+            COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
+            upstream_auth_header,
             cf_access_team_domain, cf_access_aud,
             created_at, updated_at
      FROM tenants
-     WHERE user_id = ?
+     WHERE user_id = ? AND deleted_at IS NULL AND status != 'archived'
      ORDER BY created_at DESC`
   )
     .bind(user.id)
@@ -487,8 +499,11 @@ apiRoutes.patch("/tenants/:id", async (c) => {
             auth_mode, COALESCE(mcp_mode, 'direct') AS mcp_mode,
             COALESCE(codemode_price_usd, '0.01') AS codemode_price_usd,
             COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
+            COALESCE(require_upstream_verified, 0) AS require_upstream_verified,
+            COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
+            upstream_auth_header, upstream_auth_secret,
             cf_access_team_domain, cf_access_aud
-     FROM tenants WHERE id = ? AND user_id = ? LIMIT 1`
+     FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`
   )
     .bind(tenantId, user.id)
     .first<{
@@ -503,6 +518,10 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       mcp_mode: "direct" | "codemode" | "openapi_codemode";
       codemode_price_usd: string;
       codemode_max_subcalls: number;
+      require_upstream_verified: number;
+      upstream_auth_type: "none" | "bearer" | "api_key_header";
+      upstream_auth_header: string | null;
+      upstream_auth_secret: string | null;
       cf_access_team_domain: string | null;
       cf_access_aud: string | null;
     }>();
@@ -519,6 +538,10 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     mcp_mode?: "direct" | "codemode" | "openapi_codemode";
     codemode_price_usd?: string;
     codemode_max_subcalls?: number;
+    require_upstream_verified?: boolean | number;
+    upstream_auth_type?: "none" | "bearer" | "api_key_header";
+    upstream_auth_header?: string | null;
+    upstream_auth_secret?: string | null;
     cf_access_team_domain?: string | null;
     cf_access_aud?: string | null;
   };
@@ -645,10 +668,40 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     );
   }
 
+  let nextUpstreamAuthType = existing.upstream_auth_type;
+  if (body.upstream_auth_type !== undefined) {
+    if (!UPSTREAM_AUTH_TYPES.has(body.upstream_auth_type)) {
+      return c.json({ error: "invalid_upstream_auth_type" }, 400);
+    }
+    nextUpstreamAuthType = body.upstream_auth_type;
+  }
+
+  const nextUpstreamAuthHeader =
+    body.upstream_auth_header !== undefined
+      ? body.upstream_auth_header
+        ? body.upstream_auth_header.trim().slice(0, 64)
+        : null
+      : existing.upstream_auth_header;
+
+  const nextUpstreamAuthSecret =
+    body.upstream_auth_secret !== undefined
+      ? body.upstream_auth_secret
+        ? body.upstream_auth_secret.trim().slice(0, 512)
+        : null
+      : existing.upstream_auth_secret;
+
+  const nextRequireVerified =
+    body.require_upstream_verified !== undefined
+      ? body.require_upstream_verified === true || body.require_upstream_verified === 1
+        ? 1
+        : 0
+      : existing.require_upstream_verified;
+
   await c.env.DB.prepare(
     `UPDATE tenants
      SET name = ?, upstream_base_url = ?, payout_wallet = ?, payout_wallets_json = ?, network = ?,
          auth_mode = ?, mcp_mode = ?, codemode_price_usd = ?, codemode_max_subcalls = ?,
+         require_upstream_verified = ?, upstream_auth_type = ?, upstream_auth_header = ?, upstream_auth_secret = ?,
          cf_access_team_domain = ?, cf_access_aud = ?, updated_at = datetime('now')
      WHERE id = ?`
   )
@@ -662,6 +715,10 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       nextMcpMode,
       nextCodePrice,
       nextMaxSubcalls,
+      nextRequireVerified,
+      nextUpstreamAuthType,
+      nextUpstreamAuthHeader,
+      nextUpstreamAuthSecret,
       nextAccessDomain,
       nextAccessAud,
       existing.id
@@ -671,7 +728,9 @@ apiRoutes.patch("/tenants/:id", async (c) => {
   const synced = await syncTenantToKv(c.env, existing.subdomain);
   return c.json({
     ok: true,
-    tenant: synced ? { ...synced, upstream_signing_secret: undefined } : null
+    tenant: synced
+      ? { ...synced, upstream_signing_secret: undefined, upstream_auth_secret: undefined }
+      : null
   });
 });
 
@@ -902,13 +961,14 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
   const startedAt = Date.now();
   const args = body.arguments && typeof body.arguments === "object" ? body.arguments : {};
 
-  if (tenant.upstream_base_url === "internal://sandbox") {
+  if ( tenant.upstream_base_url === "internal://sandbox") {
+    const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "EDGE";
     return c.json({
       ok: true,
       status: 200,
       latency_ms: Math.max(1, Date.now() - startedAt),
       url: `internal://sandbox${tool.upstream_path}`,
-      response: { sandbox: true, tool: tool.name, arguments: args }
+      response: executeInternalSandboxTool(tool.name, args, colo)
     });
   }
 
@@ -1031,29 +1091,45 @@ apiRoutes.post("/tenants/:id/sync-mcp", async (c) => {
     const tools = json.result?.tools ?? [];
     let imported = 0;
     const priceAtomic = usdToAtomicUsdc(defaultPriceUsd);
+
+    const existingToolsRes = await c.env.DB.prepare(
+      "SELECT id, name FROM tools WHERE tenant_id = ?"
+    )
+      .bind(tenant.id)
+      .all<{ id: string; name: string }>();
+    const existingByName = new Map<string, string>(
+      (existingToolsRes.results ?? []).map((row) => [row.name, row.id])
+    );
+
     for (const t of tools.slice(0, 50)) {
       if (!t.name || !TOOL_NAME_RE.test(t.name)) continue;
-      const toolId = `tool_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
       const schemaStr = JSON.stringify(t.inputSchema ?? { type: "object", properties: {} });
-      await c.env.DB.prepare(
-        `INSERT OR REPLACE INTO tools (id, tenant_id, name, description, http_method, upstream_path, input_schema_json, price_usd, price_atomic)
-         VALUES (?, ?, ?, ?, 'POST', ?, ?, ?, ?)`
-      )
-        .bind(
-          toolId,
-          tenant.id,
-          t.name,
-          (t.description ?? `MCP tool ${t.name}`).slice(0, 1024),
-          mcpPath,
-          schemaStr,
-          defaultPriceUsd,
-          priceAtomic
+      const desc = (t.description ?? `MCP tool ${t.name}`).slice(0, 1024);
+      const existingId = existingByName.get(t.name);
+
+      if (existingId) {
+        // Update description, schema, and remote MCP adapter binding while preserving custom tool price
+        await c.env.DB.prepare(
+          `UPDATE tools
+           SET description = ?, upstream_path = ?, input_schema_json = ?, source_type = 'mcp', remote_tool_name = ?
+           WHERE id = ? AND tenant_id = ?`
         )
-        .run();
+          .bind(desc, mcpPath, schemaStr, t.name, existingId, tenant.id)
+          .run();
+      } else {
+        const toolId = `tool_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+        await c.env.DB.prepare(
+          `INSERT INTO tools
+           (id, tenant_id, name, description, http_method, upstream_path, input_schema_json, price_usd, price_atomic, source_type, remote_tool_name)
+           VALUES (?, ?, ?, ?, 'POST', ?, ?, ?, ?, 'mcp', ?)`
+        )
+          .bind(toolId, tenant.id, t.name, desc, mcpPath, schemaStr, defaultPriceUsd, priceAtomic, t.name)
+          .run();
+      }
       imported += 1;
     }
     await syncTenantToKv(c.env, tenant.subdomain);
-    return c.json({ ok: true, imported });
+    return c.json({ ok: true, imported, source_type: "mcp" });
   } catch {
     return c.json({ error: "upstream_mcp_unreachable" }, 502);
   }
@@ -1064,7 +1140,7 @@ apiRoutes.delete("/tenants/:id", async (c) => {
   const tenantId = c.req.param("id");
 
   const existing = await c.env.DB.prepare(
-    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{ id: string; subdomain: string }>();
@@ -1076,12 +1152,25 @@ apiRoutes.delete("/tenants/:id", async (c) => {
     return c.json({ error: "cannot_delete_demo_tenant" }, 400);
   }
 
-  await c.env.DB.prepare("DELETE FROM tenants WHERE id = ? AND user_id = ?")
-    .bind(tenantId, user.id)
-    .run();
+  // Soft-archive tenant so immutable financial history in `transactions` and `usage_rollups` is NEVER cascade-deleted
+  const archivedSlug = `${existing.subdomain}__archived_${existing.id.slice(-6)}`;
+  const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE tenants
+       SET status = 'archived', is_active = 0, deleted_at = datetime('now'), subdomain = ?, updated_at = datetime('now')
+       WHERE id = ? AND user_id = ?`
+    ).bind(archivedSlug, tenantId, user.id),
+    c.env.DB.prepare("UPDATE tools SET is_active = 0 WHERE tenant_id = ?").bind(tenantId),
+    c.env.DB.prepare(
+      `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+       VALUES (?, ?, 'tenant.archived', 'tenant', ?, ?)`
+    ).bind(auditId, user.id, tenantId, JSON.stringify({ original_subdomain: existing.subdomain }))
+  ]);
 
   await invalidateTenantKv(c.env, existing.subdomain);
-  return c.json({ ok: true });
+  return c.json({ ok: true, archived: true });
 });
 
 apiRoutes.post("/tenants/:id/tools", async (c) => {
@@ -1165,6 +1254,7 @@ apiRoutes.get("/ledger", async (c) => {
   const [rollupSummary, txRes] = await Promise.all([
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(r.call_count), 0) AS total_calls,
+              COALESCE(SUM(r.gross_atomic), 0) AS total_atomic,
               COALESCE(SUM(r.gross_usd), 0) AS total_usd,
               COALESCE(SUM(r.total_latency_ms), 0) AS total_latency_ms
        FROM usage_rollups r
@@ -1172,7 +1262,7 @@ apiRoutes.get("/ledger", async (c) => {
        WHERE t.user_id = ?`
     )
       .bind(user.id)
-      .first<{ total_calls: number; total_usd: number; total_latency_ms: number }>(),
+      .first<{ total_calls: number; total_atomic: number; total_usd: number; total_latency_ms: number }>(),
     c.env.DB.prepare(
       `SELECT tx.id, tx.tenant_id, t.subdomain AS tenant_subdomain, tx.tool_name, tx.payer_wallet,
               tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status, tx.latency_ms, tx.created_at
@@ -1186,13 +1276,25 @@ apiRoutes.get("/ledger", async (c) => {
       .all<TransactionRecord>()
   ]);
 
-  const transactions = txRes.results ?? [];
+  const rawTransactions = txRes.results ?? [];
+  const transactions = rawTransactions.map((tx) => {
+    const net = getSupportedNetwork(tx.network);
+    const explorerUrl =
+      tx.status === "sandbox_settled" || !net
+        ? null
+        : `${net.explorerTxPrefix}${tx.tx_hash}`;
+    return {
+      ...tx,
+      explorer_url: explorerUrl
+    };
+  });
+
   const rollupCalls = Number(rollupSummary?.total_calls ?? 0);
-  const totalCalls = rollupCalls > 0 ? rollupCalls : transactions.length;
-  const totalUsd =
-    rollupCalls > 0
-      ? Number(rollupSummary?.total_usd ?? 0).toFixed(4)
-      : (transactions.reduce((sum, tx) => sum + Number(tx.amount_atomic || 0), 0) / 1_000_000).toFixed(4);
+  const rollupAtomic = Number(rollupSummary?.total_atomic ?? 0);
+  const txAtomic = rawTransactions.reduce((sum, tx) => sum + Number(tx.amount_atomic || 0), 0);
+  const totalCalls = Math.max(rollupCalls, transactions.length);
+  const resolvedAtomic = rollupAtomic > 0 ? rollupAtomic : txAtomic;
+  const totalUsd = (resolvedAtomic / 1_000_000).toFixed(4);
   const avgLatencyMs =
     rollupCalls > 0
       ? Math.round(Number(rollupSummary?.total_latency_ms ?? 0) / rollupCalls)
@@ -1203,6 +1305,7 @@ apiRoutes.get("/ledger", async (c) => {
   return c.json({
     summary: {
       total_calls: totalCalls,
+      total_atomic: String(resolvedAtomic),
       total_usd: totalUsd,
       avg_latency_ms: avgLatencyMs
     },
@@ -1213,7 +1316,11 @@ apiRoutes.get("/ledger", async (c) => {
 apiRoutes.get("/keys", async (c) => {
   const user = c.get("user")!;
   const res = await c.env.DB.prepare(
-    "SELECT id, name, key_prefix, created_at, last_used_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC"
+    `SELECT id, name, key_prefix, COALESCE(scopes, 'tenant:read,tenant:write') AS scopes,
+            expires_at, created_at, last_used_at
+     FROM api_keys
+     WHERE user_id = ? AND revoked_at IS NULL
+     ORDER BY created_at DESC`
   )
     .bind(user.id)
     .all();
@@ -1224,10 +1331,24 @@ apiRoutes.get("/keys", async (c) => {
 apiRoutes.post("/keys", async (c) => {
   const user = c.get("user")!;
   let name = "CLI Deploy Key";
+  let scopes = "tenant:read,tenant:write";
+  let expiresAt: string | null = null;
   try {
-    const body = (await c.req.json()) as { name?: string };
+    const body = (await c.req.json()) as {
+      name?: string;
+      scopes?: string[];
+      expires_in_days?: number;
+    };
     if (body.name && body.name.trim()) {
       name = body.name.trim().slice(0, 64);
+    }
+    if (Array.isArray(body.scopes) && body.scopes.length > 0) {
+      const allowedScopes = new Set(["tenant:read", "tenant:write", "ledger:read"]);
+      const filtered = body.scopes.filter((s) => allowedScopes.has(s));
+      if (filtered.length > 0) scopes = filtered.join(",");
+    }
+    if (typeof body.expires_in_days === "number" && body.expires_in_days >= 1 && body.expires_in_days <= 365) {
+      expiresAt = new Date(Date.now() + body.expires_in_days * 86_400_000).toISOString();
     }
   } catch {
     // Use default name
@@ -1239,9 +1360,9 @@ apiRoutes.post("/keys", async (c) => {
   const id = `key_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 
   await c.env.DB.prepare(
-    "INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash) VALUES (?, ?, ?, ?, ?)"
+    "INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind(id, user.id, name, keyPrefix, keyHash)
+    .bind(id, user.id, name, keyPrefix, keyHash, scopes, expiresAt)
     .run();
 
   return c.json(
@@ -1249,6 +1370,8 @@ apiRoutes.post("/keys", async (c) => {
       id,
       name,
       key_prefix: keyPrefix,
+      scopes,
+      expires_at: expiresAt,
       secret: rawSecret // Returned once at creation
     },
     201
@@ -1258,8 +1381,10 @@ apiRoutes.post("/keys", async (c) => {
 apiRoutes.delete("/keys/:id", async (c) => {
   const user = c.get("user")!;
   const id = c.req.param("id");
-  await c.env.DB.prepare("DELETE FROM api_keys WHERE id = ? AND user_id = ?")
+  await c.env.DB.prepare(
+    "UPDATE api_keys SET revoked_at = datetime('now') WHERE id = ? AND user_id = ?"
+  )
     .bind(id, user.id)
     .run();
-  return c.json({ ok: true });
+  return c.json({ ok: true, revoked: true });
 });

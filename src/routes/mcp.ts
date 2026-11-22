@@ -15,6 +15,7 @@ import {
   executeCodeModePlan,
   searchTenantTools
 } from "../lib/codemode";
+import { validateToolArguments } from "../lib/schema-validator";
 
 export function interpolateUpstreamPath(
   pathTemplate: string,
@@ -90,6 +91,13 @@ function safeParseSchema(raw: string): Record<string, unknown> {
   return { type: "object", properties: {} };
 }
 
+/**
+ * Multi-Protocol Upstream Execution Adapter:
+ * - `internal`: Port4 internal edge oracle / demo tools
+ * - `mcp`: Remote MCP 2026-07-28 JSON-RPC 2.0 `tools/call` adapter
+ * - `rest` / `openapi`: HTTP REST path/query/body interpolation adapter
+ * Injects configurable upstream authentication headers + Port4 HMAC-SHA256 signature.
+ */
 async function dispatchUpstreamTool(params: {
   tenant: TenantRoutingRecord;
   tool: ToolRecord;
@@ -101,11 +109,21 @@ async function dispatchUpstreamTool(params: {
 }): Promise<unknown> {
   const { tenant, tool, args, receipt, colo, requestId, idempotencyKey } = params;
 
-  if (tenant.upstream_base_url === "internal://sandbox") {
+  if (tenant.upstream_base_url === "internal://sandbox" || tool.source_type === "internal") {
     return executeInternalSandboxTool(tool.name, args, colo);
   }
 
-  const { resolvedPath, remainingArgs } = interpolateUpstreamPath(tool.upstream_path, args);
+  if (tenant.require_upstream_verified === 1 && tenant.upstream_verified !== 1) {
+    throw new Error("Upstream domain ownership is not verified for this tenant.");
+  }
+
+  const isRemoteMcp = tool.source_type === "mcp";
+  const remoteToolName = tool.remote_tool_name || tool.name;
+
+  const { resolvedPath, remainingArgs } = isRemoteMcp
+    ? { resolvedPath: tool.upstream_path, remainingArgs: args }
+    : interpolateUpstreamPath(tool.upstream_path, args);
+
   const targetUrl = new URL(resolvedPath, `${tenant.upstream_base_url}/`);
 
   const upstreamHeaders: Record<string, string> = {
@@ -118,8 +136,35 @@ async function dispatchUpstreamTool(params: {
     "Idempotency-Key": idempotencyKey
   };
 
+  // Inject encrypted/stored upstream credentials if configured by the tenant owner
+  if (tenant.upstream_auth_type === "bearer" && tenant.upstream_auth_secret) {
+    upstreamHeaders["Authorization"] = `Bearer ${tenant.upstream_auth_secret}`;
+  } else if (
+    tenant.upstream_auth_type === "api_key_header" &&
+    tenant.upstream_auth_header &&
+    tenant.upstream_auth_secret
+  ) {
+    upstreamHeaders[tenant.upstream_auth_header] = tenant.upstream_auth_secret;
+  }
+
   let serializedBody = "";
-  if (tool.http_method === "GET" || tool.http_method === "DELETE") {
+  let httpMethod: "GET" | "POST" | "PUT" | "DELETE" = tool.http_method;
+
+  if (isRemoteMcp) {
+    httpMethod = "POST";
+    upstreamHeaders["MCP-Protocol-Version"] = "2026-07-28";
+    upstreamHeaders["Mcp-Method"] = "tools/call";
+    upstreamHeaders["Mcp-Name"] = remoteToolName;
+    serializedBody = JSON.stringify({
+      jsonrpc: "2.0",
+      id: requestId,
+      method: "tools/call",
+      params: {
+        name: remoteToolName,
+        arguments: remainingArgs
+      }
+    });
+  } else if (httpMethod === "GET" || httpMethod === "DELETE") {
     for (const [k, v] of Object.entries(remainingArgs)) {
       if (v !== undefined && v !== null) {
         targetUrl.searchParams.set(k, String(v));
@@ -140,11 +185,9 @@ async function dispatchUpstreamTool(params: {
   }
 
   const fetchInit: RequestInit = {
-    method: tool.http_method,
+    method: httpMethod,
     headers: upstreamHeaders,
-    ...(tool.http_method === "GET" || tool.http_method === "DELETE"
-      ? {}
-      : { body: serializedBody })
+    ...(httpMethod === "GET" || httpMethod === "DELETE" ? {} : { body: serializedBody })
   };
 
   const upstreamRes = await fetch(targetUrl.toString(), {
@@ -167,7 +210,12 @@ async function dispatchUpstreamTool(params: {
   }
   if (contentType.includes("application/json")) {
     try {
-      return JSON.parse(rawText) as unknown;
+      const parsed = JSON.parse(rawText) as Record<string, unknown>;
+      // Unwrap remote MCP JSON-RPC result if source_type === 'mcp'
+      if (isRemoteMcp && parsed && parsed.jsonrpc === "2.0" && parsed.result !== undefined) {
+        return parsed.result;
+      }
+      return parsed;
     } catch {
       return { status: upstreamRes.status, body: rawText.slice(0, 4096) };
     }
@@ -256,6 +304,19 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       );
     }
 
+    // Validate tool arguments against JSON Schema BEFORE upstream execution
+    const argCheck = validateToolArguments(tool.input_schema_json, mcp.arguments);
+    if (!argCheck.ok) {
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          id: mcp.rpcId,
+          error: { code: -32602, message: `Invalid tool arguments: ${argCheck.error}` }
+        },
+        400
+      );
+    }
+
     const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "LOCAL";
     const requestId = `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const idempotencyKey = c.get("paymentFingerprint") ?? receipt.transaction;
@@ -271,15 +332,16 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
         env: c.env,
         tenant,
         code,
-        dispatchTool: async (subTool, subArgs) =>
+        authorizedAtomicBudget: tool.price_atomic,
+        dispatchTool: async (subTool, subArgs, subcallIndex) =>
           dispatchUpstreamTool({
             tenant,
             tool: subTool,
             args: subArgs,
             receipt,
             colo,
-            requestId,
-            idempotencyKey: `${idempotencyKey}:${subTool.name}`
+            requestId: `${requestId}_s${subcallIndex}`,
+            idempotencyKey: `${idempotencyKey}:${subTool.name}:${subcallIndex}`
           })
       });
 
@@ -296,7 +358,8 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
                     {
                       error: execOutcome.error,
                       logs: execOutcome.logs ?? [],
-                      subcalls: execOutcome.subcalls
+                      subcalls: execOutcome.subcalls,
+                      consumedAtomic: execOutcome.consumedAtomic
                     },
                     null,
                     2
@@ -313,7 +376,12 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       upstreamResult = {
         result: execOutcome.result,
         ...(execOutcome.logs && execOutcome.logs.length > 0 ? { logs: execOutcome.logs } : {}),
-        _codemode: { subcalls: execOutcome.subcalls, mode: tenant.mcp_mode }
+        _codemode: {
+          subcalls: execOutcome.subcalls,
+          consumedAtomic: execOutcome.consumedAtomic,
+          authorizedAtomic: tool.price_atomic,
+          mode: tenant.mcp_mode
+        }
       };
     } else {
       try {
@@ -347,7 +415,12 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     }
 
     const latencyMs = Math.max(1, Date.now() - startedAt);
-    const txId = `tx_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const paymentFingerprint = c.get("paymentFingerprint");
+    const leaseToken = c.get("paymentLeaseToken") ?? "";
+    // Deterministic event ID per payment authorization prevents duplicate financial rows across retries
+    const txId = paymentFingerprint
+      ? `tx_${paymentFingerprint.slice(0, 24)}`
+      : `tx_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const status = receipt.mode === "sandbox" ? "sandbox_settled" : "settled";
 
     const responsePayload = {
@@ -376,7 +449,25 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
 
     const serializedResponse = JSON.stringify(responsePayload);
 
-    // 1. Zero-D1 hot path: write to Analytics Engine + enqueue batched rollup/R2 archival
+    // 1. Synchronously persist completed state in PaymentReplayGuard DO BEFORE returning 200 OK
+    //    so a concurrent/immediate retry never re-executes a side-effecting upstream call.
+    if (paymentFingerprint && leaseToken) {
+      const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
+        c.env.PAYMENT_REPLAY_GUARD.idFromName(paymentFingerprint)
+      );
+      await replayStub.fetch("https://payment-replay/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operation: "complete",
+          leaseToken,
+          receipt,
+          responseBody: serializedResponse
+        })
+      });
+    }
+
+    // 2. Enqueue authoritative idempotent metering event
     const meteringEvent: MeteringEvent = {
       id: txId,
       tenantId: tenant.id,
@@ -395,32 +486,8 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
 
     writeGatewayAnalytics(c.env, meteringEvent);
 
-    const backgroundTasks: Promise<unknown>[] = [];
     if (c.env.METERING_EVENTS) {
-      backgroundTasks.push(c.env.METERING_EVENTS.send(meteringEvent));
-    }
-
-    // 2. Durably cache completed response in PaymentReplayGuard DO for idempotent retries
-    const paymentFingerprint = c.get("paymentFingerprint");
-    if (paymentFingerprint) {
-      const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
-        c.env.PAYMENT_REPLAY_GUARD.idFromName(paymentFingerprint)
-      );
-      backgroundTasks.push(
-        replayStub.fetch("https://payment-replay/complete", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            operation: "complete",
-            receipt,
-            responseBody: serializedResponse
-          })
-        })
-      );
-    }
-
-    if (backgroundTasks.length > 0) {
-      c.executionCtx.waitUntil(Promise.allSettled(backgroundTasks));
+      c.executionCtx.waitUntil(c.env.METERING_EVENTS.send(meteringEvent));
     }
 
     console.log(

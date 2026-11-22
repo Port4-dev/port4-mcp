@@ -8,6 +8,7 @@ export interface LedgerTransaction {
   amount_usd: string;
   network: string;
   tx_hash: string;
+  explorer_url?: string | null;
   status: string;
   latency_ms: number;
   created_at: string;
@@ -72,15 +73,21 @@ export function RevenueTable({ transactions, summary }: RevenueTableProps) {
                     </td>
                     <td className="py-3 px-4 text-emerald-700 font-medium">${tx.amount_usd}</td>
                     <td className="py-3 px-4">
-                      <a
-                        href={`https://sepolia.basescan.org/tx/${tx.tx_hash}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
-                      >
-                        {tx.tx_hash.slice(0, 10)}...{tx.tx_hash.slice(-6)}
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
+                      {tx.status !== "sandbox_settled" && tx.explorer_url ? (
+                        <a
+                          href={tx.explorer_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
+                        >
+                          {tx.tx_hash.slice(0, 10)}...{tx.tx_hash.slice(-6)}
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      ) : (
+                        <span className="text-zinc-500" title="Simulated off-chain sandbox receipt">
+                          {tx.tx_hash.slice(0, 10)}...{tx.tx_hash.slice(-6)} (sim)
+                        </span>
+                      )}
                     </td>
                     <td className="py-3 px-4 text-zinc-500">{tx.latency_ms}ms</td>
                     <td className="py-3 px-4">

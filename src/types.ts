@@ -1,14 +1,17 @@
 import type { PayoutWalletEntry } from "./lib/networks";
 
 export type UserPlan = "free" | "pro";
-export type TenantStatus = "active" | "suspended";
+export type TenantStatus = "active" | "suspended" | "archived";
 export type McpMode = "direct" | "codemode" | "openapi_codemode";
+export type ToolSourceType = "rest" | "mcp" | "openapi" | "internal";
+export type UpstreamAuthType = "none" | "bearer" | "api_key_header";
 
 export interface AppBindings extends CloudflareBindings {
   PORT4_TREASURY_WALLET?: string;
   PORT4_TREASURY_SOLANA_WALLET?: string;
   DEMO_PAYER_PRIVATE_KEY?: string;
   DEMO_AUTH_ENABLED?: string;
+  ADMIN_GITHUB_ID?: string;
   GATEWAY_ANALYTICS?: AnalyticsEngineDataset;
   LEDGER_ARCHIVE?: R2Bucket;
   MCP_RATE_LIMIT_PER_MINUTE?: string;
@@ -38,6 +41,8 @@ export interface AuthUser {
   email: string | null;
   is_admin: number;
   plan: UserPlan;
+  auth_via?: "session" | "api_key";
+  api_key_scopes?: string[];
 }
 
 export interface ToolRecord {
@@ -51,6 +56,8 @@ export interface ToolRecord {
   price_usd: string;
   price_atomic: string;
   is_active: number;
+  source_type?: ToolSourceType;
+  remote_tool_name?: string | null;
   created_at?: string;
 }
 
@@ -68,9 +75,14 @@ export interface TenantRecord {
   status: TenantStatus;
   is_featured: number;
   call_count: number;
+  settled_call_sequence?: number;
   upstream_signing_secret?: string | null;
   upstream_verified?: number;
+  require_upstream_verified?: number;
   verification_token?: string | null;
+  upstream_auth_type?: UpstreamAuthType;
+  upstream_auth_header?: string | null;
+  upstream_auth_secret?: string | null;
   rate_limit_rpm?: number;
   daily_quota?: number;
   mcp_mode?: McpMode;
@@ -78,6 +90,7 @@ export interface TenantRecord {
   codemode_max_subcalls?: number;
   cf_access_team_domain?: string | null;
   cf_access_aud?: string | null;
+  deleted_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -95,9 +108,14 @@ export interface TenantRoutingRecord {
   status: TenantStatus;
   is_featured: number;
   call_count: number;
+  settled_call_sequence: number;
   owner_plan: UserPlan;
   upstream_signing_secret: string | null;
   upstream_verified: number;
+  require_upstream_verified: number;
+  upstream_auth_type: UpstreamAuthType;
+  upstream_auth_header: string | null;
+  upstream_auth_secret: string | null;
   rate_limit_rpm: number;
   daily_quota: number;
   mcp_mode: McpMode;
@@ -191,8 +209,19 @@ export interface X402PaymentSignaturePayload {
   };
 }
 
+export interface PaymentExecutionContext {
+  tenantId: string;
+  toolName: string;
+  resourceUrl: string;
+  network: string;
+  asset: string;
+  amountAtomic: string;
+  payTo: string;
+}
+
 export interface X402SettlementReceipt {
   success: boolean;
+  settlementPending?: boolean;
   transaction: string;
   network: string;
   payer: string;
@@ -210,6 +239,8 @@ export interface AppVariables {
   selectedTool?: ToolRecord;
   x402Receipt?: X402SettlementReceipt;
   paymentFingerprint?: string;
+  paymentLeaseToken?: string;
+  paymentContext?: PaymentExecutionContext;
   rateLimitSequence?: number;
   requestStartedAt?: number;
 }

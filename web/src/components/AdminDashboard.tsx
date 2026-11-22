@@ -59,10 +59,12 @@ interface AdminTx {
   slug: string;
   tool_name: string;
   amount_usd: string;
+  status?: string;
   is_platform_fee: number;
   latency_ms: number;
   tx_hash: string;
-  basescan_url: string;
+  basescan_url: string | null;
+  explorer_url?: string | null;
   created_at: string;
 }
 
@@ -393,15 +395,21 @@ export function AdminDashboard({
                   </td>
                   <td className="py-2.5 px-4 text-zinc-500">{tx.latency_ms}ms</td>
                   <td className="py-2.5 px-4">
-                    <a
-                      href={tx.basescan_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
-                    >
-                      {tx.tx_hash.slice(0, 10)}...{tx.tx_hash.slice(-6)}
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
+                    {tx.basescan_url ? (
+                      <a
+                        href={tx.basescan_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
+                      >
+                        {tx.tx_hash.slice(0, 10)}...{tx.tx_hash.slice(-6)}
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    ) : (
+                      <span className="text-zinc-500">
+                        {tx.tx_hash.slice(0, 10)}...{tx.tx_hash.slice(-6)} (simulated)
+                      </span>
+                    )}
                   </td>
                 </tr>
               ))}

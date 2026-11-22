@@ -30,6 +30,7 @@ async function issueSessionCookie(c: Context<AppEnv>, user: AuthUser): Promise<v
   const token = await sign(
     {
       sub: user.id,
+      jti: randomHex(12),
       github_id: user.github_id,
       login: user.login,
       avatar_url: user.avatar_url,
@@ -70,20 +71,23 @@ async function fetchUserById(c: Context<AppEnv>, userId: string): Promise<AuthUs
 }
 
 export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser | null> {
-  // 1. Check Bearer API Key for CLI/CI deployments
+  // 1. Check Bearer API Key for CLI/CI deployments (enforces revocation, expiration, and scopes)
   const authHeader = c.req.header("Authorization");
   if (authHeader && authHeader.startsWith("Bearer p4_")) {
     const rawKey = authHeader.slice("Bearer ".length).trim();
     const keyHash = await sha256Hex(rawKey);
     const row = await c.env.DB.prepare(
-      `SELECT u.id, u.github_id, u.login, u.avatar_url, u.email, u.is_admin, u.plan, k.id AS api_key_id
+      `SELECT u.id, u.github_id, u.login, u.avatar_url, u.email, u.is_admin, u.plan,
+              k.id AS api_key_id, COALESCE(k.scopes, 'tenant:read,tenant:write') AS scopes
        FROM api_keys k
        INNER JOIN users u ON u.id = k.user_id
        WHERE k.key_hash = ?
+         AND k.revoked_at IS NULL
+         AND (k.expires_at IS NULL OR k.expires_at > datetime('now'))
        LIMIT 1`
     )
       .bind(keyHash)
-      .first<AuthUser & { api_key_id: string }>();
+      .first<AuthUser & { api_key_id: string; scopes: string }>();
 
     if (row) {
       c.executionCtx.waitUntil(
@@ -98,12 +102,15 @@ export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser
         avatar_url: row.avatar_url,
         email: row.email,
         is_admin: Number(row.is_admin) === 1 ? 1 : 0,
-        plan: row.plan === "pro" ? "pro" : "free"
+        plan: row.plan === "pro" ? "pro" : "free",
+        auth_via: "api_key",
+        api_key_scopes: row.scopes.split(",").map((s) => s.trim()).filter(Boolean)
       };
     }
+    return null;
   }
 
-  // 2. Check stateless HTTP-only JWT session cookie
+  // 2. Check HTTP-only JWT session cookie + server-side session revocation table
   const token = getCookie(c, SESSION_COOKIE);
   if (!token) {
     return null;
@@ -114,6 +121,17 @@ export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser
     if (typeof payload.sub !== "string" || typeof payload.login !== "string") {
       return null;
     }
+
+    const tokenHash = await sha256Hex(token);
+    const revoked = await c.env.DB.prepare(
+      "SELECT token_hash FROM revoked_sessions WHERE token_hash = ? LIMIT 1"
+    )
+      .bind(tokenHash)
+      .first<{ token_hash: string }>();
+    if (revoked) {
+      return null;
+    }
+
     return {
       id: payload.sub,
       github_id: typeof payload.github_id === "string" ? payload.github_id : "0",
@@ -121,7 +139,8 @@ export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser
       avatar_url: typeof payload.avatar_url === "string" ? payload.avatar_url : null,
       email: typeof payload.email === "string" ? payload.email : null,
       is_admin: payload.is_admin === 1 ? 1 : 0,
-      plan: payload.plan === "pro" ? "pro" : "free"
+      plan: payload.plan === "pro" ? "pro" : "free",
+      auth_via: "session"
     };
   } catch {
     return null;
@@ -145,7 +164,8 @@ export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
 
 /**
  * Super-Admin Guard Middleware:
- * Verifies the JWT session AND re-checks `is_admin === 1` directly against D1 on every request.
+ * - Rejects standard developer API keys (`tenant:read,tenant:write`) unless explicitly scoped with `admin:all`.
+ * - Re-verifies `is_admin === 1` directly against D1 on every request.
  */
 export const requireAdmin: MiddlewareHandler<AppEnv> = async (c, next) => {
   const sessionUser = await getAuthenticatedUser(c);
@@ -153,12 +173,25 @@ export const requireAdmin: MiddlewareHandler<AppEnv> = async (c, next) => {
     return c.json({ error: "unauthorized", message: "Admin authentication required." }, 401);
   }
 
+  if (
+    sessionUser.auth_via === "api_key" &&
+    !sessionUser.api_key_scopes?.includes("admin:all")
+  ) {
+    return c.json(
+      {
+        error: "insufficient_api_key_scope",
+        message: "Interactive admin session or admin:all scoped credential required."
+      },
+      403
+    );
+  }
+
   const freshUser = await fetchUserById(c, sessionUser.id);
   if (!freshUser || freshUser.is_admin !== 1) {
     return c.json({ error: "forbidden", message: "Super-admin privileges required." }, 403);
   }
 
-  c.set("user", freshUser);
+  c.set("user", { ...freshUser, auth_via: sessionUser.auth_via });
   await next();
 };
 
@@ -253,8 +286,13 @@ authRoutes.get("/github/callback", async (c) => {
   };
 
   const githubId = String(gh.id);
+  const adminGithubId = c.env.ADMIN_GITHUB_ID?.trim();
   const adminLogin = (c.env.ADMIN_GITHUB_LOGIN || "Ishabarundo").toLowerCase();
-  const autoPromoteAdmin = gh.login.toLowerCase() === adminLogin ? 1 : 0;
+  const autoPromoteAdmin =
+    (adminGithubId && githubId === adminGithubId) ||
+    (!adminGithubId && gh.login.toLowerCase() === adminLogin)
+      ? 1
+      : 0;
 
   const existing = await c.env.DB.prepare(
     "SELECT id, github_id, login, avatar_url, email, is_admin, plan FROM users WHERE github_id = ? LIMIT 1"
@@ -339,7 +377,23 @@ authRoutes.get("/me", async (c) => {
   });
 });
 
-authRoutes.post("/logout", (c) => {
+authRoutes.post("/logout", async (c) => {
+  const token = getCookie(c, SESSION_COOKIE);
+  if (token) {
+    try {
+      const payload = await verify(token, getJwtSecret(c), "HS256");
+      const tokenHash = await sha256Hex(token);
+      if (typeof payload.sub === "string") {
+        await c.env.DB.prepare(
+          "INSERT OR IGNORE INTO revoked_sessions (token_hash, user_id) VALUES (?, ?)"
+        )
+          .bind(tokenHash, payload.sub)
+          .run();
+      }
+    } catch {
+      // ignore invalid token on logout
+    }
+  }
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
   return c.json({ ok: true });
 });

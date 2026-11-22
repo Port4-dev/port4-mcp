@@ -15,7 +15,11 @@ export async function loadTenantFromD1(
   const tenant = await env.DB.prepare(
     `SELECT t.id, t.user_id, t.subdomain, t.name, t.upstream_base_url, t.payout_wallet,
             t.payout_wallets_json, t.network, t.auth_mode, t.is_active, t.status, t.is_featured, t.call_count,
+            COALESCE(t.settled_call_sequence, t.call_count, 0) AS settled_call_sequence,
             t.upstream_signing_secret, COALESCE(t.upstream_verified, 0) AS upstream_verified,
+            COALESCE(t.require_upstream_verified, 0) AS require_upstream_verified,
+            COALESCE(t.upstream_auth_type, 'none') AS upstream_auth_type,
+            t.upstream_auth_header, t.upstream_auth_secret,
             COALESCE(t.rate_limit_rpm, 120) AS rate_limit_rpm,
             COALESCE(t.daily_quota, 10000) AS daily_quota,
             COALESCE(t.mcp_mode, 'direct') AS mcp_mode,
@@ -26,7 +30,7 @@ export async function loadTenantFromD1(
             COALESCE(u.plan, 'free') AS owner_plan
      FROM tenants t
      LEFT JOIN users u ON u.id = t.user_id
-     WHERE t.subdomain = ? AND t.is_active = 1 AND t.status = 'active'
+     WHERE t.subdomain = ? AND t.is_active = 1 AND t.status = 'active' AND t.deleted_at IS NULL
      LIMIT 1`
   )
     .bind(normalized)
@@ -37,13 +41,24 @@ export async function loadTenantFromD1(
   }
 
   const toolsResult = await env.DB.prepare(
-    `SELECT id, tenant_id, name, description, http_method, upstream_path, input_schema_json, price_usd, price_atomic, is_active
+    `SELECT id, tenant_id, name, description, http_method, upstream_path, input_schema_json,
+            price_usd, price_atomic, is_active,
+            COALESCE(source_type, 'rest') AS source_type, remote_tool_name
      FROM tools
      WHERE tenant_id = ? AND is_active = 1
      ORDER BY name ASC`
   )
     .bind(tenant.id)
     .all<ToolRecord>();
+
+  const ownerPlan = tenant.owner_plan === "pro" ? "pro" : "free";
+  // Central entitlement resolution: upgrading a user from Free -> Pro immediately elevates standard tenant limits
+  const effectiveRpm =
+    ownerPlan === "pro" ? Math.max(600, Number(tenant.rate_limit_rpm ?? 600)) : Number(tenant.rate_limit_rpm ?? 120);
+  const effectiveQuota =
+    ownerPlan === "pro"
+      ? Math.max(1_000_000, Number(tenant.daily_quota ?? 1_000_000))
+      : Number(tenant.daily_quota ?? 10_000);
 
   return {
     id: tenant.id,
@@ -62,11 +77,19 @@ export async function loadTenantFromD1(
     status: tenant.status,
     is_featured: tenant.is_featured,
     call_count: tenant.call_count ?? 0,
-    owner_plan: tenant.owner_plan === "pro" ? "pro" : "free",
+    settled_call_sequence: Number(tenant.settled_call_sequence ?? tenant.call_count ?? 0),
+    owner_plan: ownerPlan,
     upstream_signing_secret: tenant.upstream_signing_secret ?? null,
     upstream_verified: Number(tenant.upstream_verified ?? 0),
-    rate_limit_rpm: Number(tenant.rate_limit_rpm ?? 120),
-    daily_quota: Number(tenant.daily_quota ?? 10000),
+    require_upstream_verified: Number(tenant.require_upstream_verified ?? 0),
+    upstream_auth_type:
+      tenant.upstream_auth_type === "bearer" || tenant.upstream_auth_type === "api_key_header"
+        ? tenant.upstream_auth_type
+        : "none",
+    upstream_auth_header: tenant.upstream_auth_header ?? null,
+    upstream_auth_secret: tenant.upstream_auth_secret ?? null,
+    rate_limit_rpm: effectiveRpm,
+    daily_quota: effectiveQuota,
     mcp_mode:
       tenant.mcp_mode === "codemode" || tenant.mcp_mode === "openapi_codemode"
         ? tenant.mcp_mode

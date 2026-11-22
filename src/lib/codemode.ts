@@ -9,6 +9,7 @@ import {
 import type { JSONSchema7 } from "json-schema";
 import type { AppBindings, TenantRoutingRecord, ToolRecord } from "../types";
 import { usdToAtomicUsdc } from "./crypto";
+import { validateToolArguments } from "./schema-validator";
 
 function parseJsonSchema(raw: string): JSONSchema7 {
   try {
@@ -22,14 +23,26 @@ function parseJsonSchema(raw: string): JSONSchema7 {
   return { type: "object", properties: {} };
 }
 
+function buildUniqueToolMap(tools: ToolRecord[]): Map<string, ToolRecord> {
+  const map = new Map<string, ToolRecord>();
+  tools.forEach((tool, idx) => {
+    let safeName = sanitizeToolName(tool.name);
+    if (map.has(safeName)) {
+      safeName = `${safeName}_${idx + 1}`;
+    }
+    map.set(safeName, tool);
+  });
+  return map;
+}
+
 /**
  * Generates compact TypeScript declarations (`declare const codemode: { ... }`)
  * for a set of Port4 tenant tools using @cloudflare/codemode's JSON Schema generator.
  */
 export function generateTenantCodeModeTypes(tools: ToolRecord[]): string {
   const descriptors: JsonSchemaToolDescriptors = {};
-  for (const tool of tools) {
-    const safeName = sanitizeToolName(tool.name);
+  const uniqueMap = buildUniqueToolMap(tools);
+  for (const [safeName, tool] of uniqueMap.entries()) {
     descriptors[safeName] = {
       description: `${tool.description || tool.name} (${tool.http_method} ${tool.upstream_path}, $${tool.price_usd} USDC)`,
       inputSchema: parseJsonSchema(tool.input_schema_json)
@@ -147,7 +160,7 @@ export function buildCodeModeMcpTools(
       },
       {
         name: "execute",
-        description: `Execute an async JavaScript arrow function inside an isolated Cloudflare Dynamic Worker sandbox against ${tenant.name} tools via the typed 'codemode.*' namespace. Call 'search' first to discover method signatures. Max ${tenant.codemode_max_subcalls} upstream calls per execution.`,
+        description: `Execute an async JavaScript arrow function inside an isolated Cloudflare Dynamic Worker sandbox against ${tenant.name} tools via the typed 'codemode.*' namespace. Call 'search' first to discover method signatures. Max ${tenant.codemode_max_subcalls} upstream calls and $${priceUsd} USDC cumulative budget per execution.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -170,7 +183,7 @@ export function buildCodeModeMcpTools(
       name: "code",
       description: [
         `Execute an async JavaScript arrow function inside an isolated Cloudflare Dynamic Worker sandbox for ${tenant.name}.`,
-        `Compose multiple tool calls, loop, filter, and return only the final result (max ${tenant.codemode_max_subcalls} upstream calls per run).`,
+        `Compose multiple tool calls, loop, filter, and return only the final result (max ${tenant.codemode_max_subcalls} upstream calls and $${priceUsd} USDC cumulative budget per run).`,
         "",
         "Available typed methods on `codemode`:",
         "```ts",
@@ -195,28 +208,33 @@ export function buildCodeModeMcpTools(
 /**
  * Executes model-written JavaScript inside an isolated Cloudflare Dynamic Worker
  * (`globalOutbound: null` — zero direct internet access, secrets never enter sandbox).
- * Every `codemode.<tool>()` call routes back through Port4's HMAC-signed host dispatcher
- * with a strict `maxSubCalls` budget.
+ * Enforces:
+ * 1. Maximum subcall count (`tenant.codemode_max_subcalls`).
+ * 2. Cumulative atomic USDC cost budget (`authorizedAtomicBudget`).
+ * 3. JSON Schema argument validation before every subcall.
  */
 export async function executeCodeModePlan(params: {
   env: AppBindings;
   tenant: TenantRoutingRecord;
   code: string;
-  dispatchTool: (tool: ToolRecord, args: Record<string, unknown>) => Promise<unknown>;
+  authorizedAtomicBudget: string;
+  dispatchTool: (tool: ToolRecord, args: Record<string, unknown>, subcallIndex: number) => Promise<unknown>;
 }): Promise<{
   ok: boolean;
   result?: unknown;
   error?: string;
   logs?: string[];
   subcalls: number;
+  consumedAtomic: string;
 }> {
-  const { env, tenant, code, dispatchTool } = params;
+  const { env, tenant, code, authorizedAtomicBudget, dispatchTool } = params;
 
   if (!env.LOADER) {
     return {
       ok: false,
       error: "Dynamic Worker LOADER binding is not configured on this gateway.",
-      subcalls: 0
+      subcalls: 0,
+      consumedAtomic: "0"
     };
   }
 
@@ -225,16 +243,20 @@ export async function executeCodeModePlan(params: {
     return {
       ok: false,
       error: "Code must be a non-empty JavaScript async arrow function under 32 KiB.",
-      subcalls: 0
+      subcalls: 0,
+      consumedAtomic: "0"
     };
   }
 
   const maxSubcalls = Math.min(50, Math.max(1, tenant.codemode_max_subcalls || 10));
+  const budgetCap = BigInt(/^\d+$/.test(authorizedAtomicBudget) ? authorizedAtomicBudget : "10000");
   let subcalls = 0;
+  let consumedAtomic = 0n;
 
   const fns: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
-  for (const tool of tenant.tools) {
-    const safeName = sanitizeToolName(tool.name);
+  const uniqueMap = buildUniqueToolMap(tenant.tools);
+
+  for (const [safeName, tool] of uniqueMap.entries()) {
     fns[safeName] = async (input?: unknown) => {
       subcalls += 1;
       if (subcalls > maxSubcalls) {
@@ -242,11 +264,26 @@ export async function executeCodeModePlan(params: {
           `Code Mode sub-call limit exceeded (${maxSubcalls} max calls per execution).`
         );
       }
+
+      const toolCost = BigInt(/^\d+$/.test(tool.price_atomic) ? tool.price_atomic : "1000");
+      if (consumedAtomic + toolCost > budgetCap) {
+        throw new Error(
+          `Code Mode execution budget exceeded: tool '${tool.name}' costs ${toolCost.toString()} atomic units, exceeding remaining budget of ${(budgetCap - consumedAtomic).toString()} atomic units.`
+        );
+      }
+
       const argsObj =
         input && typeof input === "object" && !Array.isArray(input)
           ? (input as Record<string, unknown>)
           : {};
-      return dispatchTool(tool, argsObj);
+
+      const argValidation = validateToolArguments(tool.input_schema_json, argsObj);
+      if (!argValidation.ok) {
+        throw new Error(`Invalid arguments for '${tool.name}': ${argValidation.error}`);
+      }
+
+      consumedAtomic += toolCost;
+      return dispatchTool(tool, argsObj, subcalls);
     };
   }
 
@@ -264,7 +301,8 @@ export async function executeCodeModePlan(params: {
       ok: false,
       error: outcome.error,
       logs: outcome.logs,
-      subcalls
+      subcalls,
+      consumedAtomic: consumedAtomic.toString()
     };
   }
 
@@ -272,6 +310,7 @@ export async function executeCodeModePlan(params: {
     ok: true,
     result: truncateResult(outcome.result, { maxTokens: 6000 }),
     logs: outcome.logs,
-    subcalls
+    subcalls,
+    consumedAtomic: consumedAtomic.toString()
   };
 }

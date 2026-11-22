@@ -185,6 +185,7 @@ sandboxRoutes.post("/run", async (c) => {
 
   return c.json({
     ok: true,
+    simulated: true,
     tool: tool.name,
     network: requirement.network,
     amountUsd: `$${tool.price_usd}`,
@@ -192,7 +193,7 @@ sandboxRoutes.post("/run", async (c) => {
     payTo: requirement.payTo,
     isPlatformFee,
     txHash,
-    basescanUrl: `https://sepolia.basescan.org/tx/${txHash}`,
+    basescanUrl: null,
     latencyMs,
     step1_402: {
       status: 402,

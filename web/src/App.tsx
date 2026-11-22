@@ -88,6 +88,16 @@ export default function App() {
   const [tenants, setTenants] = useState<TenantItem[]>([]);
   const [transactions, setTransactions] = useState<LedgerTransaction[]>([]);
   const [summary, setSummary] = useState({ total_calls: 0, total_usd: "0.0000", avg_latency_ms: 0 });
+  const [apiKeys, setApiKeys] = useState<
+    Array<{
+      id: string;
+      name: string;
+      key_prefix: string;
+      scopes?: string;
+      created_at: string;
+      last_used_at: string | null;
+    }>
+  >([]);
   const [newApiKey, setNewApiKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -131,9 +141,10 @@ export default function App() {
 
       if (view === "dashboard") {
         if (meJson.authenticated) {
-          const [tRes, lRes] = await Promise.all([
+          const [tRes, lRes, kRes] = await Promise.all([
             fetch("/api/tenants", { signal: controller.signal }),
-            fetch("/api/ledger", { signal: controller.signal })
+            fetch("/api/ledger", { signal: controller.signal }),
+            fetch("/api/keys", { signal: controller.signal })
           ]);
           if (tRes.ok) {
             const tJson = (await tRes.json()) as { tenants: TenantItem[] };
@@ -146,6 +157,19 @@ export default function App() {
             };
             setTransactions(lJson.transactions);
             setSummary(lJson.summary);
+          }
+          if (kRes.ok) {
+            const kJson = (await kRes.json()) as {
+              keys: Array<{
+                id: string;
+                name: string;
+                key_prefix: string;
+                scopes?: string;
+                created_at: string;
+                last_used_at: string | null;
+              }>;
+            };
+            setApiKeys(kJson.keys);
           }
         } else {
           const pubRes = await fetch("/api/public/ledger", { signal: controller.signal });
@@ -200,7 +224,13 @@ export default function App() {
     if (res.ok) {
       const data = (await res.json()) as { secret: string };
       setNewApiKey(data.secret);
+      await loadData();
     }
+  };
+
+  const handleRevokeApiKey = async (id: string) => {
+    await fetch(`/api/keys/${id}`, { method: "DELETE" });
+    await loadData();
   };
 
   const copyCurl = () => {
@@ -521,7 +551,7 @@ export default function App() {
 
                   <div className="cf-card rounded-2xl p-4 sm:p-5 flex flex-col gap-3 min-w-0">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="text-sm font-semibold text-zinc-900">API Key</span>
+                      <span className="text-sm font-semibold text-zinc-900">Scoped API Keys</span>
                       <button
                         type="button"
                         onClick={handleCreateApiKey}
@@ -531,8 +561,43 @@ export default function App() {
                         Generate
                       </button>
                     </div>
-                    <div className="font-mono text-xs bg-zinc-50 border border-zinc-200 rounded-xl p-3.5 text-zinc-800 break-all">
-                      {newApiKey ?? "p4_live_••••••••••••••••••••••••••••••••"}
+                    {newApiKey && (
+                      <div className="font-mono text-xs bg-orange-50/60 border border-[#F6821F]/40 rounded-xl p-3 text-zinc-900 break-all">
+                        <div className="text-[10px] font-semibold text-[#C25906] mb-1">
+                          New API Key (copy now — shown once):
+                        </div>
+                        {newApiKey}
+                      </div>
+                    )}
+                    <div className="flex flex-col gap-2">
+                      {apiKeys.length === 0 ? (
+                        <div className="font-mono text-xs bg-zinc-50 border border-zinc-200 rounded-xl p-3.5 text-zinc-500">
+                          No active API keys. Click Generate to create a scoped key.
+                        </div>
+                      ) : (
+                        apiKeys.map((k) => (
+                          <div
+                            key={k.id}
+                            className="flex items-center justify-between gap-2 font-mono text-xs bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2"
+                          >
+                            <div className="min-w-0">
+                              <div className="text-zinc-900 font-medium truncate">
+                                {k.name} · <span className="text-zinc-500">{k.key_prefix}•••</span>
+                              </div>
+                              <div className="text-[10px] text-zinc-500">
+                                Scopes: {k.scopes ?? "tenant:read,tenant:write"}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void handleRevokeApiKey(k.id)}
+                              className="px-2.5 py-1 rounded border border-rose-200 bg-rose-50 text-rose-700 text-[11px] hover:bg-rose-100 cursor-pointer shrink-0"
+                            >
+                              Revoke
+                            </button>
+                          </div>
+                        ))
+                      )}
                     </div>
                   </div>
                 </div>

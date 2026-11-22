@@ -2,6 +2,7 @@ import type { Context, MiddlewareHandler } from "hono";
 import type {
   AppBindings,
   AppEnv,
+  PaymentExecutionContext,
   TenantRoutingRecord,
   ToolRecord,
   X402PaymentRequired,
@@ -13,6 +14,7 @@ import {
   decodeBase64Json,
   encodeBase64Json,
   hmacSha256Hex,
+  randomHex,
   sha256Hex,
   timingSafeEqualString,
   usdToAtomicUsdc
@@ -70,22 +72,22 @@ async function verifyEnterpriseOAuthV2(
 }
 
 /**
- * Deterministic Non-Custodial Fee Split using the atomic EdgeRateLimiter DO sequence
- * (avoids stale KV call_count caching):
- * - 'free' plan (3%): every 33rd call routes payTo to PORT4_TREASURY_WALLET
- * - 'pro' plan (1%): every 100th call routes payTo to PORT4_TREASURY_WALLET
+ * Deterministic Non-Custodial Fee Split using the tenant-wide settled call sequence
+ * (independent of per-IP discovery requests):
+ * - 'free' plan (3%): every 33rd paid call routes payTo to PORT4_TREASURY_WALLET
+ * - 'pro' plan (1%): every 100th paid call routes payTo to PORT4_TREASURY_WALLET
  */
 export function computeFeeSplit(
   env: AppBindings,
   tenant: TenantRoutingRecord,
-  atomicSequence?: number,
+  tenantPaidSequence?: number,
   targetNetwork?: string,
   targetWallet?: string
 ): { payTo: string; isPlatformFee: boolean } {
   const nextCallNumber =
-    typeof atomicSequence === "number" && atomicSequence > 0
-      ? atomicSequence
-      : (tenant.call_count ?? 0) + 1;
+    typeof tenantPaidSequence === "number" && tenantPaidSequence > 0
+      ? tenantPaidSequence
+      : (tenant.settled_call_sequence ?? tenant.call_count ?? 0) + 1;
   const interval = tenant.owner_plan === "pro" ? 100 : 33;
   const family = getNetworkFamily(targetNetwork || tenant.network);
   const treasury =
@@ -112,7 +114,8 @@ export function resolveUsdcAsset(network: string, fallback: string): string {
 export function buildPaymentRequired(
   c: Context<AppEnv>,
   tenant: TenantRoutingRecord,
-  tool: ToolRecord
+  tool: ToolRecord,
+  paidSequence?: number
 ): { paymentRequired: X402PaymentRequired; isPlatformFee: boolean } {
   const primaryNetwork = tenant.network || c.env.X402_NETWORK;
   const configuredWallets =
@@ -125,7 +128,7 @@ export function buildPaymentRequired(
       ? configuredWallets
       : [{ network: primaryNetwork, address: tenant.payout_wallet }];
 
-  const sequence = c.get("rateLimitSequence");
+  const sequence = paidSequence ?? (tenant.settled_call_sequence ?? tenant.call_count ?? 0) + 1;
   let anyPlatformFee = false;
 
   const accepts: X402PaymentRequirement[] = wallets.map((entry) => {
@@ -147,6 +150,7 @@ export function buildPaymentRequired(
       extra: {
         name: "USD Coin",
         version: "2",
+        paymentFlow: "upfront",
         tenant: tenant.subdomain,
         tool: tool.name,
         priceUsd: tool.price_usd,
@@ -174,6 +178,26 @@ export function getSandboxSigningSecret(env: AppBindings): string {
     throw new Error("JWT_SECRET binding is required for sandbox signing.");
   }
   return env.JWT_SECRET;
+}
+
+/**
+ * Derives a canonical, manipulation-resistant payment authorization identity
+ * independent of Base64 JSON whitespace or key ordering.
+ */
+async function computeCanonicalPaymentFingerprint(
+  decoded: X402PaymentSignaturePayload
+): Promise<string> {
+  const family = getNetworkFamily(decoded.network);
+  if (family === "solana" && typeof decoded.payload?.transaction === "string") {
+    return sha256Hex(`x402:svm:${decoded.network}:${decoded.payload.transaction.trim()}`);
+  }
+  const auth = decoded.payload?.authorization;
+  if (auth) {
+    return sha256Hex(
+      `x402:evm:${decoded.network}:${(auth.from || "").toLowerCase()}:${(auth.to || "").toLowerCase()}:${auth.value || ""}:${(auth.nonce || "").toLowerCase()}`
+    );
+  }
+  return sha256Hex(JSON.stringify(decoded));
 }
 
 async function verifySandboxSignature(
@@ -287,8 +311,11 @@ async function verifyAndSettleViaFacilitator(
 
   if (!settleRes.ok) {
     const errText = await settleRes.text().catch(() => "Facilitator settle failed");
+    // HTTP 202 or 504 during settlement may indicate a broadcast transaction still pending on-chain
+    const mayBePending = settleRes.status === 202 || settleRes.status === 504;
     return {
       success: false,
+      settlementPending: mayBePending,
       transaction: "",
       network: requirement.network,
       payer: verifyJson.payer ?? "unknown",
@@ -301,6 +328,8 @@ async function verifyAndSettleViaFacilitator(
 
   const settleJson = (await settleRes.json()) as {
     success?: boolean;
+    status?: string;
+    settlementPending?: boolean;
     transaction?: string;
     txHash?: string;
     network?: string;
@@ -308,12 +337,39 @@ async function verifyAndSettleViaFacilitator(
     errorReason?: string | null;
   };
 
+  const txHash = (settleJson.transaction ?? settleJson.txHash ?? "").trim();
+  const isPending =
+    settleJson.status === "settlement_pending" ||
+    settleJson.settlementPending === true ||
+    settleRes.status === 202;
+
+  if (isPending) {
+    return {
+      success: false,
+      settlementPending: true,
+      transaction: txHash,
+      network: settleJson.network ?? requirement.network,
+      payer: settleJson.payer ?? verifyJson.payer ?? decoded.payload?.authorization?.from ?? "unknown",
+      errorReason: "settlement_pending",
+      mode: "facilitator",
+      isPlatformFee,
+      payTo: requirement.payTo
+    };
+  }
+
+  const validSettlement =
+    Boolean(settleJson.success) &&
+    txHash.length >= 16 &&
+    (!settleJson.network || settleJson.network === requirement.network);
+
   return {
-    success: Boolean(settleJson.success),
-    transaction: settleJson.transaction ?? settleJson.txHash ?? "",
+    success: validSettlement,
+    transaction: txHash,
     network: settleJson.network ?? requirement.network,
     payer: settleJson.payer ?? verifyJson.payer ?? decoded.payload?.authorization?.from ?? "unknown",
-    errorReason: settleJson.errorReason ?? null,
+    errorReason: validSettlement
+      ? null
+      : (settleJson.errorReason ?? "invalid_facilitator_settlement_receipt"),
     mode: "facilitator",
     isPlatformFee,
     payTo: requirement.payTo
@@ -454,25 +510,76 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
   const requirement = matchedRequirement ?? primaryRequirement;
   const isPlatformFee = Boolean(requirement.extra.isPlatformFee);
 
-  const paymentFingerprint = await sha256Hex(signatureHeader);
+  // Verify EVM authorization target & amount BEFORE checking replay cache so mismatched context never hits cache
+  if (family === "evm" && decodedSignature.payload?.authorization) {
+    const auth = decodedSignature.payload.authorization;
+    if (
+      auth.to.toLowerCase() !== requirement.payTo.toLowerCase() ||
+      auth.value !== requirement.amount
+    ) {
+      c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+      return c.json(
+        {
+          error: "invalid_payment_authorization_target",
+          message: "Payment authorization recipient or amount does not match this tool's requirement."
+        },
+        402
+      );
+    }
+  }
+
+  const paymentFingerprint = await computeCanonicalPaymentFingerprint(decodedSignature);
+  const leaseToken = `lease_${randomHex(16)}`;
+  const paymentContext: PaymentExecutionContext = {
+    tenantId: tenant.id,
+    toolName: tool.name,
+    resourceUrl: c.req.url,
+    network: requirement.network,
+    asset: requirement.asset,
+    amountAtomic: requirement.amount,
+    payTo: requirement.payTo
+  };
+
   const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
     c.env.PAYMENT_REPLAY_GUARD.idFromName(paymentFingerprint)
   );
   const replayClaim = await replayStub.fetch("https://payment-replay/claim", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ operation: "claim" })
+    body: JSON.stringify({ operation: "claim", context: paymentContext, leaseToken })
   });
-  const replayResult = replayClaim.ok
-    ? ((await replayClaim.json()) as {
-        status?: "claimed" | "retry_upstream" | "completed" | "in_flight";
-        claimed?: boolean;
-        receipt?: X402SettlementReceipt;
-        responseBody?: string;
-      })
-    : { status: "in_flight" as const, claimed: false };
 
-  // 1. Already completed idempotently -> return cached paid response without double-charging
+  if (!replayClaim.ok) {
+    return c.json({ error: "payment_coordination_unavailable" }, 503);
+  }
+
+  const replayResult = (await replayClaim.json()) as {
+    status?:
+      | "claimed"
+      | "retry_upstream"
+      | "completed"
+      | "in_flight"
+      | "settlement_pending"
+      | "context_mismatch";
+    claimed?: boolean;
+    leaseToken?: string;
+    receipt?: X402SettlementReceipt;
+    responseBody?: string;
+  };
+
+  // 1. Cross-tenant or cross-tool replay attempt -> reject immediately
+  if (replayResult.status === "context_mismatch") {
+    c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+    return c.json(
+      {
+        error: "payment_context_mismatch",
+        message: "This payment authorization is bound to a different tenant, tool, or resource."
+      },
+      409
+    );
+  }
+
+  // 2. Same tenant+tool+payment already completed -> return cached paid response idempotently
   if (replayResult.status === "completed" && replayResult.receipt && replayResult.responseBody) {
     c.header("PAYMENT-RESPONSE", encodeBase64Json(replayResult.receipt));
     c.header("X-Port4-Settlement-Tx", replayResult.receipt.transaction);
@@ -482,7 +589,18 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     return c.body(replayResult.responseBody, 200);
   }
 
-  // 2. Concurrent duplicate in-flight -> ask caller to retry briefly
+  // 3. On-chain settlement is still pending confirmation -> never release or double-settle
+  if (replayResult.status === "settlement_pending") {
+    return c.json(
+      {
+        error: "payment_settlement_pending",
+        message: "Payment transaction was broadcast and is awaiting on-chain confirmation. Retry shortly with the same PAYMENT-SIGNATURE."
+      },
+      409
+    );
+  }
+
+  // 4. Concurrent duplicate in-flight
   if (!replayResult.claimed) {
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
     return c.json(
@@ -495,9 +613,12 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
   }
 
   c.set("paymentFingerprint", paymentFingerprint);
+  c.set("paymentLeaseToken", leaseToken);
+  c.set("paymentContext", paymentContext);
+
   let receipt: X402SettlementReceipt | null = null;
 
-  // 3. Previously settled on-chain, upstream had failed -> retry upstream WITHOUT re-settling
+  // 5. Previously settled on-chain, upstream had failed -> retry upstream WITHOUT re-settling
   if (replayResult.status === "retry_upstream" && replayResult.receipt) {
     receipt = replayResult.receipt;
   } else {
@@ -507,11 +628,30 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
       receipt = await verifyAndSettleViaFacilitator(c.env, decodedSignature, requirement, isPlatformFee);
     }
 
+    if (receipt?.settlementPending) {
+      await replayStub.fetch("https://payment-replay/mark_settlement_pending", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operation: "mark_settlement_pending",
+          leaseToken,
+          receipt
+        })
+      });
+      return c.json(
+        {
+          error: "payment_settlement_pending",
+          message: "Payment settlement is pending on-chain confirmation. Retry with the same PAYMENT-SIGNATURE."
+        },
+        409
+      );
+    }
+
     if (!receipt || !receipt.success) {
       await replayStub.fetch("https://payment-replay/release", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation: "release" })
+        body: JSON.stringify({ operation: "release", leaseToken })
       });
       c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
       return c.json(
@@ -524,12 +664,21 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
       );
     }
 
-    // Durably persist settled receipt BEFORE calling upstream so upstream 502s are safely retryable
-    await replayStub.fetch("https://payment-replay/mark_settled", {
+    // Durably persist settled receipt and verify DO response BEFORE calling upstream
+    const markSettledRes = await replayStub.fetch("https://payment-replay/mark_settled", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ operation: "mark_settled", receipt })
+      body: JSON.stringify({ operation: "mark_settled", leaseToken, receipt })
     });
+    if (!markSettledRes.ok) {
+      return c.json(
+        {
+          error: "payment_state_persistence_failed",
+          message: "Payment settled but durable state persistence failed. Retry with the same PAYMENT-SIGNATURE."
+        },
+        503
+      );
+    }
   }
 
   c.set("x402Receipt", receipt);
