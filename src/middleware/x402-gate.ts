@@ -20,6 +20,7 @@ import {
   usdToAtomicUsdc
 } from "../lib/crypto";
 import { verifyCloudflareAccessJwt } from "../lib/cloudflare-access";
+import { fetchFacilitatorVerify, resolveFacilitatorConfig } from "../lib/facilitator";
 import {
   EVM_ADDRESS_RE,
   SOLANA_ADDRESS_RE,
@@ -255,19 +256,28 @@ async function verifyAndSettleViaFacilitator(
   requirement: X402PaymentRequirement,
   isPlatformFee: boolean
 ): Promise<X402SettlementReceipt> {
-  const baseUrl = (env.FACILITATOR_URL || env.X402_FACILITATOR_URL).replace(/\/$/, "");
+  const facConfig = resolveFacilitatorConfig(env, requirement.network);
   const payload = {
     x402Version: 2,
     paymentPayload: decoded,
     paymentRequirements: requirement
   };
 
-  const verifyRes = await fetch(`${baseUrl}/verify`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(10_000)
-  });
+  let verifyRes: Response;
+  try {
+    verifyRes = await fetchFacilitatorVerify(facConfig, payload);
+  } catch {
+    return {
+      success: false,
+      transaction: "",
+      network: requirement.network,
+      payer: decoded.payload?.authorization?.from ?? "unknown",
+      errorReason: "facilitator_verify_unreachable",
+      mode: "facilitator",
+      isPlatformFee,
+      payTo: requirement.payTo
+    };
+  }
 
   if (!verifyRes.ok) {
     const errText = await verifyRes.text().catch(() => "Facilitator verify failed");
@@ -302,12 +312,28 @@ async function verifyAndSettleViaFacilitator(
     };
   }
 
-  const settleRes = await fetch(`${baseUrl}/settle`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(10_000)
-  });
+  // Note: `/settle` is state-mutating and NEVER auto-retried on timeout; timeouts enter `settlement_pending`
+  let settleRes: Response;
+  try {
+    settleRes = await fetch(`${facConfig.baseUrl}/settle`, {
+      method: "POST",
+      headers: facConfig.headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10_000)
+    });
+  } catch {
+    return {
+      success: false,
+      settlementPending: true,
+      transaction: "",
+      network: requirement.network,
+      payer: verifyJson.payer ?? decoded.payload?.authorization?.from ?? "unknown",
+      errorReason: "facilitator_settle_timeout_pending",
+      mode: "facilitator",
+      isPlatformFee,
+      payTo: requirement.payTo
+    };
+  }
 
   if (!settleRes.ok) {
     const errText = await settleRes.text().catch(() => "Facilitator settle failed");

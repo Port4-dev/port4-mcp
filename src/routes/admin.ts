@@ -64,7 +64,13 @@ adminRoutes.get("/stats", async (c) => {
     gross_usdc_volume: (grossAtomic / 1_000_000).toFixed(4),
     verified_usdc_volume: (verifiedAtomic / 1_000_000).toFixed(4),
     net_platform_revenue: (netAtomic / 1_000_000).toFixed(4),
-    platform_fee_calls: txRow?.platform_fee_calls ?? 0
+    platform_fee_calls: txRow?.platform_fee_calls ?? 0,
+    capabilities: {
+      codemodeLoader: Boolean(c.env.LOADER),
+      r2Archive: Boolean(c.env.LEDGER_ARCHIVE),
+      analyticsEngine: Boolean(c.env.GATEWAY_ANALYTICS),
+      mainnetFacilitatorConfigured: Boolean(c.env.X402_MAINNET_FACILITATOR_URL)
+    }
   });
 });
 

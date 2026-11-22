@@ -2,7 +2,16 @@ import { Hono } from "hono";
 import type { AppEnv, TenantRecord, ToolRecord, TransactionRecord } from "../types";
 import { requireAuth } from "../middleware/auth";
 import { invalidateTenantKv, syncTenantToKv } from "../lib/kv-sync";
-import { hmacSha256Hex, randomHex, sha256Hex, timingSafeEqualString, usdToAtomicUsdc } from "../lib/crypto";
+import {
+  decryptSecretAtRest,
+  encryptSecretAtRest,
+  hmacSha256Hex,
+  isValidCustomAuthHeaderName,
+  randomHex,
+  sha256Hex,
+  timingSafeEqualString,
+  usdToAtomicUsdc
+} from "../lib/crypto";
 import { normalizeAccessTeamDomain } from "../lib/cloudflare-access";
 import { parseOpenApiSpecToTools } from "../lib/openapi-import";
 import {
@@ -178,7 +187,7 @@ apiRoutes.get("/tenants", async (c) => {
             COALESCE(upstream_verified, 0) AS upstream_verified,
             COALESCE(require_upstream_verified, 0) AS require_upstream_verified,
             COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
-            upstream_auth_header,
+            upstream_auth_header, upstream_auth_secret,
             cf_access_team_domain, cf_access_aud,
             created_at, updated_at
      FROM tenants
@@ -214,6 +223,8 @@ apiRoutes.get("/tenants", async (c) => {
   return c.json({
     tenants: tenants.map((t) => ({
       ...t,
+      upstream_auth_secret: undefined,
+      has_upstream_auth_secret: Boolean(t.upstream_auth_secret),
       payout_wallets: parsePayoutWalletsJson(t.payout_wallets_json, t.network, t.payout_wallet),
       endpoint_url: `https://${t.subdomain}.port4.dev/mcp`,
       tools: toolsByTenant.get(t.id) ?? []
@@ -234,6 +245,9 @@ apiRoutes.post("/tenants", async (c) => {
     mcp_mode?: "direct" | "codemode" | "openapi_codemode";
     codemode_price_usd?: string;
     codemode_max_subcalls?: number;
+    upstream_auth_type?: "none" | "bearer" | "api_key_header";
+    upstream_auth_header?: string;
+    upstream_auth_secret?: string;
     cf_access_team_domain?: string;
     cf_access_aud?: string;
     initial_tool?: {
@@ -345,6 +359,34 @@ apiRoutes.post("/tenants", async (c) => {
     authMode = "x402+oauth_v2";
   }
 
+  const upstreamAuthType =
+    body.upstream_auth_type && UPSTREAM_AUTH_TYPES.has(body.upstream_auth_type)
+      ? body.upstream_auth_type
+      : "none";
+  let upstreamAuthHeader: string | null = null;
+  let encryptedUpstreamSecret: string | null = null;
+
+  if (upstreamAuthType === "api_key_header") {
+    const rawHeader = (body.upstream_auth_header ?? "").trim();
+    if (!isValidCustomAuthHeaderName(rawHeader)) {
+      return c.json(
+        {
+          error: "invalid_upstream_auth_header",
+          message: "Custom auth header must be 2-64 alphanumeric/hyphen chars and not a reserved header."
+        },
+        400
+      );
+    }
+    upstreamAuthHeader = rawHeader;
+  }
+
+  if (upstreamAuthType !== "none" && body.upstream_auth_secret && body.upstream_auth_secret.trim()) {
+    encryptedUpstreamSecret = await encryptSecretAtRest(
+      body.upstream_auth_secret.trim().slice(0, 512),
+      c.env.JWT_SECRET
+    );
+  }
+
   const tenantId = `ten_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
   const upstreamSigningSecret = `p4_whsec_${randomHex(24)}`;
   const verificationToken = `port4-verify=${randomHex(16)}`;
@@ -354,8 +396,8 @@ apiRoutes.post("/tenants", async (c) => {
   try {
     await c.env.DB.prepare(
       `INSERT INTO tenants
-       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota, mcp_mode, codemode_price_usd, codemode_max_subcalls, cf_access_team_domain, cf_access_aud)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota, mcp_mode, codemode_price_usd, codemode_max_subcalls, upstream_auth_type, upstream_auth_header, upstream_auth_secret, cf_access_team_domain, cf_access_aud)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         tenantId,
@@ -374,6 +416,9 @@ apiRoutes.post("/tenants", async (c) => {
         mcpMode,
         codemodePriceUsd,
         codemodeMaxSubcalls,
+        upstreamAuthType,
+        upstreamAuthHeader,
+        encryptedUpstreamSecret,
         cfAccessTeamDomain,
         cfAccessAud
       )
@@ -676,19 +721,39 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     nextUpstreamAuthType = body.upstream_auth_type;
   }
 
-  const nextUpstreamAuthHeader =
+  let nextUpstreamAuthHeader =
     body.upstream_auth_header !== undefined
       ? body.upstream_auth_header
-        ? body.upstream_auth_header.trim().slice(0, 64)
+        ? body.upstream_auth_header.trim()
         : null
       : existing.upstream_auth_header;
 
-  const nextUpstreamAuthSecret =
-    body.upstream_auth_secret !== undefined
-      ? body.upstream_auth_secret
-        ? body.upstream_auth_secret.trim().slice(0, 512)
-        : null
-      : existing.upstream_auth_secret;
+  if (nextUpstreamAuthType === "api_key_header") {
+    if (!nextUpstreamAuthHeader || !isValidCustomAuthHeaderName(nextUpstreamAuthHeader)) {
+      return c.json(
+        {
+          error: "invalid_upstream_auth_header",
+          message: "Custom auth header must be 2-64 alphanumeric/hyphen chars and not a reserved header."
+        },
+        400
+      );
+    }
+  } else if (nextUpstreamAuthType === "none") {
+    nextUpstreamAuthHeader = null;
+  }
+
+  let nextUpstreamAuthSecret = existing.upstream_auth_secret;
+  if (nextUpstreamAuthType === "none") {
+    nextUpstreamAuthSecret = null;
+  } else if (body.upstream_auth_secret !== undefined) {
+    const trimmedSecret = body.upstream_auth_secret ? body.upstream_auth_secret.trim() : "";
+    if (trimmedSecret.length > 0) {
+      nextUpstreamAuthSecret = await encryptSecretAtRest(
+        trimmedSecret.slice(0, 512),
+        c.env.JWT_SECRET
+      );
+    }
+  }
 
   const nextRequireVerified =
     body.require_upstream_verified !== undefined
@@ -936,10 +1001,21 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain, upstream_base_url, upstream_signing_secret FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    `SELECT id, subdomain, upstream_base_url, upstream_signing_secret,
+            COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
+            upstream_auth_header, upstream_auth_secret
+     FROM tenants WHERE id = ? AND user_id = ? LIMIT 1`
   )
     .bind(tenantId, user.id)
-    .first<{ id: string; subdomain: string; upstream_base_url: string; upstream_signing_secret: string | null }>();
+    .first<{
+      id: string;
+      subdomain: string;
+      upstream_base_url: string;
+      upstream_signing_secret: string | null;
+      upstream_auth_type: "none" | "bearer" | "api_key_header";
+      upstream_auth_header: string | null;
+      upstream_auth_secret: string | null;
+    }>();
 
   if (!tenant) return c.json({ error: "tenant_not_found" }, 404);
 
@@ -984,6 +1060,19 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
     "Idempotency-Key": requestId,
     "X-Port4-Test": "true"
   };
+
+  if (tenant.upstream_auth_secret && tenant.upstream_auth_type !== "none") {
+    const decryptedSecret = await decryptSecretAtRest(tenant.upstream_auth_secret, c.env.JWT_SECRET);
+    if (tenant.upstream_auth_type === "bearer") {
+      headers["Authorization"] = `Bearer ${decryptedSecret}`;
+    } else if (
+      tenant.upstream_auth_type === "api_key_header" &&
+      tenant.upstream_auth_header &&
+      isValidCustomAuthHeaderName(tenant.upstream_auth_header)
+    ) {
+      headers[tenant.upstream_auth_header.trim()] = decryptedSecret;
+    }
+  }
 
   let serializedBody = "";
   if (tool.http_method === "GET" || tool.http_method === "DELETE") {

@@ -12,6 +12,8 @@ export interface AppBindings extends CloudflareBindings {
   DEMO_PAYER_PRIVATE_KEY?: string;
   DEMO_AUTH_ENABLED?: string;
   ADMIN_GITHUB_ID?: string;
+  X402_MAINNET_FACILITATOR_URL?: string;
+  X402_FACILITATOR_API_KEY?: string;
   GATEWAY_ANALYTICS?: AnalyticsEngineDataset;
   LEDGER_ARCHIVE?: R2Bucket;
   MCP_RATE_LIMIT_PER_MINUTE?: string;

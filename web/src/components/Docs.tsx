@@ -88,14 +88,26 @@ export function Docs({
           </p>
           <CodeBlock
             id="mcp-config"
-            title="mcp.json — Cursor / Claude Desktop"
+            title="mcp.json — Cursor / Claude Desktop (Stateless HTTP or Local Budget-Guarded STDIO Bridge)"
             code={`{
   "mcpServers": {
-    "port4-demo": {
+    "port4-demo-http": {
       "url": "https://port4.dev/mcp/demo",
       "headers": {
         "MCP-Protocol-Version": "2026-07-28"
       }
+    },
+    "port4-demo-stdio-bridge": {
+      "command": "node",
+      "args": [
+        "./cli/port4-mcp.mjs",
+        "--url",
+        "https://port4.dev/mcp/demo",
+        "--max-per-call-usd",
+        "0.05",
+        "--max-session-usd",
+        "1.00"
+      ]
     }
   }
 }`}

@@ -7,7 +7,12 @@ import type {
   X402SettlementReceipt
 } from "../types";
 import { executeInternalSandboxTool } from "./sandbox";
-import { hmacSha256Hex, sha256Hex } from "../lib/crypto";
+import {
+  decryptSecretAtRest,
+  hmacSha256Hex,
+  isValidCustomAuthHeaderName,
+  sha256Hex
+} from "../lib/crypto";
 import { writeGatewayAnalytics } from "../lib/metering";
 import { resolveUsdcAsset } from "../middleware/x402-gate";
 import {
@@ -99,6 +104,7 @@ function safeParseSchema(raw: string): Record<string, unknown> {
  * Injects configurable upstream authentication headers + Port4 HMAC-SHA256 signature.
  */
 async function dispatchUpstreamTool(params: {
+  jwtSecret: string;
   tenant: TenantRoutingRecord;
   tool: ToolRecord;
   args: Record<string, unknown>;
@@ -107,7 +113,7 @@ async function dispatchUpstreamTool(params: {
   requestId: string;
   idempotencyKey: string;
 }): Promise<unknown> {
-  const { tenant, tool, args, receipt, colo, requestId, idempotencyKey } = params;
+  const { jwtSecret, tenant, tool, args, receipt, colo, requestId, idempotencyKey } = params;
 
   if (tenant.upstream_base_url === "internal://sandbox" || tool.source_type === "internal") {
     return executeInternalSandboxTool(tool.name, args, colo);
@@ -136,15 +142,18 @@ async function dispatchUpstreamTool(params: {
     "Idempotency-Key": idempotencyKey
   };
 
-  // Inject encrypted/stored upstream credentials if configured by the tenant owner
-  if (tenant.upstream_auth_type === "bearer" && tenant.upstream_auth_secret) {
-    upstreamHeaders["Authorization"] = `Bearer ${tenant.upstream_auth_secret}`;
-  } else if (
-    tenant.upstream_auth_type === "api_key_header" &&
-    tenant.upstream_auth_header &&
-    tenant.upstream_auth_secret
-  ) {
-    upstreamHeaders[tenant.upstream_auth_header] = tenant.upstream_auth_secret;
+  // Decrypt and inject upstream credentials if configured by the tenant owner
+  if (tenant.upstream_auth_secret && tenant.upstream_auth_type !== "none") {
+    const decryptedSecret = await decryptSecretAtRest(tenant.upstream_auth_secret, jwtSecret);
+    if (tenant.upstream_auth_type === "bearer") {
+      upstreamHeaders["Authorization"] = `Bearer ${decryptedSecret}`;
+    } else if (
+      tenant.upstream_auth_type === "api_key_header" &&
+      tenant.upstream_auth_header &&
+      isValidCustomAuthHeaderName(tenant.upstream_auth_header)
+    ) {
+      upstreamHeaders[tenant.upstream_auth_header.trim()] = decryptedSecret;
+    }
   }
 
   let serializedBody = "";
@@ -335,6 +344,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
         authorizedAtomicBudget: tool.price_atomic,
         dispatchTool: async (subTool, subArgs, subcallIndex) =>
           dispatchUpstreamTool({
+            jwtSecret: c.env.JWT_SECRET,
             tenant,
             tool: subTool,
             args: subArgs,
@@ -386,6 +396,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     } else {
       try {
         upstreamResult = await dispatchUpstreamTool({
+          jwtSecret: c.env.JWT_SECRET,
           tenant,
           tool,
           args: mcp.arguments,

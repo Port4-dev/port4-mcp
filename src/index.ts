@@ -149,7 +149,13 @@ const healthHandler = (c: Context<AppEnv>) =>
     service: "port4-gateway",
     mcpSpec: "2026-07-28",
     x402Version: 2,
-    network: c.env.X402_NETWORK
+    network: c.env.X402_NETWORK,
+    capabilities: {
+      codemodeLoader: Boolean(c.env.LOADER),
+      r2Archive: Boolean(c.env.LEDGER_ARCHIVE),
+      analyticsEngine: Boolean(c.env.GATEWAY_ANALYTICS),
+      mainnetFacilitatorConfigured: Boolean(c.env.X402_MAINNET_FACILITATOR_URL)
+    }
   });
 
 app.get("/health", healthHandler);

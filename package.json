@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "port4-mcp": "./cli/port4-mcp.mjs"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "dev:web": "npm --prefix web run dev",

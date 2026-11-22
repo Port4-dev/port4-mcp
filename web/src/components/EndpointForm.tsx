@@ -44,6 +44,9 @@ export interface TenantItem {
   mcp_mode?: "direct" | "codemode" | "openapi_codemode";
   codemode_price_usd?: string;
   codemode_max_subcalls?: number;
+  upstream_auth_type?: "none" | "bearer" | "api_key_header";
+  upstream_auth_header?: string | null;
+  has_upstream_auth_secret?: boolean;
   cf_access_team_domain?: string | null;
   cf_access_aud?: string | null;
   endpoint_url: string;
@@ -134,6 +137,10 @@ export function EndpointForm({
     mcp_mode: "direct" | "codemode" | "openapi_codemode";
     codemode_price_usd: string;
     codemode_max_subcalls: number;
+    upstream_auth_type: "none" | "bearer" | "api_key_header";
+    upstream_auth_header: string;
+    upstream_auth_secret: string;
+    has_upstream_auth_secret: boolean;
     auth_mode: "x402" | "x402+oauth_v2";
     cf_access_team_domain: string;
     cf_access_aud: string;
@@ -146,6 +153,10 @@ export function EndpointForm({
     mcp_mode: "direct",
     codemode_price_usd: "0.01",
     codemode_max_subcalls: 10,
+    upstream_auth_type: "none",
+    upstream_auth_header: "X-API-Key",
+    upstream_auth_secret: "",
+    has_upstream_auth_secret: false,
     auth_mode: "x402",
     cf_access_team_domain: "",
     cf_access_aud: ""
@@ -295,6 +306,10 @@ export function EndpointForm({
       mcp_mode: t.mcp_mode ?? "direct",
       codemode_price_usd: t.codemode_price_usd ?? "0.01",
       codemode_max_subcalls: t.codemode_max_subcalls ?? 10,
+      upstream_auth_type: t.upstream_auth_type ?? "none",
+      upstream_auth_header: t.upstream_auth_header ?? "X-API-Key",
+      upstream_auth_secret: "",
+      has_upstream_auth_secret: Boolean(t.has_upstream_auth_secret),
       auth_mode: t.auth_mode ?? "x402",
       cf_access_team_domain: t.cf_access_team_domain ?? "",
       cf_access_aud: t.cf_access_aud ?? ""
@@ -316,6 +331,14 @@ export function EndpointForm({
         mcp_mode: tenantEdit.mcp_mode,
         codemode_price_usd: tenantEdit.codemode_price_usd,
         codemode_max_subcalls: tenantEdit.codemode_max_subcalls,
+        upstream_auth_type: tenantEdit.upstream_auth_type,
+        upstream_auth_header:
+          tenantEdit.upstream_auth_type === "api_key_header"
+            ? tenantEdit.upstream_auth_header.trim()
+            : null,
+        ...(tenantEdit.upstream_auth_secret.trim().length > 0
+          ? { upstream_auth_secret: tenantEdit.upstream_auth_secret.trim() }
+          : {}),
         auth_mode: tenantEdit.auth_mode,
         cf_access_team_domain: tenantEdit.cf_access_team_domain.trim() || null,
         cf_access_aud: tenantEdit.cf_access_aud.trim() || null
@@ -1144,6 +1167,57 @@ export function EndpointForm({
                             title="Max upstream sub-calls per Code Mode run"
                             className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
                           />
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <select
+                            value={tenantEdit.upstream_auth_type}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({
+                                ...p,
+                                upstream_auth_type: e.target.value as
+                                  | "none"
+                                  | "bearer"
+                                  | "api_key_header"
+                              }))
+                            }
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2 min-h-[36px]"
+                          >
+                            <option value="none">Origin Auth: HMAC Only</option>
+                            <option value="bearer">Origin Auth: Bearer Token</option>
+                            <option value="api_key_header">Origin Auth: Custom Header</option>
+                          </select>
+                          {tenantEdit.upstream_auth_type === "api_key_header" && (
+                            <input
+                              value={tenantEdit.upstream_auth_header}
+                              onChange={(e) =>
+                                setTenantEdit((p) => ({
+                                  ...p,
+                                  upstream_auth_header: e.target.value
+                                }))
+                              }
+                              placeholder="X-API-Key"
+                              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                            />
+                          )}
+                          {tenantEdit.upstream_auth_type !== "none" && (
+                            <input
+                              type="password"
+                              value={tenantEdit.upstream_auth_secret}
+                              onChange={(e) =>
+                                setTenantEdit((p) => ({
+                                  ...p,
+                                  upstream_auth_secret: e.target.value
+                                }))
+                              }
+                              placeholder={
+                                tenantEdit.has_upstream_auth_secret
+                                  ? "AES-GCM encrypted (type to rotate)"
+                                  : "Enter upstream secret/token..."
+                              }
+                              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                            />
+                          )}
                         </div>
 
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
