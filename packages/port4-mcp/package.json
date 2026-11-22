@@ -12,8 +12,8 @@
   },
   "type": "module",
   "bin": {
-    "port4-mcp": "./bin/port4-mcp.mjs",
-    "port4": "./bin/port4-mcp.mjs"
+    "port4-mcp": "bin/port4-mcp.mjs",
+    "port4": "bin/port4-mcp.mjs"
   },
   "files": [
     "bin/",
