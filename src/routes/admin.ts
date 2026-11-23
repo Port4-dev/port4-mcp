@@ -68,7 +68,9 @@ adminRoutes.get("/stats", async (c) => {
     capabilities: {
       codemodeLoader: Boolean(c.env.LOADER),
       visaTap: true,
-      tempoMpp: Boolean(c.env.TEMPO_RPC_URL),
+      tempoMpp: Boolean(
+        c.env.TEMPO_RPC_URL || c.env.TEMPO_MAINNET_RPC_URL || c.env.TEMPO_TESTNET_RPC_URL
+      ),
       r2Archive: Boolean(c.env.LEDGER_ARCHIVE),
       analyticsEngine: Boolean(c.env.GATEWAY_ANALYTICS),
       mainnetFacilitatorConfigured: Boolean(c.env.X402_MAINNET_FACILITATOR_URL)

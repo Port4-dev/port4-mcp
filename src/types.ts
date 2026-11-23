@@ -19,6 +19,8 @@ export interface AppBindings extends CloudflareBindings {
   LEDGER_ARCHIVE?: R2Bucket;
   MCP_RATE_LIMIT_PER_MINUTE?: string;
   TEMPO_RPC_URL?: string;
+  TEMPO_MAINNET_RPC_URL?: string;
+  TEMPO_TESTNET_RPC_URL?: string;
 }
 
 export interface MeteringEvent {

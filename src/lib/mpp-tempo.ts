@@ -250,6 +250,16 @@ export function parseAndValidateMppCredential(params: {
   };
 }
 
+export function resolveTempoRpcUrl(env: AppBindings, chainId: number): string | null {
+  if (chainId === TEMPO_MAINNET_CHAIN_ID) {
+    return env.TEMPO_MAINNET_RPC_URL?.trim() || env.TEMPO_RPC_URL?.trim() || null;
+  }
+  if (chainId === TEMPO_TESTNET_CHAIN_ID) {
+    return env.TEMPO_TESTNET_RPC_URL?.trim() || env.TEMPO_RPC_URL?.trim() || null;
+  }
+  return env.TEMPO_RPC_URL?.trim() || null;
+}
+
 export async function verifyMppPaymentCredential(params: {
   env: AppBindings;
   credential: ParsedMppCredential;
@@ -268,7 +278,7 @@ export async function verifyMppPaymentCredential(params: {
     }
 > {
   const { env, credential } = params;
-  const rpcUrl = env.TEMPO_RPC_URL?.trim();
+  const rpcUrl = resolveTempoRpcUrl(env, credential.chainId);
   if (!rpcUrl) {
     return {
       ok: false,
