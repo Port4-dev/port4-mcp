@@ -20,7 +20,11 @@ import {
   usdToAtomicUsdc
 } from "../lib/crypto";
 import { verifyCloudflareAccessJwt } from "../lib/cloudflare-access";
-import { fetchFacilitatorVerify, resolveFacilitatorConfig } from "../lib/facilitator";
+import {
+  fetchFacilitatorSettle,
+  fetchFacilitatorVerify,
+  resolveFacilitatorConfig
+} from "../lib/facilitator";
 import {
   TEMPO_MAINNET_CHAIN_ID,
   TEMPO_OUSD_ADDRESS,
@@ -364,13 +368,7 @@ async function verifyAndSettleViaFacilitator(
   // Note: `/settle` is state-mutating and NEVER auto-retried on timeout; timeouts enter `settlement_pending`
   let settleRes: Response;
   try {
-    settleRes = await fetch(`${facConfig.baseUrl}/settle`, {
-      method: "POST",
-      headers: facConfig.headers,
-      body: JSON.stringify(payload),
-      redirect: "error",
-      signal: AbortSignal.timeout(10_000)
-    });
+    settleRes = await fetchFacilitatorSettle(facConfig, payload);
   } catch {
     return {
       success: false,
