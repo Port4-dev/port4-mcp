@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Wallet, X } from "lucide-react";
 import {
   discoverEvmWallets,
@@ -21,6 +21,11 @@ export function WalletConnectButton({
   const [connecting, setConnecting] = useState(false);
   const [picker, setPicker] = useState<DetectedWallet[] | null>(null);
   const [walletError, setWalletError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPicker(null);
+    setWalletError(null);
+  }, [family]);
 
   const connectOne = async (wallet: DetectedWallet) => {
     setConnecting(true);
@@ -85,6 +90,7 @@ export function WalletConnectButton({
             </span>
             <button
               type="button"
+              aria-label="Close wallet picker"
               onClick={() => setPicker(null)}
               className="text-zinc-400 hover:text-zinc-700 cursor-pointer"
             >
@@ -105,7 +111,9 @@ export function WalletConnectButton({
       )}
 
       {walletError && (
-        <span className="text-[10px] font-mono text-rose-600 leading-snug">{walletError}</span>
+        <span role="alert" className="text-[10px] font-mono text-rose-600 leading-snug">
+          {walletError}
+        </span>
       )}
     </div>
   );

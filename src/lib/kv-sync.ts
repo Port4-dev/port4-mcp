@@ -1,17 +1,43 @@
 import type { AppBindings, TenantRecord, TenantRoutingRecord, ToolRecord, UserPlan } from "../types";
+import { encryptSecretAtRest } from "./crypto";
 import { parsePayoutWalletsJson } from "./networks";
 
 const KV_PREFIX = "tenant:";
 
+export type SanitizedTenantRoutingRecord = Omit<
+  TenantRoutingRecord,
+  "upstream_signing_secret" | "upstream_auth_secret"
+> & {
+  has_upstream_auth_secret: boolean;
+};
+
+export function sanitizeTenantRoutingRecord(
+  record: TenantRoutingRecord
+): SanitizedTenantRoutingRecord {
+  const {
+    upstream_signing_secret: _signingSecret,
+    upstream_auth_secret: authSecret,
+    ...rest
+  } = record;
+  return {
+    ...rest,
+    has_upstream_auth_secret: Boolean(authSecret)
+  };
+}
+
 export function tenantKvKey(subdomain: string): string {
-  return `${KV_PREFIX}${subdomain.toLowerCase()}`;
+  return `${KV_PREFIX}${subdomain.trim().toLowerCase()}`;
 }
 
 export async function loadTenantFromD1(
   env: AppBindings,
   subdomain: string
 ): Promise<TenantRoutingRecord | null> {
-  const normalized = subdomain.toLowerCase();
+  const normalized = subdomain.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
   const tenant = await env.DB.prepare(
     `SELECT t.id, t.user_id, t.subdomain, t.name, t.upstream_base_url, t.payout_wallet,
             t.payout_wallets_json, t.network, t.auth_mode, t.is_active, t.status, t.is_featured, t.call_count,
@@ -54,13 +80,24 @@ export async function loadTenantFromD1(
     .all<ToolRecord>();
 
   const ownerPlan = tenant.owner_plan === "pro" ? "pro" : "free";
+  const rawRpm = Number(tenant.rate_limit_rpm);
+  const baseRpm = Number.isFinite(rawRpm) && rawRpm > 0 ? rawRpm : 120;
+  const rawQuota = Number(tenant.daily_quota);
+  const baseQuota = Number.isFinite(rawQuota) && rawQuota > 0 ? rawQuota : 10_000;
+
   // Central entitlement resolution: upgrading a user from Free -> Pro immediately elevates standard tenant limits
-  const effectiveRpm =
-    ownerPlan === "pro" ? Math.max(600, Number(tenant.rate_limit_rpm ?? 600)) : Number(tenant.rate_limit_rpm ?? 120);
-  const effectiveQuota =
-    ownerPlan === "pro"
-      ? Math.max(1_000_000, Number(tenant.daily_quota ?? 1_000_000))
-      : Number(tenant.daily_quota ?? 10_000);
+  const effectiveRpm = ownerPlan === "pro" ? Math.max(600, baseRpm) : baseRpm;
+  const effectiveQuota = ownerPlan === "pro" ? Math.max(1_000_000, baseQuota) : baseQuota;
+
+  let upstreamAuthSecret = tenant.upstream_auth_secret ?? null;
+  if (
+    upstreamAuthSecret &&
+    !upstreamAuthSecret.startsWith("enc:v1:") &&
+    env.JWT_SECRET &&
+    env.JWT_SECRET.length >= 16
+  ) {
+    upstreamAuthSecret = await encryptSecretAtRest(upstreamAuthSecret, env.JWT_SECRET);
+  }
 
   return {
     id: tenant.id,
@@ -91,7 +128,7 @@ export async function loadTenantFromD1(
         ? tenant.upstream_auth_type
         : "none",
     upstream_auth_header: tenant.upstream_auth_header ?? null,
-    upstream_auth_secret: tenant.upstream_auth_secret ?? null,
+    upstream_auth_secret: upstreamAuthSecret,
     rate_limit_rpm: effectiveRpm,
     daily_quota: effectiveQuota,
     mcp_mode:
@@ -111,10 +148,14 @@ export async function syncTenantToKv(
   env: AppBindings,
   subdomain: string
 ): Promise<TenantRoutingRecord | null> {
-  const record = await loadTenantFromD1(env, subdomain);
-  const key = tenantKvKey(subdomain);
+  const normalized = subdomain.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  const record = await loadTenantFromD1(env, normalized);
+  const key = tenantKvKey(normalized);
   if (!record) {
-    await invalidateTenantKv(env, subdomain);
+    await invalidateTenantKv(env, normalized);
     return null;
   }
   await env.TENANT_ROUTING.put(key, JSON.stringify(record), {
@@ -124,7 +165,10 @@ export async function syncTenantToKv(
 }
 
 export async function invalidateTenantKv(env: AppBindings, subdomain: string): Promise<void> {
-  const slug = subdomain.toLowerCase();
+  const slug = subdomain.trim().toLowerCase();
+  if (!slug) {
+    return;
+  }
   await Promise.all([
     env.TENANT_ROUTING.delete(tenantKvKey(slug)),
     env.TENANT_ROUTING.delete(slug)
@@ -132,7 +176,9 @@ export async function invalidateTenantKv(env: AppBindings, subdomain: string): P
 }
 
 export async function syncUserTenantsToKv(env: AppBindings, userId: string): Promise<void> {
-  const res = await env.DB.prepare("SELECT subdomain FROM tenants WHERE user_id = ?")
+  const res = await env.DB.prepare(
+    "SELECT subdomain FROM tenants WHERE user_id = ? AND deleted_at IS NULL AND status != 'archived'"
+  )
     .bind(userId)
     .all<{ subdomain: string }>();
 
@@ -144,12 +190,16 @@ export async function resolveTenant(
   env: AppBindings,
   subdomain: string
 ): Promise<TenantRoutingRecord | null> {
-  const key = tenantKvKey(subdomain);
+  const normalized = subdomain.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  const key = tenantKvKey(normalized);
   const cached = await env.TENANT_ROUTING.get<TenantRoutingRecord>(key, "json");
   if (cached && cached.status === "active") {
     return cached;
   }
-  const fromDb = await loadTenantFromD1(env, subdomain);
+  const fromDb = await loadTenantFromD1(env, normalized);
   if (fromDb) {
     await env.TENANT_ROUTING.put(key, JSON.stringify(fromDb), {
       expirationTtl: 3600

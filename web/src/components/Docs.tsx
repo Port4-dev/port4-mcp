@@ -98,9 +98,11 @@ export function Docs({
       }
     },
     "port4-demo-stdio-bridge": {
-      "command": "node",
+      "command": "npx",
       "args": [
-        "./cli/port4-mcp.mjs",
+        "-y",
+        "port4-mcp",
+        "bridge",
         "--url",
         "https://port4.dev/mcp/demo",
         "--max-per-call-usd",
@@ -131,17 +133,20 @@ export function Docs({
         {/* 3. Call Paid Tool from an Agent */}
         <section className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold text-zinc-900">
-            3. Pay & Call from an AI Agent (Multi-Chain EVM &amp; Solana USDC)
+            3. Pay &amp; Call from an AI Agent (Multi-Chain EVM, Tempo OUSD &amp; Solana USDC)
           </h2>
           <p className="text-sm text-zinc-600">
             Port4 supports x402 v2 multi-rail <code className="font-mono text-xs">accepts[]</code>{" "}
             across <strong>Base, Arbitrum, Optimism, Polygon, Ethereum, Avalanche</strong> (EVM{" "}
-            <code className="font-mono text-xs">0x...</code>) and <strong>Solana</strong> (SVM
-            Base58). Install <code className="font-mono text-xs">@x402/fetch</code> +{" "}
+            <code className="font-mono text-xs">0x...</code> USDC), <strong>Tempo OUSD</strong> (
+            <code className="font-mono text-xs">eip155:4217</code> Mainnet &amp;{" "}
+            <code className="font-mono text-xs">eip155:42431</code> Testnet), and{" "}
+            <strong>Solana</strong> (SVM Base58 SPL USDC). Install{" "}
+            <code className="font-mono text-xs">@x402/fetch</code> +{" "}
             <code className="font-mono text-xs">@x402/evm</code> (or{" "}
             <code className="font-mono text-xs">@x402/svm</code> for Solana) — the wrapper handles
             the <code className="font-mono text-xs">402 Payment Required</code> challenge, signs the
-            USDC authorization, and retries automatically:
+            authorization, and retries automatically:
           </p>
           <CodeBlock
             id="ts-client"
@@ -176,22 +181,35 @@ console.log(await res.json());`}
           />
         </section>
 
-        {/* 4. Code Mode & Cloudflare One Zero Trust */}
+        {/* 4. Code Mode, Visa TAP, Tempo MPP & Cloudflare One Zero Trust */}
         <section className="flex flex-col gap-3">
           <h2 className="text-lg font-semibold text-zinc-900">
-            4. Organize Large APIs with Cloudflare Code Mode, Visa TAP &amp; Tempo OUSD
+            4. Code Mode, Visa TAP, Tempo OUSD MPP &amp; Cloudflare One Zero Trust
           </h2>
           <p className="text-sm text-zinc-600">
             Switch any endpoint in <code className="font-mono text-xs">/dashboard</code> to{" "}
             <strong>Code Mode</strong> (<code className="font-mono text-xs">code</code>) or{" "}
             <strong>OpenAPI Code Mode</strong> (<code className="font-mono text-xs">search</code> +{" "}
             <code className="font-mono text-xs">execute</code>). Enable{" "}
-            <strong>Visa TAP Verified Agent</strong> (<code className="font-mono text-xs">require_visa_tap</code>)
-            to verify RFC 9421 Ed25519 signatures against <code className="font-mono text-xs">auth.visacli.sh</code>.
-            Every endpoint also serves <code className="font-mono text-xs">/mcp/&#123;tenant&#125;/openapi.json</code>{" "}
-            with <code className="font-mono text-xs">x-payment-info</code> and dual{" "}
+            <strong>Visa TAP Verified Agent</strong> (<code className="font-mono text-xs">require_visa_tap</code>
+            {" "}with optional <code className="font-mono text-xs">allow_tap_simulated</code> for sandbox keys)
+            to verify RFC 9421 Ed25519 signatures (<code className="font-mono text-xs">Signature-Input</code>,{" "}
+            <code className="font-mono text-xs">Signature</code>,{" "}
+            <code className="font-mono text-xs">Content-Digest</code>,{" "}
+            <code className="font-mono text-xs">Signature-Agent</code>) against{" "}
+            <code className="font-mono text-xs">auth.visacli.sh</code> and forward{" "}
+            <code className="font-mono text-xs">X-Port4-Tap-Agent</code> upstream. Every endpoint serves{" "}
+            <code className="font-mono text-xs">GET /openapi.json</code> and{" "}
+            <code className="font-mono text-xs">GET /mcp/&#123;tenant&#125;/openapi.json</code> with{" "}
+            <code className="font-mono text-xs">x-payment-info</code>, emitting dual{" "}
             <code className="font-mono text-xs">PAYMENT-REQUIRED</code> (x402 USDC) +{" "}
-            <code className="font-mono text-xs">WWW-Authenticate: Payment</code> (Visa MPP Tempo OUSD) headers.
+            <code className="font-mono text-xs">WWW-Authenticate: Payment</code> (Tempo OUSD MPP) challenges
+            and returning <code className="font-mono text-xs">Payment-Receipt</code> on settlement. For
+            private enterprise APIs, enable <strong>Cloudflare One Access</strong> (
+            <code className="font-mono text-xs">auth_mode: &quot;x402+oauth_v2&quot;</code>) and pass{" "}
+            <code className="font-mono text-xs">Cf-Access-Jwt-Assertion</code> or{" "}
+            <code className="font-mono text-xs">CF-Access-Client-Id</code> /{" "}
+            <code className="font-mono text-xs">CF-Access-Client-Secret</code>.
           </p>
           <CodeBlock
             id="codemode-call"
@@ -237,10 +255,10 @@ console.log(await res.json());`}
           />
         </section>
 
-        {/* 5. Featured Endpoints */}
+        {/* 6. Featured Endpoints */}
         {featured.length > 0 && (
           <section className="flex flex-col gap-3">
-            <h2 className="text-lg font-semibold text-zinc-900">5. Featured Public Endpoints</h2>
+            <h2 className="text-lg font-semibold text-zinc-900">6. Featured Public Endpoints</h2>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {featured.map((item) => (
                 <div key={item.id} className="cf-card rounded-2xl p-4 flex flex-col gap-2.5">

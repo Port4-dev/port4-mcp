@@ -11,6 +11,9 @@
     "directory": "packages/port4-mcp"
   },
   "type": "module",
+  "exports": {
+    ".": "./bin/port4-mcp.mjs"
+  },
   "bin": {
     "port4-mcp": "bin/port4-mcp.mjs",
     "port4": "bin/port4-mcp.mjs"

@@ -8,6 +8,7 @@ import {
   ShieldAlert,
   Terminal
 } from "lucide-react";
+import { isSafeHttpsUrl } from "../lib/wallets";
 
 interface SandboxProps {
   onSettled?: () => void;
@@ -74,6 +75,10 @@ export function Sandbox({ onSettled }: SandboxProps) {
 
   const active = phase === "settled";
   const running = phase === "running";
+  const stage3Sub =
+    data?.network === "eip155:4217" || data?.network === "eip155:42431"
+      ? "Tempo OUSD"
+      : "Base Sepolia";
 
   return (
     <section className="cf-card rounded-2xl p-4 sm:p-6 min-w-0">
@@ -119,12 +124,12 @@ export function Sandbox({ onSettled }: SandboxProps) {
       <div className="grid grid-cols-1 xs:grid-cols-2 sm:grid-cols-2 md:grid-cols-4 gap-2.5 my-4">
         <Stage icon={<Terminal className="w-3.5 h-3.5" />} label="1. POST /mcp" sub={tool} done={running || active} tone="orange" />
         <Stage icon={<ShieldAlert className="w-3.5 h-3.5" />} label="2. 402 Required" sub={data ? data.amountUsd + " USDC" : "PAYMENT-REQUIRED"} done={active} tone="amber" />
-        <Stage icon={<KeyRound className="w-3.5 h-3.5" />} label="3. Sign USDC" sub="Base Sepolia" done={active} tone="orange" />
+        <Stage icon={<KeyRound className="w-3.5 h-3.5" />} label="3. Sign USDC" sub={stage3Sub} done={active} tone="orange" />
         <Stage icon={<CheckCircle2 className="w-3.5 h-3.5" />} label="4. 200 OK" sub={data ? `${data.latencyMs}ms settled` : "PAYMENT-RESPONSE"} done={active} tone="green" />
       </div>
 
       {error && (
-        <div className="mb-4 font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+        <div role="alert" className="mb-4 font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
           {error}
         </div>
       )}
@@ -187,9 +192,9 @@ export function Sandbox({ onSettled }: SandboxProps) {
               {data.txHash.slice(0, 14)}...{data.txHash.slice(-8)}
             </code>
           </div>
-          {data.basescanUrl ? (
+          {isSafeHttpsUrl(data.basescanUrl) ? (
             <a
-              href={data.basescanUrl}
+              href={data.basescanUrl!}
               target="_blank"
               rel="noreferrer"
               className="inline-flex items-center gap-1 text-[#C25906] hover:underline"

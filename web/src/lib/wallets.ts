@@ -46,6 +46,16 @@ export function isValidWalletAddress(networkId: string, address: string): boolea
     : EVM_ADDRESS_RE.test(trimmed);
 }
 
+export function isSafeHttpsUrl(url: string | null | undefined): boolean {
+  if (!url || typeof url !== "string") return false;
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 interface Eip1193Provider {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
   isMetaMask?: boolean;

@@ -1,17 +1,10 @@
 import type { MiddlewareHandler } from "hono";
+import type { RateLimitConsumeInput, RateLimitConsumeResult } from "../durable-objects";
 import type { AppEnv } from "../types";
 import { sha256Hex } from "../lib/crypto";
 
 const WINDOW_SECONDS = 60;
 const DEFAULT_REQUESTS_PER_MINUTE = 120;
-
-interface LimitResponse {
-  allowed: boolean;
-  reason?: "rpm_exceeded" | "daily_quota_exceeded";
-  remaining: number;
-  resetAt: number;
-  sequence: number;
-}
 
 export const edgeRateLimitMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => {
   const tenant = c.get("tenant");
@@ -25,7 +18,9 @@ export const edgeRateLimitMiddleware: MiddlewareHandler<AppEnv> = async (c, next
       : DEFAULT_REQUESTS_PER_MINUTE;
 
   const dailyQuota =
-    tenant.daily_quota && tenant.daily_quota > 0
+    typeof tenant.daily_quota === "number" &&
+    Number.isInteger(tenant.daily_quota) &&
+    tenant.daily_quota > 0
       ? tenant.daily_quota
       : tenant.owner_plan === "pro"
         ? 1_000_000
@@ -35,15 +30,27 @@ export const edgeRateLimitMiddleware: MiddlewareHandler<AppEnv> = async (c, next
   const key = await sha256Hex(`${tenant.id}:${source}`);
   const stub = c.env.EDGE_RATE_LIMITER.get(c.env.EDGE_RATE_LIMITER.idFromName(key));
 
-  let result: LimitResponse;
+  let result: RateLimitConsumeResult;
   try {
-    const response = await stub.fetch("https://rate-limit/consume", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ limit, windowSeconds: WINDOW_SECONDS, dailyQuota })
-    });
-    if (!response.ok) throw new Error("rate_limiter_rejected_request");
-    result = (await response.json()) as LimitResponse;
+    const consumeInput: RateLimitConsumeInput = {
+      limit,
+      windowSeconds: WINDOW_SECONDS,
+      dailyQuota
+    };
+    const rpcStub = stub as unknown as {
+      consume?: (input: RateLimitConsumeInput) => Promise<RateLimitConsumeResult>;
+    };
+    if (typeof rpcStub.consume === "function") {
+      result = await rpcStub.consume(consumeInput);
+    } else {
+      const response = await stub.fetch("https://rate-limit/consume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(consumeInput)
+      });
+      if (!response.ok) throw new Error("rate_limiter_rejected_request");
+      result = (await response.json()) as RateLimitConsumeResult;
+    }
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -72,6 +79,7 @@ export const edgeRateLimitMiddleware: MiddlewareHandler<AppEnv> = async (c, next
     );
   }
 
+  // Per-IP rate-limit counter; tenant-wide fee split uses EdgeRateLimiter.nextFeeSequence (`paidFeeSequence`)
   c.set("rateLimitSequence", result.sequence);
   await next();
 };

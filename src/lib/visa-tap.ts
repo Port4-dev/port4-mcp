@@ -1,7 +1,7 @@
 /**
  * Visa Trusted Agent Protocol (TAP RFC 9421) Verifier for Cloudflare Workers (100% Web Crypto API)
  * Built on Visa CLI's reference verifier specification (`https://app.visacli.sh/docs/verifier-code.md`):
- * - Verifies `sig2` (and `sig1`) Ed25519 / ECDSA P-256 RFC 9421 HTTP Message Signatures via Web Crypto.
+ * - Verifies `sig2` (and `sig1`) Ed25519 RFC 9421 HTTP Message Signatures via Web Crypto.
  * - Supports both `tag="agent-browser-auth"` (60s identity requests) and `tag="agent-payer-auth"` (300s/480s paid requests).
  * - Resolves agent public keys from `https://auth.visacli.sh/v1/tap/registry/keys/{keyid}`.
  * - Computes and verifies RFC 7638 JWK SHA-256 thumbprints (`jkt`) locally.
@@ -162,7 +162,7 @@ export function refusal(
 const HOST_RE =
   /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*|\[[0-9a-f:]+\])(?::[1-9][0-9]{0,4})?$/;
 const INPUT_RE =
-  /^(sig2|sig1)=\(([^)]+)\);created=(\d+);expires=(\d+);keyid="([A-Za-z0-9_-]{43}|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})";alg="(ed25519|Ed25519|ecdsa-p256-sha256)";nonce="([A-Za-z0-9+/]{43}=)";tag="(agent-browser-auth|agent-payer-auth)"$/;
+  /^(sig2|sig1)=\(([^)]+)\);created=(\d+);expires=(\d+);keyid="([A-Za-z0-9_-]{43}|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})";alg="(ed25519|Ed25519)";nonce="([A-Za-z0-9+/]{43}=)";tag="(agent-browser-auth|agent-payer-auth)"$/;
 const SIGNATURE_RE =
   /^(sig2|sig1)=:((?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?|[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=):$/;
 const CORE_IDENTITY = ["@method", "@scheme", "@authority", "@path", "@query", "content-digest"];
@@ -283,6 +283,15 @@ const NEVER_SIGNED_IDENTITY = new Set([
 const NEVER_SIGNED_PREFIX =
   /^(?:proxy-|sec-|x-forwarded-|x-visa(?:$|-)|x-stamp(?:$|-)|x-payment(?:$|-))/;
 
+const UNPAID_CREDENTIAL_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "payment",
+  "payment-signature",
+  "x-payment"
+]);
+
 function originIsNormal(publicOrigin: string): boolean {
   try {
     return (
@@ -339,15 +348,14 @@ export function expirySeconds(value: unknown): number | null {
 }
 
 function normalTarget(publicOrigin: string, target: string): URL | null {
-  if (
-    typeof target !== "string" ||
-    !target.startsWith("/") ||
-    target.startsWith("//") ||
-    target.split("?")[0].includes("^")
-  ) {
+  if (typeof target !== "string" || !target.startsWith("/")) {
     return null;
   }
-  if (target.split("?")[0].split("/").some((segment) => segment === "." || segment === "..")) {
+  const pathOnly = target.split("?")[0];
+  if (pathOnly.includes("//") || pathOnly.includes("\\") || pathOnly.includes("^")) {
+    return null;
+  }
+  if (pathOnly.split("/").some((segment) => segment === "." || segment === "..")) {
     return null;
   }
   let url: URL;
@@ -545,6 +553,7 @@ export function judgeKey(
   return null;
 }
 
+const MAX_REGISTRY_CACHE = 500;
 const registryKeyCache = new Map<string, { answer: ParsedListing; until: number }>();
 
 export function createTapVerifier(options: {
@@ -573,8 +582,16 @@ export function createTapVerifier(options: {
 
   async function lookup(keyId: string, { fresh = false } = {}): Promise<ParsedListing> {
     const cacheKey = `${registryOrigin}:${keyId}`;
+    const currentNow = now();
     const hit = registryKeyCache.get(cacheKey);
-    if (!fresh && hit && hit.until > now()) return hit.answer;
+    if (!fresh && hit) {
+      if (hit.until > currentNow) {
+        registryKeyCache.delete(cacheKey);
+        registryKeyCache.set(cacheKey, hit);
+        return hit.answer;
+      }
+      registryKeyCache.delete(cacheKey);
+    }
 
     const url = `${registryOrigin}/v1/tap/registry/keys/${encodeURIComponent(keyId)}`;
     const answer = await readRegistry(url, (doc) => readListing(keyId, doc), fetchImpl);
@@ -582,7 +599,20 @@ export function createTapVerifier(options: {
     if (answer.unavailable || answer.invalid) return answer;
     registryKeyCache.delete(cacheKey);
     if (answer.listed && answer.agent?.isActive && answer.key) {
-      registryKeyCache.set(cacheKey, { answer, until: now() + cacheSeconds });
+      const storeNow = now();
+      if (registryKeyCache.size >= MAX_REGISTRY_CACHE) {
+        for (const [k, entry] of registryKeyCache) {
+          if (entry.until <= storeNow) {
+            registryKeyCache.delete(k);
+          }
+        }
+        while (registryKeyCache.size >= MAX_REGISTRY_CACHE) {
+          const oldestKey = registryKeyCache.keys().next().value;
+          if (!oldestKey) break;
+          registryKeyCache.delete(oldestKey);
+        }
+      }
+      registryKeyCache.set(cacheKey, { answer, until: storeNow + cacheSeconds });
     }
     return answer;
   }
@@ -616,8 +646,11 @@ export function createTapVerifier(options: {
 
       const created = Number(parsed[3]);
       const expires = Number(parsed[4]);
+      if (!Number.isSafeInteger(created) || !Number.isSafeInteger(expires)) {
+        return refusal("signature_input_format");
+      }
       const keyId = parsed[5];
-      const alg = parsed[6] === "ecdsa-p256-sha256" ? "ecdsa-p256-sha256" : "ed25519";
+      const alg = "ed25519";
       const nonce = parsed[7];
       const tag = parsed[8] as "agent-browser-auth" | "agent-payer-auth";
 
@@ -673,6 +706,14 @@ export function createTapVerifier(options: {
         size += name.length + value.length;
       }
       if (size > 16384) return refusal("signed_header_invalid");
+
+      if (tag === "agent-browser-auth") {
+        for (const name of Object.keys(headers)) {
+          if (UNPAID_CREDENTIAL_HEADERS.has(name) || name.startsWith("x-payment-")) {
+            return refusal("credential_header_present", null, name);
+          }
+        }
+      }
 
       for (const name of Object.keys(headers)) {
         const transport = transportHeaders.has(name) || name.startsWith("sec-fetch-");

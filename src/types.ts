@@ -18,6 +18,7 @@ export interface AppBindings extends CloudflareBindings {
   GATEWAY_ANALYTICS?: AnalyticsEngineDataset;
   LEDGER_ARCHIVE?: R2Bucket;
   MCP_RATE_LIMIT_PER_MINUTE?: string;
+  TEMPO_RPC_URL?: string;
 }
 
 export interface MeteringEvent {
@@ -33,6 +34,7 @@ export interface MeteringEvent {
   latencyMs: number;
   status: "settled" | "sandbox_settled";
   isPlatformFee: boolean;
+  tapAgentId?: string | null;
   occurredAt: string;
 }
 
@@ -147,6 +149,7 @@ export interface TransactionRecord {
   status: "settled" | "sandbox_settled" | "failed";
   latency_ms: number;
   is_platform_fee: number;
+  tap_agent_id?: string | null;
   created_at: string;
 }
 
@@ -182,6 +185,7 @@ export interface X402PaymentRequirement {
     tenant: string;
     tool: string;
     priceUsd: string;
+    paymentFlow?: string;
     isPlatformFee?: boolean;
   };
 }
@@ -248,6 +252,8 @@ export interface AppVariables {
   paymentFingerprint?: string;
   paymentLeaseToken?: string;
   paymentContext?: PaymentExecutionContext;
+  mppReceiptHeader?: string;
+  paidFeeSequence?: number;
   rateLimitSequence?: number;
   requestStartedAt?: number;
   rawBodyText?: string;

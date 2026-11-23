@@ -28,38 +28,45 @@ app.use(
   })
 );
 
+const MCP_CORS_ALLOW_HEADERS = [
+  "Content-Type",
+  "Authorization",
+  "Cf-Access-Jwt-Assertion",
+  "CF-Access-Client-Id",
+  "CF-Access-Client-Secret",
+  "MCP-Protocol-Version",
+  "Mcp-Method",
+  "Mcp-Name",
+  "Mcp-Session-Id",
+  "PAYMENT-SIGNATURE",
+  "Signature",
+  "Signature-Input",
+  "Content-Digest",
+  "Signature-Agent",
+  "Idempotency-Key",
+  "X-Port4-Tenant"
+];
+
+const MCP_CORS_EXPOSE_HEADERS = [
+  "PAYMENT-REQUIRED",
+  "PAYMENT-RESPONSE",
+  "WWW-Authenticate",
+  "Payment-Receipt",
+  "X-Port4-Tenant",
+  "X-Port4-Mcp-Mode",
+  "X-Port4-Tap-Agent",
+  "X-Port4-Settlement-Tx",
+  "X-Port4-Idempotent-Replay",
+  "Retry-After",
+  "MCP-Protocol-Version"
+];
+
 app.use(
   "/mcp*",
   cors({
     origin: "*",
-    allowHeaders: [
-      "Content-Type",
-      "Authorization",
-      "Cf-Access-Jwt-Assertion",
-      "CF-Access-Client-Id",
-      "CF-Access-Client-Secret",
-      "MCP-Protocol-Version",
-      "Mcp-Method",
-      "Mcp-Name",
-      "PAYMENT-SIGNATURE",
-      "Signature",
-      "Signature-Input",
-      "Content-Digest",
-      "Signature-Agent",
-      "Idempotency-Key",
-      "X-Port4-Tenant"
-    ],
-    exposeHeaders: [
-      "PAYMENT-REQUIRED",
-      "PAYMENT-RESPONSE",
-      "WWW-Authenticate",
-      "Payment-Receipt",
-      "X-Port4-Tenant",
-      "X-Port4-Mcp-Mode",
-      "X-Port4-Tap-Agent",
-      "X-Port4-Settlement-Tx",
-      "MCP-Protocol-Version"
-    ],
+    allowHeaders: MCP_CORS_ALLOW_HEADERS,
+    exposeHeaders: MCP_CORS_EXPOSE_HEADERS,
     allowMethods: ["GET", "POST", "OPTIONS"],
     credentials: false
   })
@@ -69,20 +76,8 @@ app.use(
   "/sandbox/*",
   cors({
     origin: "*",
-    allowHeaders: [
-      "Content-Type",
-      "MCP-Protocol-Version",
-      "Mcp-Method",
-      "Mcp-Name",
-      "PAYMENT-SIGNATURE"
-    ],
-    exposeHeaders: [
-      "PAYMENT-REQUIRED",
-      "PAYMENT-RESPONSE",
-      "X-Port4-Tenant",
-      "X-Port4-Settlement-Tx",
-      "MCP-Protocol-Version"
-    ],
+    allowHeaders: MCP_CORS_ALLOW_HEADERS,
+    exposeHeaders: MCP_CORS_EXPOSE_HEADERS,
     allowMethods: ["GET", "POST", "OPTIONS"],
     credentials: false
   })
@@ -120,9 +115,14 @@ function extractTenantSubdomain(c: Context<AppEnv>): string | null {
 const resolveTenantMiddleware = (forcedSubdomain?: string): MiddlewareHandler<AppEnv> => {
   return async (c, next) => {
     const cfIp = c.req.header("CF-Connecting-IP");
-    const isLocalDev = !cfIp || cfIp === "127.0.0.1" || cfIp === "::1";
-    const explicitHeader = isLocalDev ? c.req.header("X-Port4-Tenant")?.trim().toLowerCase() : null;
-    const subdomain = forcedSubdomain ?? explicitHeader ?? extractTenantSubdomain(c) ?? (isLocalDev ? "demo" : null);
+    const isLocalDev =
+      !cfIp || cfIp === "127.0.0.1" || cfIp === "::1" || cfIp === "::ffff:127.0.0.1";
+    const rawExplicit = isLocalDev
+      ? c.req.header("X-Port4-Tenant")?.trim().toLowerCase()
+      : undefined;
+    const explicitHeader = rawExplicit && rawExplicit.length > 0 ? rawExplicit : null;
+    const subdomain =
+      forcedSubdomain ?? explicitHeader ?? extractTenantSubdomain(c) ?? (isLocalDev ? "demo" : null);
     if (!subdomain) {
       return c.json(
         {
@@ -172,14 +172,31 @@ const healthHandler = (c: Context<AppEnv>) =>
 app.get("/health", healthHandler);
 app.get("/api/health", healthHandler);
 
+function resolvePublicOrigin(c: Context<AppEnv>): string {
+  try {
+    const reqUrl = new URL(c.req.url);
+    const hostname = reqUrl.hostname.toLowerCase();
+    if (hostname === "port4.dev" || hostname.endsWith(".port4.dev")) {
+      return `https://${hostname}`;
+    }
+    if (
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]"
+    ) {
+      return reqUrl.origin;
+    }
+  } catch {
+    // Fallback to APP_URL below
+  }
+  return (c.env.APP_URL || "https://port4.dev").replace(/\/$/, "");
+}
+
 // Auto-generated OpenAPI 3.1.0 with Visa CLI `x-payment-info` (for `discover` on Tempo OUSD)
 app.get("/openapi.json", resolveTenantMiddleware(), (c) => {
   const tenant = c.get("tenant")!;
-  const reqUrl = new URL(c.req.url);
-  const publicOrigin =
-    reqUrl.hostname.endsWith(".port4.dev") || reqUrl.hostname === "port4.dev"
-      ? `https://${reqUrl.hostname}`
-      : c.env.APP_URL.replace(/\/$/, "");
+  const publicOrigin = resolvePublicOrigin(c);
   c.header("Cache-Control", "public, max-age=300");
   return c.json(buildTenantOpenApiDocument(tenant, publicOrigin));
 });
@@ -188,9 +205,15 @@ app.get("/mcp/:tenant/openapi.json", async (c) => {
   const slug = c.req.param("tenant").trim().toLowerCase();
   const tenant = await resolveTenant(c.env, slug);
   if (!tenant) {
-    return c.json({ error: "tenant_not_found_or_suspended" }, 404);
+    return c.json(
+      {
+        error: "tenant_not_found_or_suspended",
+        message: `No active Port4 gateway found for '${slug}'.`
+      },
+      404
+    );
   }
-  const publicOrigin = c.env.APP_URL.replace(/\/$/, "");
+  const publicOrigin = resolvePublicOrigin(c);
   c.header("Cache-Control", "public, max-age=300");
   return c.json(buildTenantOpenApiDocument(tenant, publicOrigin));
 });
@@ -229,15 +252,20 @@ app.post(
   handleMcpRequest
 );
 
-app.get("/mcp", (c) =>
-  c.json(
+const mcpMethodNotAllowed = (c: Context<AppEnv>) => {
+  c.header("Allow", "POST, OPTIONS");
+  return c.json(
     {
       error: "method_not_allowed",
       message: "Stateless MCP 2026-07-28 uses HTTP POST with JSON-RPC 2.0."
     },
     405
-  )
-);
+  );
+};
+
+app.get("/mcp", mcpMethodNotAllowed);
+app.get("/mcp/:tenant", mcpMethodNotAllowed);
+app.get("/sandbox/mcp", mcpMethodNotAllowed);
 
 // Sandbox Data Plane alias
 app.post(
@@ -287,13 +315,18 @@ app.all("*", async (c) => {
 });
 
 app.onError((err, c) => {
+  const errorName = err instanceof Error ? err.name : "Error";
   const message = err instanceof Error ? err.message : "Unknown error";
   console.error(
     JSON.stringify({
+      level: "error",
       event: "unhandled_worker_error",
-      path: new URL(c.req.url).pathname,
+      error: errorName,
+      errorName,
       method: c.req.method,
-      error: message
+      path: c.req.path,
+      tenant: c.get("tenantSubdomain") ?? null,
+      message
     })
   );
   return c.json({ error: "internal_server_error" }, 500);

@@ -12,6 +12,7 @@ import {
   Star,
   Users
 } from "lucide-react";
+import { isSafeHttpsUrl } from "../lib/wallets";
 
 interface AdminUserProp {
   id: string;
@@ -65,7 +66,28 @@ interface AdminTx {
   tx_hash: string;
   basescan_url: string | null;
   explorer_url?: string | null;
+  tap_agent_id?: string | null;
   created_at: string;
+}
+
+interface AdminRegisteredUser {
+  id: string;
+  github_id: string;
+  login: string;
+  email: string | null;
+  is_admin: number;
+  plan: "free" | "pro";
+  tenant_count: number;
+  created_at: string;
+}
+
+interface AdminTrafficHour {
+  hour_utc: string;
+  total_calls: number;
+  verified_calls: number;
+  sandbox_calls: number;
+  volume_usd: string;
+  avg_latency_ms: number;
 }
 
 export function AdminDashboard({
@@ -77,71 +99,118 @@ export function AdminDashboard({
 }: AdminDashboardProps) {
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [tenants, setTenants] = useState<AdminTenant[]>([]);
+  const [users, setUsers] = useState<AdminRegisteredUser[]>([]);
+  const [trafficHours, setTrafficHours] = useState<AdminTrafficHour[]>([]);
   const [transactions, setTransactions] = useState<AdminTx[]>([]);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"" | "active" | "suspended">("");
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const isAdmin = Boolean(authenticated && user && user.is_admin === 1);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 250);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   const loadAll = useCallback(async () => {
     if (!isAdmin) return;
     setLoading(true);
+    setError(null);
     try {
       const params = new URLSearchParams();
-      if (search.trim()) params.set("q", search.trim());
+      if (debouncedSearch.trim()) params.set("q", debouncedSearch.trim());
       if (statusFilter) params.set("status", statusFilter);
 
-      const [sRes, tRes, txRes] = await Promise.all([
+      const [sRes, tRes, uRes, trRes, txRes] = await Promise.all([
         fetch("/api/admin/stats"),
         fetch(`/api/admin/tenants?${params.toString()}`),
+        fetch("/api/admin/users"),
+        fetch("/api/admin/traffic"),
         fetch("/api/admin/transactions?limit=100")
       ]);
 
-      if (sRes.ok) setStats((await sRes.json()) as AdminStats);
-      if (tRes.ok) {
-        const tJson = (await tRes.json()) as { tenants: AdminTenant[] };
-        setTenants(tJson.tenants);
+      if (!sRes.ok || !tRes.ok || !uRes.ok || !trRes.ok || !txRes.ok) {
+        const failed = [sRes, tRes, uRes, trRes, txRes].find((r) => !r.ok);
+        const errBody = failed ? ((await failed.json().catch(() => ({}))) as { message?: string; error?: string }) : {};
+        throw new Error(errBody.message || errBody.error || `Admin sync failed (${failed?.status ?? 500})`);
       }
-      if (txRes.ok) {
-        const txJson = (await txRes.json()) as { transactions: AdminTx[] };
-        setTransactions(txJson.transactions);
-      }
+
+      setStats((await sRes.json()) as AdminStats);
+      const tJson = (await tRes.json()) as { tenants: AdminTenant[] };
+      setTenants(tJson.tenants);
+      const uJson = (await uRes.json()) as { users: AdminRegisteredUser[] };
+      setUsers(uJson.users);
+      const trJson = (await trRes.json()) as { hours: AdminTrafficHour[] };
+      setTrafficHours(trJson.hours);
+      const txJson = (await txRes.json()) as { transactions: AdminTx[] };
+      setTransactions(txJson.transactions);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load admin telemetry.");
     } finally {
       setLoading(false);
     }
-  }, [isAdmin, search, statusFilter]);
+  }, [isAdmin, debouncedSearch, statusFilter]);
 
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
 
   const toggleStatus = async (slug: string, current: "active" | "suspended") => {
-    const next = current === "active" ? "suspended" : "active";
-    await fetch(`/api/admin/tenants/${slug}/status`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: next })
-    });
-    await loadAll();
+    setError(null);
+    try {
+      const next = current === "active" ? "suspended" : "active";
+      const res = await fetch(`/api/admin/tenants/${slug}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: next })
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        throw new Error(err.message || err.error || `Failed to update status (${res.status})`);
+      }
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update tenant status.");
+    }
   };
 
   const toggleFeatured = async (slug: string, current: number) => {
-    await fetch(`/api/admin/tenants/${slug}/featured`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ is_featured: current === 1 ? 0 : 1 })
-    });
-    await loadAll();
+    setError(null);
+    try {
+      const res = await fetch(`/api/admin/tenants/${slug}/featured`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_featured: current === 1 ? 0 : 1 })
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        throw new Error(err.message || err.error || `Failed to update featured flag (${res.status})`);
+      }
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update featured status.");
+    }
   };
 
   const updateUserPlan = async (userId: string, plan: "free" | "pro") => {
-    await fetch(`/api/admin/users/${userId}/plan`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plan })
-    });
-    await loadAll();
+    setError(null);
+    try {
+      const res = await fetch(`/api/admin/users/${userId}/plan`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan })
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        throw new Error(err.message || err.error || `Failed to update user plan (${res.status})`);
+      }
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update developer plan.");
+    }
   };
 
   if (!authLoaded) {
@@ -257,6 +326,15 @@ export function AdminDashboard({
         </div>
       </div>
 
+      {error && (
+        <div
+          role="alert"
+          className="font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-4 py-2.5"
+        >
+          {error}
+        </div>
+      )}
+
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
         <Kpi icon={<Users className="w-4 h-4 text-[#F6821F]" />} label="Developers" value={String(stats?.total_users ?? 0)} />
         <Kpi icon={<Activity className="w-4 h-4 text-[#F6821F]" />} label="Endpoints" value={`${stats?.active_tenants ?? 0}/${stats?.total_tenants ?? 0}`} />
@@ -357,6 +435,109 @@ export function AdminDashboard({
         </div>
       </section>
 
+      <section className="cf-card rounded-2xl overflow-hidden min-w-0">
+        <div className="p-4 border-b border-zinc-200 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-900">Registered Developers</h2>
+          <span className="font-mono text-[11px] text-zinc-500">{users.length} signups</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse font-mono text-xs whitespace-nowrap">
+            <thead>
+              <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] uppercase text-zinc-500">
+                <th className="py-2.5 px-4">GitHub</th>
+                <th className="py-2.5 px-4">Role</th>
+                <th className="py-2.5 px-4">Plan / Fee</th>
+                <th className="py-2.5 px-4">Endpoints</th>
+                <th className="py-2.5 px-4">Signed Up (UTC)</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-200">
+              {users.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="py-6 px-4 text-center text-zinc-400">
+                    No registered developers yet.
+                  </td>
+                </tr>
+              ) : (
+                users.map((u) => (
+                  <tr key={u.id} className="hover:bg-orange-50/40">
+                    <td className="py-2.5 px-4">
+                      <span className="text-zinc-900 font-medium">@{u.login}</span>
+                      {u.email && <span className="text-zinc-400 ml-2 text-[11px]">{u.email}</span>}
+                    </td>
+                    <td className="py-2.5 px-4">
+                      {u.is_admin === 1 ? (
+                        <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px]">
+                          Super-Admin
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded bg-zinc-100 text-zinc-700 border border-zinc-200 text-[10px]">
+                          Developer
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-4">
+                      <select
+                        aria-label={`Developer plan for ${u.login}`}
+                        value={u.plan}
+                        onChange={(e) => updateUserPlan(u.id, e.target.value as "free" | "pro")}
+                        className="bg-white border border-zinc-300 rounded px-2 py-1 text-[11px] text-zinc-800"
+                      >
+                        <option value="free">free (3%)</option>
+                        <option value="pro">pro (1%)</option>
+                      </select>
+                    </td>
+                    <td className="py-2.5 px-4 text-zinc-700">{u.tenant_count}</td>
+                    <td className="py-2.5 px-4 text-zinc-500">{u.created_at}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="cf-card rounded-2xl overflow-hidden min-w-0">
+        <div className="p-4 border-b border-zinc-200 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-900">Hourly Gateway Traffic (Last 48h UTC)</h2>
+          <span className="font-mono text-[11px] text-zinc-500">{trafficHours.length} active hours</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse font-mono text-xs whitespace-nowrap">
+            <thead>
+              <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] uppercase text-zinc-500">
+                <th className="py-2.5 px-4">Hour (UTC)</th>
+                <th className="py-2.5 px-4">Total Calls</th>
+                <th className="py-2.5 px-4">Verified</th>
+                <th className="py-2.5 px-4">Sandbox</th>
+                <th className="py-2.5 px-4">Volume</th>
+                <th className="py-2.5 px-4">Avg Latency</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-200">
+              {trafficHours.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-6 px-4 text-center text-zinc-400">
+                    No settled traffic recorded yet.
+                  </td>
+                </tr>
+              ) : (
+                trafficHours.map((h) => (
+                  <tr key={h.hour_utc} className="hover:bg-orange-50/40">
+                    <td className="py-2.5 px-4 text-zinc-700">{h.hour_utc}</td>
+                    <td className="py-2.5 px-4 text-zinc-900 font-semibold">{h.total_calls}</td>
+                    <td className="py-2.5 px-4 text-emerald-700">{h.verified_calls}</td>
+                    <td className="py-2.5 px-4 text-zinc-500">{h.sandbox_calls}</td>
+                    <td className="py-2.5 px-4 text-[#C25906] font-medium">${h.volume_usd}</td>
+                    <td className="py-2.5 px-4 text-zinc-500">{h.avg_latency_ms}ms</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <section className="cf-card rounded-2xl overflow-hidden">
         <div className="p-4 border-b border-zinc-200 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-zinc-900">Global Audit Ledger (Latest 100)</h2>
@@ -375,13 +556,23 @@ export function AdminDashboard({
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-200">
-              {transactions.map((tx) => (
+              {transactions.map((tx) => {
+                const explorerUrl = tx.explorer_url ?? tx.basescan_url;
+                return (
                 <tr key={tx.id} className="hover:bg-orange-50/40">
                   <td className="py-2.5 px-4 text-zinc-500">{tx.created_at}</td>
                   <td className="py-2.5 px-4">
                     <span className="text-[#C25906]">{tx.slug}</span>
                     <span className="text-zinc-400">/</span>
                     <span className="text-zinc-900">{tx.tool_name}</span>
+                    {tx.tap_agent_id && (
+                      <span
+                        title={`Visa TAP Agent: ${tx.tap_agent_id}`}
+                        className="ml-2 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px]"
+                      >
+                        TAP
+                      </span>
+                    )}
                   </td>
                   <td className="py-2.5 px-4 text-emerald-700 font-medium">${tx.amount_usd}</td>
                   <td className="py-2.5 px-4">
@@ -395,9 +586,9 @@ export function AdminDashboard({
                   </td>
                   <td className="py-2.5 px-4 text-zinc-500">{tx.latency_ms}ms</td>
                   <td className="py-2.5 px-4">
-                    {tx.basescan_url ? (
+                    {tx.status !== "sandbox_settled" && isSafeHttpsUrl(explorerUrl) ? (
                       <a
-                        href={tx.basescan_url}
+                        href={explorerUrl!}
                         target="_blank"
                         rel="noreferrer"
                         className="inline-flex items-center gap-1 text-[#C25906] hover:underline"
@@ -412,7 +603,8 @@ export function AdminDashboard({
                     )}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

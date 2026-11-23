@@ -2,9 +2,11 @@ import type { AppBindings, MeteringEvent } from "../types";
 
 export function writeGatewayAnalytics(env: AppBindings, event: MeteringEvent): void {
   if (!env.GATEWAY_ANALYTICS) return;
+  const amountUsd = Number.isFinite(Number(event.amountUsd)) ? Number(event.amountUsd) : 0;
+  const latencyMs = Number.isFinite(event.latencyMs) ? event.latencyMs : 0;
   env.GATEWAY_ANALYTICS.writeDataPoint({
     indexes: [event.tenantId, event.toolName],
-    doubles: [Number(event.amountUsd), event.latencyMs, event.status === "sandbox_settled" ? 1 : 0],
+    doubles: [amountUsd, latencyMs, event.status === "sandbox_settled" ? 1 : 0],
     blobs: [event.tenantSubdomain, event.network, event.status]
   });
 }
@@ -32,12 +34,22 @@ export async function consumeMeteringEvents(
     if (
       !event ||
       typeof event.id !== "string" ||
+      event.id.trim().length === 0 ||
       typeof event.tenantId !== "string" ||
+      event.tenantId.trim().length === 0 ||
       typeof event.toolName !== "string" ||
+      event.toolName.trim().length === 0 ||
       typeof event.network !== "string" ||
+      event.network.trim().length === 0 ||
+      typeof event.payerWallet !== "string" ||
+      event.payerWallet.trim().length === 0 ||
+      typeof event.txHash !== "string" ||
+      event.txHash.trim().length === 0 ||
+      (event.status !== "settled" && event.status !== "sandbox_settled") ||
       typeof event.amountAtomic !== "string" ||
       !/^\d+$/.test(event.amountAtomic) ||
       typeof event.occurredAt !== "string" ||
+      !Number.isFinite(Date.parse(event.occurredAt)) ||
       typeof event.latencyMs !== "number" ||
       !Number.isFinite(event.latencyMs) ||
       !Number.isFinite(Number(event.amountUsd))
@@ -69,7 +81,15 @@ export async function consumeMeteringEvents(
       }
     }
 
-    const freshEvents = candidates.filter((e) => !alreadyProcessed.has(e.id));
+    const seenInBatch = new Set<string>();
+    const freshEvents: MeteringEvent[] = [];
+    for (const ev of candidates) {
+      if (alreadyProcessed.has(ev.id) || seenInBatch.has(ev.id)) {
+        continue;
+      }
+      seenInBatch.add(ev.id);
+      freshEvents.push(ev);
+    }
     if (freshEvents.length === 0) {
       for (const message of batch.messages) message.ack();
       return;
@@ -150,8 +170,8 @@ export async function consumeMeteringEvents(
       ...freshEvents.map((ev) =>
         env.DB.prepare(
           `INSERT OR IGNORE INTO transactions
-           (id, tenant_id, tool_name, payer_wallet, amount_atomic, amount_usd, network, tx_hash, status, latency_ms, is_platform_fee, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           (id, tenant_id, tool_name, payer_wallet, amount_atomic, amount_usd, network, tx_hash, status, latency_ms, is_platform_fee, tap_agent_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           ev.id,
           ev.tenantId,
@@ -164,6 +184,9 @@ export async function consumeMeteringEvents(
           ev.status,
           Math.max(1, Math.floor(ev.latencyMs)),
           ev.isPlatformFee ? 1 : 0,
+          typeof ev.tapAgentId === "string" && ev.tapAgentId.trim().length > 0
+            ? ev.tapAgentId.trim()
+            : null,
           ev.occurredAt
         )
       ),

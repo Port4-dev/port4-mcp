@@ -14,7 +14,7 @@ adminRoutes.use("*", requireAdmin);
  */
 adminRoutes.get("/stats", async (c) => {
   const [usersRow, tenantsRow, txRow] = await Promise.all([
-    c.env.DB.prepare("SELECT COUNT(*) AS total_users FROM users").first<{ total_users: number }>(),
+    c.env.DB.prepare("SELECT COUNT(*) AS total_users FROM users WHERE id != 'usr_port4_sandbox'").first<{ total_users: number }>(),
     c.env.DB.prepare(
       `SELECT COUNT(*) AS total_tenants,
               SUM(CASE WHEN status = 'active' AND deleted_at IS NULL THEN 1 ELSE 0 END) AS active_tenants,
@@ -67,6 +67,8 @@ adminRoutes.get("/stats", async (c) => {
     platform_fee_calls: txRow?.platform_fee_calls ?? 0,
     capabilities: {
       codemodeLoader: Boolean(c.env.LOADER),
+      visaTap: true,
+      tempoMpp: Boolean(c.env.TEMPO_RPC_URL),
       r2Archive: Boolean(c.env.LEDGER_ARCHIVE),
       analyticsEngine: Boolean(c.env.GATEWAY_ANALYTICS),
       mainnetFacilitatorConfigured: Boolean(c.env.X402_MAINNET_FACILITATOR_URL)
@@ -202,11 +204,16 @@ adminRoutes.patch("/tenants/:slug/featured", async (c) => {
     return c.json({ error: "tenant_not_found" }, 404);
   }
 
-  await c.env.DB.prepare(
-    "UPDATE tenants SET is_featured = ?, updated_at = datetime('now') WHERE id = ?"
-  )
-    .bind(featured, existing.id)
-    .run();
+  const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "UPDATE tenants SET is_featured = ?, updated_at = datetime('now') WHERE id = ?"
+    ).bind(featured, existing.id),
+    c.env.DB.prepare(
+      `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+       VALUES (?, ?, 'admin.tenant_featured', 'tenant', ?, ?)`
+    ).bind(auditId, c.get("user")?.id ?? null, existing.id, JSON.stringify({ slug, is_featured: featured }))
+  ]);
 
   await syncTenantToKv(c.env, slug);
 
@@ -214,7 +221,7 @@ adminRoutes.patch("/tenants/:slug/featured", async (c) => {
 });
 
 /**
- * 4. User Plan & Fee-Tier Management
+ * 4. User Plan & Fee-Tier Management (excludes seeded sandbox account)
  */
 adminRoutes.get("/users", async (c) => {
   const res = await c.env.DB.prepare(
@@ -222,11 +229,48 @@ adminRoutes.get("/users", async (c) => {
             COUNT(t.id) AS tenant_count
      FROM users u
      LEFT JOIN tenants t ON t.user_id = u.id AND t.deleted_at IS NULL
+     WHERE u.id != 'usr_port4_sandbox'
      GROUP BY u.id
      ORDER BY u.created_at DESC`
   ).all();
 
   return c.json({ users: res.results ?? [] });
+});
+
+/**
+ * 4b. Hourly Platform Traffic & Volume Breakdown (UTC)
+ */
+adminRoutes.get("/traffic", async (c) => {
+  const res = await c.env.DB.prepare(
+    `SELECT strftime('%Y-%m-%d %H:00', created_at) AS hour_utc,
+            COUNT(*) AS total_calls,
+            SUM(CASE WHEN status = 'settled' THEN 1 ELSE 0 END) AS verified_calls,
+            SUM(CASE WHEN status = 'sandbox_settled' THEN 1 ELSE 0 END) AS sandbox_calls,
+            COALESCE(SUM(CAST(amount_atomic AS INTEGER)), 0) AS volume_atomic,
+            COALESCE(ROUND(AVG(latency_ms)), 0) AS avg_latency_ms
+     FROM transactions
+     GROUP BY hour_utc
+     ORDER BY hour_utc DESC
+     LIMIT 48`
+  ).all<{
+    hour_utc: string;
+    total_calls: number;
+    verified_calls: number;
+    sandbox_calls: number;
+    volume_atomic: number;
+    avg_latency_ms: number;
+  }>();
+
+  const hours = (res.results ?? []).map((row) => ({
+    hour_utc: row.hour_utc,
+    total_calls: Number(row.total_calls ?? 0),
+    verified_calls: Number(row.verified_calls ?? 0),
+    sandbox_calls: Number(row.sandbox_calls ?? 0),
+    volume_usd: (Number(row.volume_atomic ?? 0) / 1_000_000).toFixed(4),
+    avg_latency_ms: Number(row.avg_latency_ms ?? 0)
+  }));
+
+  return c.json({ hours });
 });
 
 adminRoutes.patch("/users/:id/plan", async (c) => {
@@ -279,7 +323,7 @@ adminRoutes.get("/transactions", async (c) => {
   const res = await c.env.DB.prepare(
     `SELECT tx.id, tx.tenant_id, t.subdomain AS slug, tx.tool_name, tx.payer_wallet,
             tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status,
-            tx.latency_ms, COALESCE(tx.is_platform_fee, 0) AS is_platform_fee, tx.created_at
+            tx.latency_ms, COALESCE(tx.is_platform_fee, 0) AS is_platform_fee, tx.tap_agent_id, tx.created_at
      FROM transactions tx
      LEFT JOIN tenants t ON t.id = tx.tenant_id
      ORDER BY tx.created_at DESC
@@ -299,6 +343,7 @@ adminRoutes.get("/transactions", async (c) => {
       status: string;
       latency_ms: number;
       is_platform_fee: number;
+      tap_agent_id: string | null;
       created_at: string;
     }>();
 

@@ -287,7 +287,7 @@ authRoutes.get("/github/callback", async (c) => {
 
   const githubId = String(gh.id);
   const adminGithubId = c.env.ADMIN_GITHUB_ID?.trim();
-  const adminLogin = (c.env.ADMIN_GITHUB_LOGIN || "Ishabarundo").toLowerCase();
+  const adminLogin = (c.env.ADMIN_GITHUB_LOGIN || "JORO-NIMO").toLowerCase();
   const autoPromoteAdmin =
     (adminGithubId && githubId === adminGithubId) ||
     (!adminGithubId && gh.login.toLowerCase() === adminLogin)

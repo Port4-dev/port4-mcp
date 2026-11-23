@@ -25,7 +25,8 @@
 	},
 	"vars": {
 		"APP_URL": "https://port4.dev",
-		"ADMIN_GITHUB_LOGIN": "Ishabarundo",
+		"ADMIN_GITHUB_LOGIN": "joro-nimo",
+		"ADMIN_GITHUB_ID": "185346167",
 		"FACILITATOR_URL": "https://x402.org/facilitator",
 		"X402_FACILITATOR_URL": "https://x402.org/facilitator",
 		"X402_NETWORK": "eip155:84532",
@@ -53,17 +54,32 @@
 	],
 	"durable_objects": {
 		"bindings": [
-			{ "name": "EDGE_RATE_LIMITER", "class_name": "EdgeRateLimiter" },
-			{ "name": "PAYMENT_REPLAY_GUARD", "class_name": "PaymentReplayGuard" }
+			{
+				"name": "EDGE_RATE_LIMITER",
+				"class_name": "EdgeRateLimiter"
+			},
+			{
+				"name": "PAYMENT_REPLAY_GUARD",
+				"class_name": "PaymentReplayGuard"
+			}
 		]
 	},
 	"exports": {
-		"EdgeRateLimiter": { "type": "durable-object", "storage": "sqlite" },
-		"PaymentReplayGuard": { "type": "durable-object", "storage": "sqlite" }
+		"EdgeRateLimiter": {
+			"type": "durable-object",
+			"storage": "sqlite"
+		},
+		"PaymentReplayGuard": {
+			"type": "durable-object",
+			"storage": "sqlite"
+		}
 	},
 	"queues": {
 		"producers": [
-			{ "binding": "METERING_EVENTS", "queue": "port4-metering" }
+			{
+				"binding": "METERING_EVENTS",
+				"queue": "port4-metering"
+			}
 		],
 		"consumers": [
 			{

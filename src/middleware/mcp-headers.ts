@@ -7,6 +7,52 @@ import { sha256Hex } from "../lib/crypto";
 export const MCP_PROTOCOL_VERSION = "2026-07-28";
 const MAX_BODY_BYTES = 64 * 1024; // 64 KiB enforced on actual read bytes
 
+const decoder = new TextDecoder();
+
+async function readBoundedBodyBytes(
+  request: Request,
+  maxBytes: number
+): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; status: 400 | 413; message: string }> {
+  if (!request.body) {
+    return { ok: true, bytes: new Uint8Array(0) };
+  }
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return {
+          ok: false,
+          status: 413,
+          message: "Request body exceeds the 64 KiB limit."
+        };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      message: "Unable to read request body."
+    };
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, bytes };
+}
+
 function rpcError(
   id: string | number | null,
   code: number,
@@ -48,7 +94,8 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
   }
 
   const contentType = c.req.header("Content-Type") ?? "";
-  if (!contentType.toLowerCase().includes("application/json")) {
+  const mediaType = contentType.split(";")[0].trim().toLowerCase();
+  if (mediaType !== "application/json") {
     return c.json(rpcError(null, -32600, "Content-Type must be application/json."), 415);
   }
 
@@ -66,17 +113,15 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
   }
   const protocolVersion = rawProtocolVersion ?? MCP_PROTOCOL_VERSION;
 
-  let rawText: string;
-  try {
-    rawText = await c.req.text();
-  } catch {
-    return c.json(rpcError(null, -32700, "Unable to read request body."), 400);
+  const bounded = await readBoundedBodyBytes(c.req.raw, MAX_BODY_BYTES);
+  if (!bounded.ok) {
+    return c.json(
+      rpcError(null, bounded.status === 413 ? -32600 : -32700, bounded.message),
+      bounded.status
+    );
   }
-
-  const actualBytes = new TextEncoder().encode(rawText).byteLength;
-  if (actualBytes > MAX_BODY_BYTES) {
-    return c.json(rpcError(null, -32600, "Request body exceeds the 64 KiB limit."), 413);
-  }
+  const rawBytes = bounded.bytes;
+  const rawText = decoder.decode(rawBytes);
   c.set("rawBodyText", rawText);
 
   // Visa Trusted Agent Protocol (TAP RFC 9421) Verification Gate
@@ -101,6 +146,13 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
       reserveNonce: async (nonceKey, expiresEpochSec) => {
         const doKey = await sha256Hex(`tap-nonce:${nonceKey}`);
         const stub = c.env.EDGE_RATE_LIMITER.get(c.env.EDGE_RATE_LIMITER.idFromName(doKey));
+        const rpcStub = stub as unknown as {
+          reserveTapNonce?: (input: { expiresEpochSec: number }) => Promise<{ reserved?: boolean }>;
+        };
+        if (typeof rpcStub.reserveTapNonce === "function") {
+          const data = await rpcStub.reserveTapNonce({ expiresEpochSec });
+          return Boolean(data.reserved);
+        }
         const res = await stub.fetch("https://rate-limit/tap-nonce", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -120,7 +172,7 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
       publicOrigin: pinnedPublicOrigin,
       target: targetPathAndQuery,
       headers: headersLower,
-      rawBody: rawText
+      rawBody: rawBytes
     });
 
     if (!tapOutcome.ok) {
@@ -153,14 +205,22 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
     }
   }
 
-  let body: McpJsonRpcRequest;
+  let parsedBody: unknown;
   try {
-    body = JSON.parse(rawText) as McpJsonRpcRequest;
+    parsedBody = JSON.parse(rawText);
   } catch {
     return c.json(rpcError(null, -32700, "Parse error: invalid JSON-RPC 2.0 body."), 400);
   }
 
-  const rpcId = body.id ?? null;
+  if (!parsedBody || typeof parsedBody !== "object" || Array.isArray(parsedBody)) {
+    return c.json(
+      rpcError(null, -32600, "Invalid Request: expected JSON-RPC 2.0 payload with method."),
+      400
+    );
+  }
+
+  const body = parsedBody as McpJsonRpcRequest;
+  const rpcId = typeof body.id === "string" || typeof body.id === "number" ? body.id : null;
 
   if (body.jsonrpc !== "2.0" || typeof body.method !== "string" || body.method.length === 0) {
     return c.json(

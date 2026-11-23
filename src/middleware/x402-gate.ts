@@ -21,14 +21,30 @@ import {
 } from "../lib/crypto";
 import { verifyCloudflareAccessJwt } from "../lib/cloudflare-access";
 import { fetchFacilitatorVerify, resolveFacilitatorConfig } from "../lib/facilitator";
-import { buildMppAuthenticateHeader, resolveTempoRecipient } from "../lib/mpp-tempo";
+import {
+  TEMPO_MAINNET_CHAIN_ID,
+  TEMPO_OUSD_ADDRESS,
+  TEMPO_TESTNET_CHAIN_ID,
+  buildMppAuthenticateHeader,
+  encodeBase64UrlJson,
+  extractMppAuthorizationToken,
+  parseAndValidateMppCredential,
+  resolveTempoRecipient,
+  verifyMppPaymentCredential
+} from "../lib/mpp-tempo";
 import {
   EVM_ADDRESS_RE,
   SOLANA_ADDRESS_RE,
   getNetworkFamily,
+  getNetworkTreasury,
+  getSupportedNetwork,
   normalizePayoutWallets,
   resolveUsdcAssetForNetwork
 } from "../lib/networks";
+
+interface DecodedX402Signature extends X402PaymentSignaturePayload {
+  accepted?: Partial<X402PaymentRequirement>;
+}
 
 async function verifyEnterpriseOAuthV2(
   c: Context<AppEnv>,
@@ -113,6 +129,16 @@ export function resolveUsdcAsset(network: string, fallback: string): string {
   return resolveUsdcAssetForNetwork(network, fallback);
 }
 
+function resolveAssetExtraMetadata(networkId: string): { name: string; version: string } {
+  if (networkId === "eip155:4217" || networkId === "eip155:42431") {
+    return { name: "OUSD", version: "1" };
+  }
+  if (getNetworkFamily(networkId) === "solana") {
+    return { name: "USDC", version: "spl" };
+  }
+  return { name: "USD Coin", version: "2" };
+}
+
 export function buildPaymentRequired(
   c: Context<AppEnv>,
   tenant: TenantRoutingRecord,
@@ -142,6 +168,7 @@ export function buildPaymentRequired(
       entry.address
     );
     if (isPlatformFee) anyPlatformFee = true;
+    const assetMeta = resolveAssetExtraMetadata(entry.network);
     return {
       scheme: "exact",
       network: entry.network,
@@ -150,8 +177,8 @@ export function buildPaymentRequired(
       payTo,
       maxTimeoutSeconds: 60,
       extra: {
-        name: "USD Coin",
-        version: "2",
+        name: assetMeta.name,
+        version: assetMeta.version,
         paymentFlow: "upfront",
         tenant: tenant.subdomain,
         tool: tool.name,
@@ -267,7 +294,14 @@ async function verifyAndSettleViaFacilitator(
   let verifyRes: Response;
   try {
     verifyRes = await fetchFacilitatorVerify(facConfig, payload);
-  } catch {
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        event: "facilitator_verify_unreachable",
+        network: requirement.network,
+        error: err instanceof Error ? err.message : "unknown"
+      })
+    );
     return {
       success: false,
       transaction: "",
@@ -294,11 +328,25 @@ async function verifyAndSettleViaFacilitator(
     };
   }
 
-  const verifyJson = (await verifyRes.json()) as {
+  let verifyJson: {
     isValid?: boolean;
     invalidReason?: string;
     payer?: string;
   };
+  try {
+    verifyJson = (await verifyRes.json()) as typeof verifyJson;
+  } catch {
+    return {
+      success: false,
+      transaction: "",
+      network: requirement.network,
+      payer: decoded.payload?.authorization?.from ?? "unknown",
+      errorReason: "facilitator_verify_invalid_json",
+      mode: "facilitator",
+      isPlatformFee,
+      payTo: requirement.payTo
+    };
+  }
 
   if (!verifyJson.isValid) {
     return {
@@ -320,6 +368,7 @@ async function verifyAndSettleViaFacilitator(
       method: "POST",
       headers: facConfig.headers,
       body: JSON.stringify(payload),
+      redirect: "error",
       signal: AbortSignal.timeout(10_000)
     });
   } catch {
@@ -353,7 +402,7 @@ async function verifyAndSettleViaFacilitator(
     };
   }
 
-  const settleJson = (await settleRes.json()) as {
+  let settleJson: {
     success?: boolean;
     status?: string;
     settlementPending?: boolean;
@@ -363,6 +412,21 @@ async function verifyAndSettleViaFacilitator(
     payer?: string;
     errorReason?: string | null;
   };
+  try {
+    settleJson = (await settleRes.json()) as typeof settleJson;
+  } catch {
+    return {
+      success: false,
+      settlementPending: true,
+      transaction: "",
+      network: requirement.network,
+      payer: verifyJson.payer ?? decoded.payload?.authorization?.from ?? "unknown",
+      errorReason: "facilitator_settle_invalid_json_pending",
+      mode: "facilitator",
+      isPlatformFee,
+      payTo: requirement.payTo
+    };
+  }
 
   const txHash = (settleJson.transaction ?? settleJson.txHash ?? "").trim();
   const isPending =
@@ -479,30 +543,75 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
 
   c.set("selectedTool", tool);
 
-  const { paymentRequired } = buildPaymentRequired(c, tenant, tool);
+  const signatureHeader = c.req.header("PAYMENT-SIGNATURE")?.trim();
+  const mppToken = extractMppAuthorizationToken(c.req.header("Authorization"));
+
+  if (signatureHeader && mppToken) {
+    return c.json(
+      {
+        error: "ambiguous_payment_credentials",
+        message: "Provide either PAYMENT-SIGNATURE (x402) or Authorization: Payment (MPP), not both."
+      },
+      402
+    );
+  }
+
+  let paidSequence = (tenant.settled_call_sequence ?? tenant.call_count ?? 0) + 1;
+  if (!signatureHeader && !mppToken) {
+    try {
+      const seqKey = await sha256Hex(`fee-seq:${tenant.id}`);
+      const seqStub = c.env.EDGE_RATE_LIMITER.get(c.env.EDGE_RATE_LIMITER.idFromName(seqKey));
+      const rpcStub = seqStub as unknown as {
+        nextFeeSequence?: () => Promise<{ ok?: boolean; sequence?: number }>;
+      };
+      let seqData: { ok?: boolean; sequence?: number };
+      if (typeof rpcStub.nextFeeSequence === "function") {
+        seqData = await rpcStub.nextFeeSequence();
+      } else {
+        const seqRes = await seqStub.fetch("https://rate-limit/next-fee-sequence", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operation: "next_fee_sequence" })
+        });
+        seqData = seqRes.ok
+          ? ((await seqRes.json()) as { ok?: boolean; sequence?: number })
+          : {};
+      }
+      if (typeof seqData.sequence === "number" && seqData.sequence > 0) {
+        paidSequence = (tenant.settled_call_sequence ?? 0) + seqData.sequence;
+      }
+    } catch {
+      // Fallback to tenant.settled_call_sequence + 1
+    }
+    c.set("paidFeeSequence", paidSequence);
+  }
+
+  const { paymentRequired } = buildPaymentRequired(c, tenant, tool, paidSequence);
   const paymentRequiredHeader = encodeBase64Json(paymentRequired);
   const primaryRequirement = paymentRequired.accepts[0];
+  const primaryIsTestnet = getSupportedNetwork(primaryRequirement.network)?.isMainnet === false;
+  const evmTreasury = getNetworkTreasury(c.env, "eip155:42431");
+  const tempoRecipient =
+    primaryRequirement.extra.isPlatformFee && evmTreasury
+      ? evmTreasury
+      : resolveTempoRecipient(tenant, primaryRequirement.payTo);
 
-  const signatureHeader = c.req.header("PAYMENT-SIGNATURE");
-  if (!signatureHeader) {
+  const attachMppChallengeHeader = () => {
+    if (!tempoRecipient) return;
+    const reqUrl = new URL(c.req.url);
+    const mppHeader = buildMppAuthenticateHeader({
+      challengeId: `ch_${randomHex(12)}`,
+      realm: reqUrl.host,
+      amountAtomic: tool.price_atomic,
+      recipient: tempoRecipient,
+      isTestnet: primaryIsTestnet
+    });
+    c.header("WWW-Authenticate", mppHeader);
+  };
+
+  if (!signatureHeader && !mppToken) {
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
-    const tempoRecipient = resolveTempoRecipient(tenant, primaryRequirement.payTo);
-    if (tempoRecipient) {
-      const reqUrl = new URL(c.req.url);
-      const isTestnet =
-        primaryRequirement.network === "eip155:84532" ||
-        primaryRequirement.network === "eip155:421614" ||
-        primaryRequirement.network === "eip155:42431" ||
-        primaryRequirement.network === "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
-      const mppHeader = buildMppAuthenticateHeader({
-        challengeId: `ch_${randomHex(12)}`,
-        realm: reqUrl.host,
-        amountAtomic: tool.price_atomic,
-        recipient: tempoRecipient,
-        isTestnet
-      });
-      c.header("WWW-Authenticate", mppHeader);
-    }
+    attachMppChallengeHeader();
     c.header("X-Port4-Tenant", tenant.subdomain);
     c.header("Cache-Control", "no-store");
     const networkSummary = paymentRequired.accepts.map((a) => a.network).join(", ");
@@ -516,9 +625,244 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     );
   }
 
-  let decodedSignature: X402PaymentSignaturePayload;
+  // --- Branch A: Tempo OUSD Machine Payments Protocol (`Authorization: Payment <b64url>`) ---
+  if (mppToken) {
+    const expectedChainId = primaryIsTestnet ? TEMPO_TESTNET_CHAIN_ID : TEMPO_MAINNET_CHAIN_ID;
+    const defaultTempoRecipient = resolveTempoRecipient(tenant, tenant.payout_wallet);
+    const parsedCred = parseAndValidateMppCredential({
+      token: mppToken,
+      env: c.env,
+      tenant,
+      tool,
+      expectedRecipient: defaultTempoRecipient,
+      expectedChainId
+    });
+    if (!parsedCred.ok) {
+      c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+      attachMppChallengeHeader();
+      return c.json(
+        {
+          error: parsedCred.error,
+          message: parsedCred.message,
+          x402: paymentRequired
+        },
+        402
+      );
+    }
+
+    const cred = parsedCred.credential;
+    const paymentFingerprint = await sha256Hex(
+      `mpp:tempo:${cred.chainId}:${cred.txHash.toLowerCase()}`
+    );
+    const leaseToken = `lease_${randomHex(16)}`;
+    const paymentContext: PaymentExecutionContext = {
+      tenantId: tenant.id,
+      toolName: tool.name,
+      resourceUrl: c.req.url,
+      network: `eip155:${cred.chainId}`,
+      asset: TEMPO_OUSD_ADDRESS,
+      amountAtomic: cred.amount,
+      payTo: cred.recipient
+    };
+
+    const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
+      c.env.PAYMENT_REPLAY_GUARD.idFromName(paymentFingerprint)
+    );
+    const replayClaim = await replayStub.fetch("https://payment-replay/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "claim", context: paymentContext, leaseToken })
+    });
+
+    if (!replayClaim.ok) {
+      return c.json({ error: "payment_coordination_unavailable" }, 503);
+    }
+
+    const replayResult = (await replayClaim.json()) as {
+      status?:
+        | "claimed"
+        | "retry_upstream"
+        | "completed"
+        | "in_flight"
+        | "settlement_pending"
+        | "context_mismatch";
+      claimed?: boolean;
+      leaseToken?: string;
+      receipt?: X402SettlementReceipt;
+      responseBody?: string;
+    };
+
+    if (replayResult.status === "context_mismatch") {
+      c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+      attachMppChallengeHeader();
+      return c.json(
+        {
+          error: "payment_context_mismatch",
+          message: "This Tempo MPP payment is bound to a different tenant, tool, or resource."
+        },
+        409
+      );
+    }
+
+    if (replayResult.status === "completed" && replayResult.receipt) {
+      if (!replayResult.responseBody) {
+        return c.json(
+          {
+            error: "payment_already_used",
+            message: "Payment already redeemed (response exceeded 64 KiB cache)."
+          },
+          409
+        );
+      }
+      const replayReceiptHeader = encodeBase64UrlJson({
+        status: "success",
+        method: "tempo",
+        challengeId: cred.challengeId,
+        reference: replayResult.receipt.transaction,
+        chainId: cred.chainId,
+        currency: TEMPO_OUSD_ADDRESS,
+        amount: cred.amount,
+        recipient: cred.recipient
+      });
+      c.header("PAYMENT-RESPONSE", encodeBase64Json(replayResult.receipt));
+      c.header("Payment-Receipt", replayReceiptHeader);
+      c.header("X-Port4-Settlement-Tx", replayResult.receipt.transaction);
+      c.header("X-Port4-Tenant", tenant.subdomain);
+      c.header("X-Port4-Idempotent-Replay", "true");
+      c.header("Content-Type", "application/json");
+      return c.body(replayResult.responseBody, 200);
+    }
+
+    if (replayResult.status === "settlement_pending") {
+      return c.json(
+        {
+          error: "payment_settlement_pending",
+          message:
+            "Tempo payment transaction is awaiting on-chain confirmation. Retry shortly with the same Authorization: Payment header."
+        },
+        409
+      );
+    }
+
+    if (!replayResult.claimed) {
+      return c.json(
+        {
+          error: "payment_already_used",
+          message: "This Tempo payment is already being processed or was already redeemed."
+        },
+        409
+      );
+    }
+
+    c.set("paymentFingerprint", paymentFingerprint);
+    c.set("paymentLeaseToken", leaseToken);
+    c.set("paymentContext", paymentContext);
+
+    let receipt: X402SettlementReceipt;
+    let mppReceiptHeader: string;
+
+    if (replayResult.status === "retry_upstream" && replayResult.receipt) {
+      receipt = replayResult.receipt;
+      mppReceiptHeader = encodeBase64UrlJson({
+        status: "success",
+        method: "tempo",
+        challengeId: cred.challengeId,
+        reference: receipt.transaction,
+        chainId: cred.chainId,
+        currency: TEMPO_OUSD_ADDRESS,
+        amount: cred.amount,
+        recipient: cred.recipient
+      });
+    } else {
+      const mppOutcome = await verifyMppPaymentCredential({
+        env: c.env,
+        credential: cred
+      });
+
+      if (!mppOutcome.ok) {
+        if (mppOutcome.settlementPending) {
+          await replayStub.fetch("https://payment-replay/mark_settlement_pending", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              operation: "mark_settlement_pending",
+              leaseToken,
+              receipt: {
+                success: false,
+                settlementPending: true,
+                transaction: cred.txHash,
+                network: `eip155:${cred.chainId}`,
+                payer: cred.payer,
+                errorReason: mppOutcome.error,
+                mode: "facilitator",
+                isPlatformFee: cred.isPlatformFee,
+                payTo: cred.recipient
+              }
+            })
+          });
+          return c.json(
+            {
+              error: "payment_settlement_pending",
+              message: mppOutcome.message
+            },
+            409
+          );
+        }
+
+        await replayStub.fetch("https://payment-replay/release", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operation: "release", leaseToken })
+        });
+        if (mppOutcome.status === 402) {
+          c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+          attachMppChallengeHeader();
+        }
+        return c.json(
+          {
+            error: mppOutcome.error,
+            message: mppOutcome.message,
+            ...(mppOutcome.status === 402 ? { x402: paymentRequired } : {})
+          },
+          mppOutcome.status
+        );
+      }
+
+      receipt = mppOutcome.receipt;
+      mppReceiptHeader = mppOutcome.receiptHeader;
+
+      const markSettledRes = await replayStub.fetch("https://payment-replay/mark_settled", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operation: "mark_settled", leaseToken, receipt })
+      });
+      if (!markSettledRes.ok) {
+        return c.json(
+          {
+            error: "payment_state_persistence_failed",
+            message:
+              "Payment settled on Tempo but durable state persistence failed. Retry with the same Authorization: Payment header."
+          },
+          503
+        );
+      }
+    }
+
+    c.set("x402Receipt", receipt);
+    c.set("mppReceiptHeader", mppReceiptHeader);
+    await next();
+
+    c.header("PAYMENT-RESPONSE", encodeBase64Json(receipt));
+    c.header("Payment-Receipt", mppReceiptHeader);
+    c.header("X-Port4-Settlement-Tx", receipt.transaction);
+    c.header("X-Port4-Tenant", tenant.subdomain);
+    return;
+  }
+
+  // --- Branch B: x402 v2 (`PAYMENT-SIGNATURE`) ---
+  let rawDecoded: DecodedX402Signature;
   try {
-    decodedSignature = decodeBase64Json<X402PaymentSignaturePayload>(signatureHeader);
+    rawDecoded = decodeBase64Json<DecodedX402Signature>(signatureHeader!);
   } catch {
     c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
     return c.json(
@@ -529,6 +873,32 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
       402
     );
   }
+
+  if (
+    (rawDecoded.network &&
+      rawDecoded.accepted?.network &&
+      rawDecoded.network !== rawDecoded.accepted.network) ||
+    (rawDecoded.scheme &&
+      rawDecoded.accepted?.scheme &&
+      rawDecoded.scheme !== rawDecoded.accepted.scheme)
+  ) {
+    c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
+    return c.json(
+      {
+        error: "invalid_payment_signature",
+        message: "PAYMENT-SIGNATURE top-level network/scheme conflicts with accepted network/scheme."
+      },
+      402
+    );
+  }
+
+  const resolvedNetwork = (rawDecoded.network ?? rawDecoded.accepted?.network ?? "").trim();
+  const resolvedScheme = (rawDecoded.scheme ?? rawDecoded.accepted?.scheme ?? "").trim();
+  const decodedSignature: X402PaymentSignaturePayload = {
+    ...rawDecoded,
+    network: resolvedNetwork,
+    scheme: resolvedScheme
+  };
 
   const matchedRequirement = paymentRequired.accepts.find(
     (req) => req.network === decodedSignature.network && req.scheme === decodedSignature.scheme
@@ -551,16 +921,26 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     );
   }
 
-  const requirement = matchedRequirement ?? primaryRequirement;
-  const isPlatformFee = Boolean(requirement.extra.isPlatformFee);
+  const configuredWallets =
+    Array.isArray(tenant.payout_wallets) && tenant.payout_wallets.length > 0
+      ? tenant.payout_wallets
+      : normalizePayoutWallets(tenant.network || c.env.X402_NETWORK, tenant.payout_wallet);
+  const tenantWalletForNetwork =
+    configuredWallets.find((w) => w.network === matchedRequirement.network)?.address ??
+    matchedRequirement.payTo;
+  const networkTreasury = getNetworkTreasury(c.env, matchedRequirement.network);
+
+  let effectivePayTo = matchedRequirement.payTo;
+  let isPlatformFee = Boolean(matchedRequirement.extra.isPlatformFee);
 
   // Verify EVM authorization target & amount BEFORE checking replay cache so mismatched context never hits cache
   if (family === "evm" && decodedSignature.payload?.authorization) {
     const auth = decodedSignature.payload.authorization;
-    if (
-      auth.to.toLowerCase() !== requirement.payTo.toLowerCase() ||
-      auth.value !== requirement.amount
-    ) {
+    const toLower = (auth.to ?? "").toLowerCase();
+    const matchesTenantWallet = toLower === tenantWalletForNetwork.toLowerCase();
+    const matchesTreasury = Boolean(networkTreasury && toLower === networkTreasury.toLowerCase());
+
+    if ((!matchesTenantWallet && !matchesTreasury) || auth.value !== matchedRequirement.amount) {
       c.header("PAYMENT-REQUIRED", paymentRequiredHeader);
       return c.json(
         {
@@ -570,7 +950,26 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
         402
       );
     }
+    effectivePayTo = matchesTreasury && networkTreasury ? networkTreasury : tenantWalletForNetwork;
+    isPlatformFee = matchesTreasury && !matchesTenantWallet;
+  } else if (
+    family === "solana" &&
+    rawDecoded.accepted?.payTo &&
+    networkTreasury &&
+    rawDecoded.accepted.payTo === networkTreasury
+  ) {
+    effectivePayTo = networkTreasury;
+    isPlatformFee = true;
   }
+
+  const requirement: X402PaymentRequirement = {
+    ...matchedRequirement,
+    payTo: effectivePayTo,
+    extra: {
+      ...matchedRequirement.extra,
+      isPlatformFee
+    }
+  };
 
   const paymentFingerprint = await computeCanonicalPaymentFingerprint(decodedSignature);
   const leaseToken = `lease_${randomHex(16)}`;
@@ -624,7 +1023,16 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
   }
 
   // 2. Same tenant+tool+payment already completed -> return cached paid response idempotently
-  if (replayResult.status === "completed" && replayResult.receipt && replayResult.responseBody) {
+  if (replayResult.status === "completed" && replayResult.receipt) {
+    if (!replayResult.responseBody) {
+      return c.json(
+        {
+          error: "payment_already_used",
+          message: "Payment already redeemed (response exceeded 64 KiB cache)."
+        },
+        409
+      );
+    }
     c.header("PAYMENT-RESPONSE", encodeBase64Json(replayResult.receipt));
     c.header("X-Port4-Settlement-Tx", replayResult.receipt.transaction);
     c.header("X-Port4-Tenant", tenant.subdomain);

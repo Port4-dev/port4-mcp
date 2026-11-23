@@ -7,6 +7,25 @@ export interface FacilitatorEndpointConfig {
   isMainnet: boolean;
 }
 
+function validateFacilitatorUrl(rawUrl: string): string {
+  const normalized = rawUrl.trim().replace(/\/+$/, "");
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new Error("Invalid x402 facilitator URL configuration.");
+  }
+  const isLocalHttp =
+    parsed.protocol === "http:" &&
+    (parsed.hostname === "localhost" ||
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "[::1]");
+  if (parsed.protocol !== "https:" && !isLocalHttp) {
+    throw new Error("x402 facilitator URL must use https://.");
+  }
+  return normalized;
+}
+
 /**
  * Resolves the appropriate x402 Facilitator URL & optional authentication headers
  * for the target settlement network (Mainnet vs. Testnet).
@@ -17,12 +36,13 @@ export function resolveFacilitatorConfig(
 ): FacilitatorEndpointConfig {
   const netInfo = getSupportedNetwork(network);
   const isMainnet = netInfo?.isMainnet ?? false;
-  const defaultUrl = (env.FACILITATOR_URL || env.X402_FACILITATOR_URL || "https://x402.org/facilitator")
-    .trim()
-    .replace(/\/$/, "");
-  const mainnetUrl = env.X402_MAINNET_FACILITATOR_URL?.trim().replace(/\/$/, "");
+  const defaultRaw =
+    env.FACILITATOR_URL || env.X402_FACILITATOR_URL || "https://x402.org/facilitator";
+  const mainnetRaw = env.X402_MAINNET_FACILITATOR_URL?.trim();
 
-  const baseUrl = isMainnet && mainnetUrl ? mainnetUrl : defaultUrl;
+  const baseUrl = validateFacilitatorUrl(
+    isMainnet && mainnetRaw ? mainnetRaw : defaultRaw
+  );
   const headers: Record<string, string> = {
     "Content-Type": "application/json"
   };
@@ -55,16 +75,18 @@ export async function fetchFacilitatorVerify(
         method: "POST",
         headers: config.headers,
         body,
+        redirect: "error",
         signal: AbortSignal.timeout(8_000)
       });
       if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt === 0) {
-        await new Promise((r) => setTimeout(r, 200));
+        await res.body?.cancel().catch(() => {});
+        await new Promise((r) => setTimeout(r, 250));
         continue;
       }
       return res;
     } catch (err) {
       if (attempt === 0) {
-        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setTimeout(r, 250));
         continue;
       }
       throw err;

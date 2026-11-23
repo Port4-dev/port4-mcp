@@ -34,12 +34,19 @@ const SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const TOOL_NAME_RE = /^[a-zA-Z0-9_-]{2,64}$/;
 const HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
 
-function validateUpstreamBaseUrl(value: string): string | null {
-  if (value === "internal://sandbox") return value;
+function validateUpstreamBaseUrl(
+  value: string,
+  options?: { allowInternalSandbox?: boolean }
+): string | null {
+  if (value === "internal://sandbox") {
+    return options?.allowInternalSandbox ? value : null;
+  }
   try {
     const url = new URL(value);
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return null;
-    const hostname = url.hostname.toLowerCase();
+    const rawHost = url.hostname.toLowerCase();
+    const hostname =
+      rawHost.startsWith("[") && rawHost.endsWith("]") ? rawHost.slice(1, -1) : rawHost;
     if (
       hostname === "localhost" ||
       hostname.endsWith(".localhost") ||
@@ -51,6 +58,7 @@ function validateUpstreamBaseUrl(value: string): string | null {
       hostname === "0.0.0.0" ||
       hostname === "::" ||
       hostname === "::1" ||
+      hostname.startsWith("0:") ||
       hostname.startsWith("fc") ||
       hostname.startsWith("fd") ||
       hostname.startsWith("fe80:") ||
@@ -206,10 +214,11 @@ apiRoutes.get("/tenants", async (c) => {
 
   const toolsRes = await c.env.DB.prepare(
     `SELECT tl.id, tl.tenant_id, tl.name, tl.description, tl.http_method, tl.upstream_path,
-            tl.input_schema_json, tl.price_usd, tl.price_atomic, tl.is_active, tl.created_at
+            tl.input_schema_json, tl.price_usd, tl.price_atomic, tl.is_active,
+            COALESCE(tl.source_type, 'rest') AS source_type, tl.remote_tool_name, tl.created_at
      FROM tools tl
      INNER JOIN tenants t ON t.id = tl.tenant_id
-     WHERE t.user_id = ?
+     WHERE t.user_id = ? AND t.deleted_at IS NULL
      ORDER BY tl.created_at DESC`
   )
     .bind(user.id)
@@ -250,6 +259,9 @@ apiRoutes.post("/tenants", async (c) => {
     upstream_auth_type?: "none" | "bearer" | "api_key_header";
     upstream_auth_header?: string;
     upstream_auth_secret?: string;
+    require_upstream_verified?: boolean | number;
+    require_visa_tap?: boolean | number;
+    allow_tap_simulated?: boolean | number;
     cf_access_team_domain?: string;
     cf_access_aud?: string;
     initial_tool?: {
@@ -395,11 +407,18 @@ apiRoutes.post("/tenants", async (c) => {
   const rateLimitRpm = user.plan === "pro" ? 600 : 120;
   const dailyQuota = user.plan === "pro" ? 1_000_000 : 10_000;
 
+  const requireUpstreamVerified =
+    body.require_upstream_verified === true || body.require_upstream_verified === 1 ? 1 : 0;
+  const requireVisaTap =
+    body.require_visa_tap === true || body.require_visa_tap === 1 ? 1 : 0;
+  const allowTapSimulated =
+    body.allow_tap_simulated === true || body.allow_tap_simulated === 1 ? 1 : 0;
+
   try {
     await c.env.DB.prepare(
       `INSERT INTO tenants
-       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota, mcp_mode, codemode_price_usd, codemode_max_subcalls, upstream_auth_type, upstream_auth_header, upstream_auth_secret, cf_access_team_domain, cf_access_aud)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota, mcp_mode, codemode_price_usd, codemode_max_subcalls, require_upstream_verified, require_visa_tap, allow_tap_simulated, upstream_auth_type, upstream_auth_header, upstream_auth_secret, cf_access_team_domain, cf_access_aud)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         tenantId,
@@ -418,6 +437,9 @@ apiRoutes.post("/tenants", async (c) => {
         mcpMode,
         codemodePriceUsd,
         codemodeMaxSubcalls,
+        requireUpstreamVerified,
+        requireVisaTap,
+        allowTapSimulated,
         upstreamAuthType,
         upstreamAuthHeader,
         encryptedUpstreamSecret,
@@ -476,7 +498,7 @@ apiRoutes.post("/tenants/:id/verify-upstream", async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain, upstream_base_url, verification_token FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain, upstream_base_url, verification_token FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{ id: string; subdomain: string; upstream_base_url: string; verification_token: string | null }>();
@@ -518,7 +540,7 @@ apiRoutes.post("/tenants/:id/rotate-secret", async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{ id: string; subdomain: string }>();
@@ -609,7 +631,9 @@ apiRoutes.patch("/tenants/:id", async (c) => {
 
   let nextUpstream = existing.upstream_base_url;
   if (body.upstream_base_url !== undefined) {
-    const validated = validateUpstreamBaseUrl(body.upstream_base_url.trim());
+    const validated = validateUpstreamBaseUrl(body.upstream_base_url.trim(), {
+      allowInternalSandbox: existing.subdomain === "demo"
+    });
     if (!validated) {
       return c.json(
         { error: "invalid_upstream_url", message: "Upstream URL must be a public HTTPS origin." },
@@ -832,7 +856,7 @@ apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{ id: string; subdomain: string }>();
@@ -954,7 +978,7 @@ apiRoutes.patch("/tenants/:id/tools/:toolId", async (c) => {
   const toolId = c.req.param("toolId");
 
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{ id: string; subdomain: string }>();
@@ -1029,7 +1053,7 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
     `SELECT id, subdomain, upstream_base_url, upstream_signing_secret,
             COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
             upstream_auth_header, upstream_auth_secret
-     FROM tenants WHERE id = ? AND user_id = ? LIMIT 1`
+     FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`
   )
     .bind(tenantId, user.id)
     .first<{
@@ -1052,17 +1076,24 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
   }
 
   const tool = await c.env.DB.prepare(
-    "SELECT id, name, http_method, upstream_path FROM tools WHERE tenant_id = ? AND name = ? AND is_active = 1 LIMIT 1"
+    `SELECT id, name, http_method, upstream_path,
+            COALESCE(source_type, 'rest') AS source_type, remote_tool_name
+     FROM tools WHERE tenant_id = ? AND name = ? AND is_active = 1 LIMIT 1`
   )
     .bind(tenant.id, (body.tool_name ?? "").trim())
-    .first<Pick<ToolRecord, "id" | "name" | "http_method" | "upstream_path">>();
+    .first<
+      Pick<
+        ToolRecord,
+        "id" | "name" | "http_method" | "upstream_path" | "source_type" | "remote_tool_name"
+      >
+    >();
 
   if (!tool) return c.json({ error: "tool_not_found" }, 404);
 
   const startedAt = Date.now();
   const args = body.arguments && typeof body.arguments === "object" ? body.arguments : {};
 
-  if ( tenant.upstream_base_url === "internal://sandbox") {
+  if (tenant.upstream_base_url === "internal://sandbox" || tool.source_type === "internal") {
     const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "EDGE";
     return c.json({
       ok: true,
@@ -1073,7 +1104,11 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
     });
   }
 
-  const { resolvedPath, remainingArgs } = interpolateUpstreamPath(tool.upstream_path, args);
+  const isRemoteMcp = tool.source_type === "mcp";
+  const remoteToolName = tool.remote_tool_name || tool.name;
+  const { resolvedPath, remainingArgs } = isRemoteMcp
+    ? { resolvedPath: tool.upstream_path, remainingArgs: args }
+    : interpolateUpstreamPath(tool.upstream_path, args);
   const targetUrl = new URL(resolvedPath, `${tenant.upstream_base_url}/`);
   const requestId = `test_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
   const headers: Record<string, string> = {
@@ -1100,7 +1135,22 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
   }
 
   let serializedBody = "";
-  if (tool.http_method === "GET" || tool.http_method === "DELETE") {
+  let httpMethod: "GET" | "POST" | "PUT" | "DELETE" = tool.http_method;
+  if (isRemoteMcp) {
+    httpMethod = "POST";
+    headers["MCP-Protocol-Version"] = "2026-07-28";
+    headers["Mcp-Method"] = "tools/call";
+    headers["Mcp-Name"] = remoteToolName;
+    serializedBody = JSON.stringify({
+      jsonrpc: "2.0",
+      id: requestId,
+      method: "tools/call",
+      params: {
+        name: remoteToolName,
+        arguments: remainingArgs
+      }
+    });
+  } else if (httpMethod === "GET" || httpMethod === "DELETE") {
     for (const [k, v] of Object.entries(remainingArgs)) {
       if (v !== undefined && v !== null) targetUrl.searchParams.set(k, String(v));
     }
@@ -1121,16 +1171,20 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
 
   try {
     const res = await fetch(targetUrl.toString(), {
-      method: tool.http_method,
+      method: httpMethod,
       headers,
       redirect: "error",
       signal: AbortSignal.timeout(12_000),
-      ...(tool.http_method === "GET" || tool.http_method === "DELETE" ? {} : { body: serializedBody })
+      ...(httpMethod === "GET" || httpMethod === "DELETE" ? {} : { body: serializedBody })
     });
     const text = (await res.text()).slice(0, 16_384);
     let parsed: unknown = text;
     try {
-      parsed = JSON.parse(text);
+      const jsonObj = JSON.parse(text) as Record<string, unknown>;
+      parsed =
+        isRemoteMcp && jsonObj && jsonObj.jsonrpc === "2.0" && jsonObj.result !== undefined
+          ? jsonObj.result
+          : jsonObj;
     } catch {
       // keep raw text
     }
@@ -1139,7 +1193,7 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
       status: res.status,
       latency_ms: Math.max(1, Date.now() - startedAt),
       url: targetUrl.toString(),
-      method: tool.http_method,
+      method: httpMethod,
       response: parsed
     });
   } catch (err) {
@@ -1163,10 +1217,20 @@ apiRoutes.post("/tenants/:id/sync-mcp", async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain, upstream_base_url FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    `SELECT id, subdomain, upstream_base_url,
+            COALESCE(upstream_auth_type, 'none') AS upstream_auth_type,
+            upstream_auth_header, upstream_auth_secret
+     FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`
   )
     .bind(tenantId, user.id)
-    .first<{ id: string; subdomain: string; upstream_base_url: string }>();
+    .first<{
+      id: string;
+      subdomain: string;
+      upstream_base_url: string;
+      upstream_auth_type: "none" | "bearer" | "api_key_header";
+      upstream_auth_header: string | null;
+      upstream_auth_secret: string | null;
+    }>();
 
   if (!tenant) return c.json({ error: "tenant_not_found" }, 404);
   if (tenant.upstream_base_url === "internal://sandbox") {
@@ -1178,20 +1242,61 @@ apiRoutes.post("/tenants/:id/sync-mcp", async (c) => {
   try {
     const body = (await c.req.json()) as { default_price_usd?: string; mcp_path?: string };
     if (body.default_price_usd) defaultPriceUsd = body.default_price_usd.replace(/^\$/, "").trim();
-    if (body.mcp_path && body.mcp_path.startsWith("/")) mcpPath = body.mcp_path;
+    if (body.mcp_path !== undefined) {
+      const candidate = String(body.mcp_path).trim();
+      if (
+        !candidate.startsWith("/") ||
+        candidate.startsWith("//") ||
+        candidate.includes("?") ||
+        candidate.includes("#") ||
+        candidate.includes("\\") ||
+        candidate.split("/").some((seg) => seg === "." || seg === "..")
+      ) {
+        return c.json(
+          {
+            error: "invalid_mcp_path",
+            message: "mcp_path must be a normalized relative path starting with '/'."
+          },
+          400
+        );
+      }
+      mcpPath = candidate;
+    }
   } catch {
     // defaults
+  }
+
+  let priceAtomic: string;
+  try {
+    priceAtomic = usdToAtomicUsdc(defaultPriceUsd);
+  } catch {
+    return c.json({ error: "invalid_price" }, 400);
+  }
+
+  const syncHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+    "MCP-Protocol-Version": "2026-07-28",
+    "Mcp-Method": "tools/list"
+  };
+
+  if (tenant.upstream_auth_secret && tenant.upstream_auth_type !== "none") {
+    const decryptedSecret = await decryptSecretAtRest(tenant.upstream_auth_secret, c.env.JWT_SECRET);
+    if (tenant.upstream_auth_type === "bearer") {
+      syncHeaders["Authorization"] = `Bearer ${decryptedSecret}`;
+    } else if (
+      tenant.upstream_auth_type === "api_key_header" &&
+      tenant.upstream_auth_header &&
+      isValidCustomAuthHeaderName(tenant.upstream_auth_header)
+    ) {
+      syncHeaders[tenant.upstream_auth_header.trim()] = decryptedSecret;
+    }
   }
 
   const targetUrl = new URL(mcpPath, `${tenant.upstream_base_url}/`);
   try {
     const res = await fetch(targetUrl.toString(), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "MCP-Protocol-Version": "2026-07-28",
-        "Mcp-Method": "tools/list"
-      },
+      headers: syncHeaders,
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
       redirect: "error",
       signal: AbortSignal.timeout(10_000)
@@ -1292,7 +1397,7 @@ apiRoutes.post("/tenants/:id/tools", async (c) => {
   const tenantId = c.req.param("id");
 
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{ id: string; subdomain: string }>();
@@ -1346,7 +1451,7 @@ apiRoutes.delete("/tenants/:id/tools/:toolId", async (c) => {
   const toolId = c.req.param("toolId");
 
   const tenant = await c.env.DB.prepare(
-    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? LIMIT 1"
+    "SELECT id, subdomain FROM tenants WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1"
   )
     .bind(tenantId, user.id)
     .first<{ id: string; subdomain: string }>();
@@ -1379,7 +1484,8 @@ apiRoutes.get("/ledger", async (c) => {
       .first<{ total_calls: number; total_atomic: number; total_usd: number; total_latency_ms: number }>(),
     c.env.DB.prepare(
       `SELECT tx.id, tx.tenant_id, t.subdomain AS tenant_subdomain, tx.tool_name, tx.payer_wallet,
-              tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status, tx.latency_ms, tx.created_at
+              tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status, tx.latency_ms,
+              tx.tap_agent_id, tx.created_at
        FROM transactions tx
        INNER JOIN tenants t ON t.id = tx.tenant_id
        WHERE t.user_id = ?
@@ -1462,7 +1568,10 @@ apiRoutes.post("/keys", async (c) => {
       if (filtered.length > 0) scopes = filtered.join(",");
     }
     if (typeof body.expires_in_days === "number" && body.expires_in_days >= 1 && body.expires_in_days <= 365) {
-      expiresAt = new Date(Date.now() + body.expires_in_days * 86_400_000).toISOString();
+      expiresAt = new Date(Date.now() + body.expires_in_days * 86_400_000)
+        .toISOString()
+        .replace("T", " ")
+        .slice(0, 19);
     }
   } catch {
     // Use default name

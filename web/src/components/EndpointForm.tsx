@@ -10,6 +10,7 @@ import {
   Plus,
   RefreshCw,
   Send,
+  ShieldCheck,
   Trash2,
   X
 } from "lucide-react";
@@ -47,6 +48,8 @@ export interface TenantItem {
   upstream_auth_type?: "none" | "bearer" | "api_key_header";
   upstream_auth_header?: string | null;
   has_upstream_auth_secret?: boolean;
+  upstream_verified?: number;
+  require_upstream_verified?: number;
   require_visa_tap?: number;
   allow_tap_simulated?: number;
   cf_access_team_domain?: string | null;
@@ -74,6 +77,8 @@ interface DraftState {
   mcpMode: "direct" | "codemode" | "openapi_codemode";
   codemodePriceUsd: string;
   codemodeMaxSubcalls: string;
+  requireVisaTap: boolean;
+  allowTapSimulated: boolean;
   toolName: string;
   toolDescription: string;
   toolMethod: "GET" | "POST" | "PUT" | "DELETE";
@@ -92,6 +97,8 @@ const EMPTY_DRAFT: DraftState = {
   mcpMode: "direct",
   codemodePriceUsd: "0.01",
   codemodeMaxSubcalls: "10",
+  requireVisaTap: false,
+  allowTapSimulated: false,
   toolName: "",
   toolDescription: "",
   toolMethod: "POST",
@@ -104,7 +111,12 @@ function loadDraft(): DraftState {
   try {
     const raw = sessionStorage.getItem(DRAFT_KEY);
     if (raw) {
-      return { ...EMPTY_DRAFT, ...(JSON.parse(raw) as Partial<DraftState>) };
+      const parsed = JSON.parse(raw) as Partial<DraftState>;
+      return {
+        ...EMPTY_DRAFT,
+        ...parsed,
+        extraWallets: Array.isArray(parsed.extraWallets) ? parsed.extraWallets : []
+      };
     }
   } catch {
     // ignore storage errors
@@ -121,6 +133,9 @@ export function EndpointForm({
   const [draft, setDraft] = useState<DraftState>(loadDraft);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [verifyingTenantId, setVerifyingTenantId] = useState<string | null>(null);
+  const [deletingToolId, setDeletingToolId] = useState<string | null>(null);
   const [createdSecret, setCreatedSecret] = useState<{
     subdomain: string;
     secret: string;
@@ -143,6 +158,7 @@ export function EndpointForm({
     upstream_auth_header: string;
     upstream_auth_secret: string;
     has_upstream_auth_secret: boolean;
+    require_upstream_verified: boolean;
     require_visa_tap: boolean;
     allow_tap_simulated: boolean;
     auth_mode: "x402" | "x402+oauth_v2";
@@ -161,6 +177,7 @@ export function EndpointForm({
     upstream_auth_header: "X-API-Key",
     upstream_auth_secret: "",
     has_upstream_auth_secret: false,
+    require_upstream_verified: false,
     require_visa_tap: false,
     allow_tap_simulated: false,
     auth_mode: "x402",
@@ -260,6 +277,8 @@ export function EndpointForm({
           mcp_mode: draft.mcpMode,
           codemode_price_usd: draft.codemodePriceUsd.trim() || "0.01",
           codemode_max_subcalls: Number(draft.codemodeMaxSubcalls) || 10,
+          require_visa_tap: draft.requireVisaTap ? 1 : 0,
+          allow_tap_simulated: draft.allowTapSimulated ? 1 : 0,
           initial_tool: draft.toolName.trim()
             ? {
                 name: draft.toolName.trim(),
@@ -301,6 +320,7 @@ export function EndpointForm({
   };
 
   const startEditTenant = (t: TenantItem) => {
+    setEditError(null);
     setEditingTenantId(t.id);
     const extras = (t.payout_wallets ?? []).filter((w) => w.network !== t.network);
     setTenantEdit({
@@ -316,6 +336,7 @@ export function EndpointForm({
       upstream_auth_header: t.upstream_auth_header ?? "X-API-Key",
       upstream_auth_secret: "",
       has_upstream_auth_secret: Boolean(t.has_upstream_auth_secret),
+      require_upstream_verified: t.require_upstream_verified === 1,
       require_visa_tap: t.require_visa_tap === 1,
       allow_tap_simulated: t.allow_tap_simulated === 1,
       auth_mode: t.auth_mode ?? "x402",
@@ -325,42 +346,89 @@ export function EndpointForm({
   };
 
   const saveEditTenant = async (tenantId: string) => {
-    setError(null);
-    const cleanedExtras = tenantEdit.extra_wallets.filter((w) => w.address.trim().length > 0);
-    const res = await fetch(`/api/tenants/${tenantId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: tenantEdit.name,
-        upstream_base_url: tenantEdit.upstream_base_url,
-        payout_wallet: tenantEdit.payout_wallet,
-        network: tenantEdit.network,
-        payout_wallets: cleanedExtras,
-        mcp_mode: tenantEdit.mcp_mode,
-        codemode_price_usd: tenantEdit.codemode_price_usd,
-        codemode_max_subcalls: tenantEdit.codemode_max_subcalls,
-        upstream_auth_type: tenantEdit.upstream_auth_type,
-        upstream_auth_header:
-          tenantEdit.upstream_auth_type === "api_key_header"
-            ? tenantEdit.upstream_auth_header.trim()
-            : null,
-        ...(tenantEdit.upstream_auth_secret.trim().length > 0
-          ? { upstream_auth_secret: tenantEdit.upstream_auth_secret.trim() }
-          : {}),
-        require_visa_tap: tenantEdit.require_visa_tap ? 1 : 0,
-        allow_tap_simulated: tenantEdit.allow_tap_simulated ? 1 : 0,
-        auth_mode: tenantEdit.auth_mode,
-        cf_access_team_domain: tenantEdit.cf_access_team_domain.trim() || null,
-        cf_access_aud: tenantEdit.cf_access_aud.trim() || null
-      })
-    });
-    if (!res.ok) {
-      const err = (await res.json()) as { message?: string; error?: string };
-      setError(err.message || err.error || "Failed to update endpoint");
+    setEditError(null);
+    const trimmedName = tenantEdit.name.trim();
+    if (!trimmedName) {
+      setEditError("Display Name is required.");
       return;
     }
-    setEditingTenantId(null);
-    await onRefresh();
+    const trimmedUpstream = tenantEdit.upstream_base_url.trim();
+    if (trimmedUpstream !== "internal://sandbox" && !trimmedUpstream.startsWith("https://")) {
+      setEditError("Upstream Base URL must start with https:// (or internal://sandbox for demo).");
+      return;
+    }
+    if (!isValidWalletAddress(tenantEdit.network, tenantEdit.payout_wallet)) {
+      setEditError(
+        getNetworkFamily(tenantEdit.network) === "solana"
+          ? "Primary payout wallet must be a valid Solana Base58 address."
+          : "Primary payout wallet must be a valid 0x EVM address."
+      );
+      return;
+    }
+    const cleanedExtras = tenantEdit.extra_wallets.filter((w) => w.address.trim().length > 0);
+    for (const extra of cleanedExtras) {
+      if (!isValidWalletAddress(extra.network, extra.address)) {
+        setEditError(
+          `Invalid payout wallet address for ${getNetworkOption(extra.network)?.shortLabel ?? extra.network}.`
+        );
+        return;
+      }
+    }
+    if (
+      tenantEdit.upstream_auth_type === "api_key_header" &&
+      tenantEdit.upstream_auth_header.trim().length < 2
+    ) {
+      setEditError("Custom auth header name must be at least 2 characters.");
+      return;
+    }
+    if (tenantEdit.auth_mode === "x402+oauth_v2") {
+      if (!tenantEdit.cf_access_team_domain.trim() || tenantEdit.cf_access_aud.trim().length < 16) {
+        setEditError(
+          "Cloudflare One Access requires both <team>.cloudflareaccess.com and an AUD tag (>= 16 chars)."
+        );
+        return;
+      }
+    }
+
+    try {
+      const res = await fetch(`/api/tenants/${tenantId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: trimmedName,
+          upstream_base_url: trimmedUpstream,
+          payout_wallet: tenantEdit.payout_wallet.trim(),
+          network: tenantEdit.network,
+          payout_wallets: cleanedExtras,
+          mcp_mode: tenantEdit.mcp_mode,
+          codemode_price_usd: tenantEdit.codemode_price_usd,
+          codemode_max_subcalls: tenantEdit.codemode_max_subcalls,
+          upstream_auth_type: tenantEdit.upstream_auth_type,
+          upstream_auth_header:
+            tenantEdit.upstream_auth_type === "api_key_header"
+              ? tenantEdit.upstream_auth_header.trim()
+              : null,
+          ...(tenantEdit.upstream_auth_secret.trim().length > 0
+            ? { upstream_auth_secret: tenantEdit.upstream_auth_secret.trim() }
+            : {}),
+          require_upstream_verified: tenantEdit.require_upstream_verified ? 1 : 0,
+          require_visa_tap: tenantEdit.require_visa_tap ? 1 : 0,
+          allow_tap_simulated: tenantEdit.allow_tap_simulated ? 1 : 0,
+          auth_mode: tenantEdit.auth_mode,
+          cf_access_team_domain: tenantEdit.cf_access_team_domain.trim() || null,
+          cf_access_aud: tenantEdit.cf_access_aud.trim() || null
+        })
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        setEditError(err.message || err.error || `Failed to update endpoint (${res.status})`);
+        return;
+      }
+      setEditingTenantId(null);
+      await onRefresh();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Network error while updating endpoint.");
+    }
   };
 
   const runOpenApiImport = async () => {
@@ -395,69 +463,153 @@ export function EndpointForm({
   };
 
   const rotateSecret = async (tenant: TenantItem) => {
-    const res = await fetch(`/api/tenants/${tenant.id}/rotate-secret`, { method: "POST" });
-    if (res.ok) {
+    setEditError(null);
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}/rotate-secret`, { method: "POST" });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        setEditError(err.message || err.error || `Failed to rotate HMAC secret (${res.status})`);
+        return;
+      }
       const data = (await res.json()) as { upstream_signing_secret: string };
       setCreatedSecret({ subdomain: tenant.subdomain, secret: data.upstream_signing_secret });
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to rotate HMAC secret.");
+    }
+  };
+
+  const verifyUpstreamDomain = async (tenant: TenantItem) => {
+    setEditError(null);
+    setVerifyingTenantId(tenant.id);
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}/verify-upstream`, { method: "POST" });
+      const data = (await res.json().catch(() => ({}))) as {
+        verified?: boolean;
+        error?: string;
+        status?: number;
+      };
+      setLiveProbe({ tenantId: tenant.id, output: JSON.stringify(data, null, 2) });
+      if (!res.ok || !data.verified) {
+        setEditError(
+          `Domain verification failed (${data.error || `HTTP ${res.status}`}). Host your token at ${tenant.upstream_base_url}/.well-known/port4-verification.txt.`
+        );
+        return;
+      }
+      await onRefresh();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Domain verification request failed.");
+    } finally {
+      setVerifyingTenantId(null);
     }
   };
 
   const syncMcpTools = async (tenant: TenantItem) => {
+    setEditError(null);
     setLiveProbe({ tenantId: tenant.id, output: "Syncing tools/list from upstream MCP server..." });
-    const res = await fetch(`/api/tenants/${tenant.id}/sync-mcp`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ default_price_usd: "0.005" })
-    });
-    const data = await res.json();
-    setLiveProbe({ tenantId: tenant.id, output: JSON.stringify(data, null, 2) });
-    if (res.ok) await onRefresh();
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}/sync-mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ default_price_usd: "0.005" })
+      });
+      const data = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+      setLiveProbe({ tenantId: tenant.id, output: JSON.stringify(data, null, 2) });
+      if (!res.ok) {
+        setEditError(data.message || data.error || `Failed to sync MCP tools (${res.status})`);
+        return;
+      }
+      await onRefresh();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Sync MCP failed";
+      setEditError(msg);
+      setLiveProbe({ tenantId: tenant.id, output: msg });
+    }
   };
 
   const saveEditTool = async () => {
     if (!editingTool) return;
+    setEditError(null);
     try {
       JSON.parse(editingTool.input_schema_json || "{}");
     } catch {
-      setError("Tool Input JSON Schema must be valid JSON.");
+      setEditError("Tool Input JSON Schema must be valid JSON.");
       return;
     }
-    const res = await fetch(`/api/tenants/${editingTool.tenantId}/tools/${editingTool.toolId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: editingTool.name,
-        description: editingTool.description,
-        http_method: editingTool.http_method,
-        upstream_path: editingTool.upstream_path,
-        price_usd: editingTool.price_usd,
-        input_schema_json: editingTool.input_schema_json
-      })
-    });
-    if (!res.ok) {
-      const err = (await res.json()) as { error?: string };
-      setError(err.error || "Failed to update tool");
-      return;
+    try {
+      const res = await fetch(`/api/tenants/${editingTool.tenantId}/tools/${editingTool.toolId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: editingTool.name,
+          description: editingTool.description,
+          http_method: editingTool.http_method,
+          upstream_path: editingTool.upstream_path,
+          price_usd: editingTool.price_usd,
+          input_schema_json: editingTool.input_schema_json
+        })
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        setEditError(err.message || err.error || `Failed to update tool (${res.status})`);
+        return;
+      }
+      setEditingTool(null);
+      await onRefresh();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to update tool.");
     }
-    setEditingTool(null);
-    await onRefresh();
+  };
+
+  const handleDeleteTool = async (tenantId: string, toolId: string, toolName: string) => {
+    if (!window.confirm(`Delete tool '${toolName}' from this endpoint?`)) return;
+    setEditError(null);
+    setDeletingToolId(toolId);
+    try {
+      const res = await fetch(`/api/tenants/${tenantId}/tools/${toolId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        setEditError(err.message || err.error || `Failed to delete tool (${res.status})`);
+        return;
+      }
+      setEditingTool(null);
+      await onRefresh();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to delete tool.");
+    } finally {
+      setDeletingToolId(null);
+    }
   };
 
   const handleAddTool = async (tenantId: string) => {
-    if (!newTool.name.trim() || !newTool.upstream_path.trim()) return;
-    const res = await fetch(`/api/tenants/${tenantId}/tools`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: newTool.name.trim(),
-        description: newTool.description.trim() || `Paid MCP tool ${newTool.name.trim()}`,
-        http_method: newTool.http_method,
-        upstream_path: newTool.upstream_path.trim(),
-        price_usd: newTool.price_usd.trim() || "0.002",
-        input_schema_json: newTool.input_schema_json.trim() || '{"type":"object","properties":{}}'
-      })
-    });
-    if (res.ok) {
+    setEditError(null);
+    if (!newTool.name.trim() || !newTool.upstream_path.trim()) {
+      setEditError("Tool name and upstream path are required.");
+      return;
+    }
+    try {
+      JSON.parse(newTool.input_schema_json || "{}");
+    } catch {
+      setEditError("New tool Input JSON Schema must be valid JSON.");
+      return;
+    }
+    try {
+      const res = await fetch(`/api/tenants/${tenantId}/tools`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: newTool.name.trim(),
+          description: newTool.description.trim() || `Paid MCP tool ${newTool.name.trim()}`,
+          http_method: newTool.http_method,
+          upstream_path: newTool.upstream_path.trim(),
+          price_usd: newTool.price_usd.trim() || "0.002",
+          input_schema_json: newTool.input_schema_json.trim() || '{"type":"object","properties":{}}'
+        })
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        setEditError(err.message || err.error || `Failed to add tool (${res.status})`);
+        return;
+      }
       setNewTool({
         name: "",
         description: "",
@@ -468,12 +620,27 @@ export function EndpointForm({
       });
       setAddingToolFor(null);
       await onRefresh();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to add tool.");
     }
   };
 
-  const handleDelete = async (id: string) => {
-    await fetch(`/api/tenants/${id}`, { method: "DELETE" });
-    await onRefresh();
+  const handleDelete = async (tenant: TenantItem) => {
+    if (!window.confirm(`Archive endpoint '${tenant.name}' (${tenant.subdomain})?`)) {
+      return;
+    }
+    setEditError(null);
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        setEditError(err.message || err.error || `Failed to archive endpoint (${res.status})`);
+        return;
+      }
+      await onRefresh();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to archive endpoint.");
+    }
   };
 
   const copyMcpConfig = (tenant: TenantItem) => {
@@ -573,6 +740,19 @@ export function EndpointForm({
             Verify <code className="font-mono">X-Port4-Signature: v1=&lt;hmac_sha256&gt;</code> &amp;{" "}
             <code className="font-mono">X-Port4-Timestamp</code> on your origin so unauthenticated traffic cannot bypass x402.
           </p>
+          {createdSecret.verifyUrl && createdSecret.verifyToken && (
+            <div className="rounded-xl bg-white border border-zinc-200 p-3 flex flex-col gap-1.5">
+              <div className="text-[11px] font-semibold text-zinc-800">
+                Upstream Domain Verification (optional, shown for origin trust)
+              </div>
+              <div className="font-mono text-[11px] text-zinc-600 break-all">
+                Host at <span className="text-zinc-900">{createdSecret.verifyUrl}</span>:
+              </div>
+              <code className="font-mono text-xs bg-zinc-50 border border-zinc-200 rounded px-2.5 py-1.5 break-all text-zinc-900">
+                {createdSecret.verifyToken}
+              </code>
+            </div>
+          )}
         </div>
       )}
 
@@ -791,6 +971,28 @@ export function EndpointForm({
                 </label>
               </div>
             )}
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-zinc-50 border border-zinc-200 px-3 py-2">
+              <label className="inline-flex items-center gap-2 font-mono text-[11px] text-zinc-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={draft.requireVisaTap}
+                  onChange={(e) => updateDraft("requireVisaTap", e.target.checked)}
+                  className="accent-[#F6821F]"
+                />
+                <span>Require Visa TAP Verified Agent</span>
+              </label>
+              {draft.requireVisaTap && (
+                <label className="inline-flex items-center gap-1.5 font-mono text-[11px] text-zinc-600 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={draft.allowTapSimulated}
+                    onChange={(e) => updateDraft("allowTapSimulated", e.target.checked)}
+                    className="accent-[#F6821F]"
+                  />
+                  <span>Allow TAP Sandbox Keys</span>
+                </label>
+              )}
+            </div>
           </div>
 
           <div className="pt-2 border-t border-zinc-200 flex flex-col gap-2.5">
@@ -855,7 +1057,7 @@ export function EndpointForm({
           </div>
 
           {error && (
-            <div className="font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+            <div role="alert" className="font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
               {error}
             </div>
           )}
@@ -872,6 +1074,22 @@ export function EndpointForm({
 
         {/* Active Endpoints List */}
         <div className="lg:col-span-7 flex flex-col gap-3 min-w-0">
+          {editError && (
+            <div
+              role="alert"
+              className="font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-2"
+            >
+              <span>{editError}</span>
+              <button
+                type="button"
+                aria-label="Dismiss error"
+                onClick={() => setEditError(null)}
+                className="text-rose-500 hover:text-rose-800 cursor-pointer shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
           {tenants.length === 0 ? (
             <div className="cf-card rounded-2xl p-8 text-center font-mono text-xs text-zinc-500">
               No endpoints yet. Create one to get your live MCP URL, HMAC signing secret, and client config.
@@ -881,6 +1099,13 @@ export function EndpointForm({
               const netInfo = getNetworkOption(tenant.network);
               const isMainnet = netInfo?.isMainnet ?? false;
               const extraChainCount = Math.max(0, (tenant.payout_wallets?.length ?? 1) - 1);
+              const netBadgeText = netInfo
+                ? tenant.network === "eip155:4217"
+                  ? "Tempo OUSD · Mainnet"
+                  : tenant.network === "eip155:42431"
+                    ? "Tempo OUSD · Testnet"
+                    : `${netInfo.shortLabel} · ${isMainnet ? "Real USDC" : "Testnet"}`
+                : tenant.network;
               return (
                 <div key={tenant.id} className="cf-card rounded-2xl p-4 flex flex-col gap-3 min-w-0">
                   <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
@@ -895,9 +1120,7 @@ export function EndpointForm({
                               : "bg-[#F6821F]/10 text-[#C25906] border-[#F6821F]/25"
                           }`}
                         >
-                          {netInfo
-                            ? `${netInfo.shortLabel} · ${isMainnet ? "Real USDC" : "Testnet"}`
-                            : tenant.network}
+                          {netBadgeText}
                         </span>
                         {extraChainCount > 0 && (
                           <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-zinc-100 text-zinc-700 border-zinc-200">
@@ -917,6 +1140,12 @@ export function EndpointForm({
                         {tenant.require_visa_tap === 1 && (
                           <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-indigo-50 text-indigo-700 border-indigo-200">
                             Visa TAP Verified
+                          </span>
+                        )}
+                        {tenant.upstream_verified === 1 && (
+                          <span className="inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border bg-emerald-50 text-emerald-700 border-emerald-200">
+                            <ShieldCheck className="w-3 h-3" />
+                            Domain Verified
                           </span>
                         )}
                       </div>
@@ -983,7 +1212,7 @@ export function EndpointForm({
                       {tenant.subdomain !== "demo" && (
                         <button
                           type="button"
-                          onClick={() => handleDelete(tenant.id)}
+                          onClick={() => void handleDelete(tenant)}
                           className="inline-flex items-center justify-center min-w-[38px] min-h-[38px] sm:min-w-[30px] sm:min-h-[30px] rounded-lg text-zinc-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer"
                           title="Delete endpoint"
                         >
@@ -1268,6 +1497,38 @@ export function EndpointForm({
                           )}
                         </div>
 
+                        {tenant.upstream_base_url !== "internal://sandbox" && (
+                          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white border border-zinc-200 px-3 py-2">
+                            <label className="inline-flex items-center gap-2 font-mono text-xs text-zinc-800 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={tenantEdit.require_upstream_verified}
+                                onChange={(e) =>
+                                  setTenantEdit((p) => ({
+                                    ...p,
+                                    require_upstream_verified: e.target.checked
+                                  }))
+                                }
+                                className="accent-[#F6821F]"
+                              />
+                              <span>Require Verified Upstream Domain</span>
+                            </label>
+                            <button
+                              type="button"
+                              disabled={verifyingTenantId === tenant.id}
+                              onClick={() => void verifyUpstreamDomain(tenant)}
+                              className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 bg-zinc-50 px-2.5 py-1 font-mono text-[11px] text-zinc-700 hover:border-[#F6821F] cursor-pointer disabled:opacity-60"
+                            >
+                              <ShieldCheck className="w-3 h-3 text-[#F6821F]" />
+                              {verifyingTenantId === tenant.id
+                                ? "Verifying..."
+                                : tenant.upstream_verified === 1
+                                  ? "Re-Verify Domain"
+                                  : "Verify Domain"}
+                            </button>
+                          </div>
+                        )}
+
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                           <select
                             value={tenantEdit.auth_mode}
@@ -1517,10 +1778,25 @@ export function EndpointForm({
                         }
                         className="font-mono text-xs bg-white border border-zinc-300 rounded-lg p-2.5"
                       />
-                      <div className="flex justify-end">
+                      <div className="flex items-center justify-between gap-2">
                         <button
                           type="button"
-                          onClick={saveEditTool}
+                          disabled={deletingToolId === editingTool.toolId}
+                          onClick={() =>
+                            void handleDeleteTool(
+                              editingTool.tenantId,
+                              editingTool.toolId,
+                              editingTool.name
+                            )
+                          }
+                          className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 font-mono text-xs text-rose-700 hover:bg-rose-100 cursor-pointer disabled:opacity-60"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          {deletingToolId === editingTool.toolId ? "Deleting..." : "Delete Tool"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void saveEditTool()}
                           className="cf-btn-primary rounded-lg px-4 py-1.5 text-xs cursor-pointer"
                         >
                           Save Tool

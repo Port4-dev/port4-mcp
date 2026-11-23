@@ -1,4 +1,5 @@
 import { Activity, CheckCircle2, Clock, Coins, ExternalLink } from "lucide-react";
+import { isSafeHttpsUrl } from "../lib/wallets";
 
 export interface LedgerTransaction {
   id: string;
@@ -9,6 +10,7 @@ export interface LedgerTransaction {
   network: string;
   tx_hash: string;
   explorer_url?: string | null;
+  tap_agent_id?: string | null;
   status: string;
   latency_ms: number;
   created_at: string;
@@ -30,7 +32,7 @@ export function RevenueTable({ transactions, summary }: RevenueTableProps) {
         <MetricCard
           icon={<Coins className="w-4 h-4 text-[#F6821F]" />}
           label="Settled Revenue"
-          value={`$${summary.total_usd} USDC`}
+          value={`$${summary.total_usd} USDC/OUSD`}
         />
         <MetricCard
           icon={<Activity className="w-4 h-4 text-[#F6821F]" />}
@@ -73,7 +75,7 @@ export function RevenueTable({ transactions, summary }: RevenueTableProps) {
                     </td>
                     <td className="py-3 px-4 text-emerald-700 font-medium">${tx.amount_usd}</td>
                     <td className="py-3 px-4">
-                      {tx.status !== "sandbox_settled" && tx.explorer_url ? (
+                      {tx.status !== "sandbox_settled" && isSafeHttpsUrl(tx.explorer_url) && tx.explorer_url ? (
                         <a
                           href={tx.explorer_url}
                           target="_blank"
@@ -91,10 +93,20 @@ export function RevenueTable({ transactions, summary }: RevenueTableProps) {
                     </td>
                     <td className="py-3 px-4 text-zinc-500">{tx.latency_ms}ms</td>
                     <td className="py-3 px-4">
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px]">
-                        <CheckCircle2 className="w-3 h-3" />
-                        {tx.status}
-                      </span>
+                      <div className="inline-flex items-center gap-1.5">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px]">
+                          <CheckCircle2 className="w-3 h-3" />
+                          {tx.status}
+                        </span>
+                        {tx.tap_agent_id && (
+                          <span
+                            title={`Visa TAP Agent: ${tx.tap_agent_id}`}
+                            className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px]"
+                          >
+                            TAP
+                          </span>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))

@@ -22,6 +22,16 @@ import {
 } from "../lib/codemode";
 import { validateToolArguments } from "../lib/schema-validator";
 
+export class UpstreamHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message?: string) {
+    super(message ?? `Upstream service returned HTTP ${status}.`);
+    this.name = "UpstreamHttpError";
+    this.status = status;
+  }
+}
+
 export function interpolateUpstreamPath(
   pathTemplate: string,
   args: Record<string, unknown>
@@ -127,7 +137,7 @@ async function dispatchUpstreamTool(params: {
   }
 
   if (tenant.require_upstream_verified === 1 && tenant.upstream_verified !== 1) {
-    throw new Error("Upstream domain ownership is not verified for this tenant.");
+    throw new UpstreamHttpError(403, "Upstream domain ownership is not verified for this tenant.");
   }
 
   const isRemoteMcp = tool.source_type === "mcp";
@@ -230,7 +240,7 @@ async function dispatchUpstreamTool(params: {
         status: upstreamRes.status
       })
     );
-    throw new Error(`Upstream service returned HTTP ${upstreamRes.status}.`);
+    throw new UpstreamHttpError(upstreamRes.status);
   }
   if (contentType.includes("application/json")) {
     try {
@@ -328,6 +338,10 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       );
     }
 
+    const paymentFingerprint = c.get("paymentFingerprint");
+    const leaseToken = c.get("paymentLeaseToken") ?? "";
+    const tapVerified = c.get("tapVerified");
+
     // Validate tool arguments against JSON Schema BEFORE upstream execution
     const argCheck = validateToolArguments(tool.input_schema_json, mcp.arguments);
     if (!argCheck.ok) {
@@ -343,9 +357,9 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
 
     const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "LOCAL";
     const requestId = `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const idempotencyKey = c.get("paymentFingerprint") ?? receipt.transaction;
-    const tapVerified = c.get("tapVerified");
+    const idempotencyKey = paymentFingerprint ?? receipt.transaction;
     let upstreamResult: unknown;
+    let isToolError = false;
 
     const isCodeModeExec =
       (tenant.mcp_mode === "codemode" && mcp.toolName === "code") ||
@@ -373,43 +387,25 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       });
 
       if (!execOutcome.ok) {
-        return c.json(
-          {
-            jsonrpc: "2.0",
-            id: mcp.rpcId,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify(
-                    {
-                      error: execOutcome.error,
-                      logs: execOutcome.logs ?? [],
-                      subcalls: execOutcome.subcalls,
-                      consumedAtomic: execOutcome.consumedAtomic
-                    },
-                    null,
-                    2
-                  )
-                }
-              ],
-              isError: true
-            }
-          },
-          200
-        );
-      }
-
-      upstreamResult = {
-        result: execOutcome.result,
-        ...(execOutcome.logs && execOutcome.logs.length > 0 ? { logs: execOutcome.logs } : {}),
-        _codemode: {
+        isToolError = true;
+        upstreamResult = {
+          error: execOutcome.error,
+          logs: execOutcome.logs ?? [],
           subcalls: execOutcome.subcalls,
-          consumedAtomic: execOutcome.consumedAtomic,
-          authorizedAtomic: tool.price_atomic,
-          mode: tenant.mcp_mode
-        }
-      };
+          consumedAtomic: execOutcome.consumedAtomic
+        };
+      } else {
+        upstreamResult = {
+          result: execOutcome.result,
+          ...(execOutcome.logs && execOutcome.logs.length > 0 ? { logs: execOutcome.logs } : {}),
+          _codemode: {
+            subcalls: execOutcome.subcalls,
+            consumedAtomic: execOutcome.consumedAtomic,
+            authorizedAtomic: tool.price_atomic,
+            mode: tenant.mcp_mode
+          }
+        };
+      }
     } else {
       try {
         upstreamResult = await dispatchUpstreamTool({
@@ -432,20 +428,51 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
             error: err instanceof Error ? err.message : "unknown"
           })
         );
-        return c.json(
-          {
-            jsonrpc: "2.0",
-            id: mcp.rpcId,
-            error: { code: -32000, message: "Upstream service is unavailable." }
-          },
-          502
-        );
+
+        const isDeterministic4xx =
+          err instanceof UpstreamHttpError &&
+          err.status >= 400 &&
+          err.status < 500 &&
+          err.status !== 408 &&
+          err.status !== 429;
+
+        if (isDeterministic4xx) {
+          isToolError = true;
+          upstreamResult = {
+            error: "upstream_client_error",
+            status: err.status,
+            message: err.message
+          };
+        } else {
+          // Transient 5xx / 429 / 408 / network timeout: clear in-flight lease age so caller can immediately retry upstream without re-settling
+          if (paymentFingerprint && leaseToken) {
+            const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
+              c.env.PAYMENT_REPLAY_GUARD.idFromName(paymentFingerprint)
+            );
+            await replayStub
+              .fetch("https://payment-replay/mark_upstream_failed", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  operation: "mark_upstream_failed",
+                  leaseToken
+                })
+              })
+              .catch(() => {});
+          }
+          return c.json(
+            {
+              jsonrpc: "2.0",
+              id: mcp.rpcId,
+              error: { code: -32000, message: "Upstream service is unavailable." }
+            },
+            502
+          );
+        }
       }
     }
 
     const latencyMs = Math.max(1, Date.now() - startedAt);
-    const paymentFingerprint = c.get("paymentFingerprint");
-    const leaseToken = c.get("paymentLeaseToken") ?? "";
     // Deterministic event ID per payment authorization prevents duplicate financial rows across retries
     const txId = paymentFingerprint
       ? `tx_${paymentFingerprint.slice(0, 24)}`
@@ -462,7 +489,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
             text: JSON.stringify(upstreamResult, null, 2)
           }
         ],
-        isError: false,
+        isError: isToolError,
         _meta: {
           x402: {
             txHash: receipt.transaction,
@@ -496,7 +523,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       });
     }
 
-    // 2. Enqueue authoritative idempotent metering event
+    // 2. Enqueue authoritative idempotent metering event (including Visa TAP agentId if present)
     const meteringEvent: MeteringEvent = {
       id: txId,
       tenantId: tenant.id,
@@ -510,6 +537,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       latencyMs,
       status,
       isPlatformFee: receipt.isPlatformFee,
+      tapAgentId: tapVerified?.agentId ?? null,
       occurredAt: new Date().toISOString()
     };
 

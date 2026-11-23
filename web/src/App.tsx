@@ -94,11 +94,19 @@ export default function App() {
       name: string;
       key_prefix: string;
       scopes?: string;
+      expires_at: string | null;
       created_at: string;
       last_used_at: string | null;
     }>
   >([]);
   const [newApiKey, setNewApiKey] = useState<string | null>(null);
+  const [keyCopied, setKeyCopied] = useState(false);
+  const [keyName, setKeyName] = useState("CLI Deploy Key");
+  const [keyScopes, setKeyScopes] = useState<string[]>(["tenant:read", "tenant:write"]);
+  const [expiresInDays, setExpiresInDays] = useState<string>("");
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [creatingKey, setCreatingKey] = useState(false);
+  const [revokingKeyId, setRevokingKeyId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   const navigate = useCallback((next: Exclude<PageView, "notfound">) => {
@@ -131,6 +139,7 @@ export default function App() {
       setAuth({ ...meJson, loaded: true });
 
       // Only fetch heavier data when on views that actually display it (saves 3G bandwidth on `/`)
+      if (view === "home") return;
       if (view === "docs") {
         const featRes = await fetch("/api/public/featured", { signal: controller.signal });
         if (featRes.ok) {
@@ -165,6 +174,7 @@ export default function App() {
                 name: string;
                 key_prefix: string;
                 scopes?: string;
+                expires_at: string | null;
                 created_at: string;
                 last_used_at: string | null;
               }>;
@@ -172,6 +182,10 @@ export default function App() {
             setApiKeys(kJson.keys);
           }
         } else {
+          setTenants([]);
+          setApiKeys([]);
+          setNewApiKey(null);
+          setKeyError(null);
           const pubRes = await fetch("/api/public/ledger", { signal: controller.signal });
           if (pubRes.ok) {
             const pubJson = (await pubRes.json()) as { transactions: LedgerTransaction[] };
@@ -205,37 +219,106 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await fetch("/api/auth/logout", { method: "POST" });
-    setTenants([]);
-    setMobileMenuOpen(false);
-    if (view === "admin") navigate("home");
-    await loadData();
-  };
-
-  const handleCreateApiKey = async () => {
-    if (!auth.authenticated) {
-      await requireAuthentication();
-    }
-    const res = await fetch("/api/keys", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "CLI Deploy Key" })
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { secret: string };
-      setNewApiKey(data.secret);
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } finally {
+      setTenants([]);
+      setApiKeys([]);
+      setNewApiKey(null);
+      setKeyError(null);
+      setMobileMenuOpen(false);
+      if (view === "admin") navigate("home");
       await loadData();
     }
   };
 
+  const toggleKeyScope = (scope: string) => {
+    setKeyScopes((prev) =>
+      prev.includes(scope) ? prev.filter((s) => s !== scope) : [...prev, scope]
+    );
+  };
+
+  const handleCreateApiKey = async () => {
+    setKeyError(null);
+    if (!auth.authenticated) {
+      if (auth.githubConfigured) {
+        window.location.assign("/api/auth/github");
+        return;
+      }
+      setKeyError("Sign in with GitHub to generate scoped API keys.");
+      return;
+    }
+    if (keyScopes.length === 0) {
+      setKeyError("Select at least one API key scope.");
+      return;
+    }
+    setCreatingKey(true);
+    try {
+      const payload: {
+        name: string;
+        scopes: string[];
+        expires_in_days?: number;
+      } = {
+        name: keyName.trim() || "CLI Deploy Key",
+        scopes: keyScopes
+      };
+      if (expiresInDays) {
+        payload.expires_in_days = Number(expiresInDays);
+      }
+      const res = await fetch("/api/keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        secret?: string;
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.secret) {
+        throw new Error(data.message || data.error || `Failed to create API key (${res.status})`);
+      }
+      setNewApiKey(data.secret);
+      setKeyCopied(false);
+      await loadData();
+    } catch (err) {
+      setKeyError(err instanceof Error ? err.message : "Failed to create API key.");
+    } finally {
+      setCreatingKey(false);
+    }
+  };
+
   const handleRevokeApiKey = async (id: string) => {
-    await fetch(`/api/keys/${id}`, { method: "DELETE" });
-    await loadData();
+    if (!window.confirm("Revoke this API key? Any CLI or CI job using it will lose access immediately.")) {
+      return;
+    }
+    setKeyError(null);
+    setRevokingKeyId(id);
+    try {
+      const res = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+        throw new Error(data.message || data.error || `Failed to revoke API key (${res.status})`);
+      }
+      await loadData();
+    } catch (err) {
+      setKeyError(err instanceof Error ? err.message : "Failed to revoke API key.");
+    } finally {
+      setRevokingKeyId(null);
+    }
+  };
+
+  const copyNewApiKey = () => {
+    if (!newApiKey) return;
+    void navigator.clipboard.writeText(newApiKey);
+    setKeyCopied(true);
+    setTimeout(() => setKeyCopied(false), 1800);
   };
 
   const copyCurl = () => {
     const snippet = `curl -i -X POST https://port4.dev/mcp/demo \\
   -H "Content-Type: application/json" \\
+  -H "MCP-Protocol-Version: 2026-07-28" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping"}}'`;
     void navigator.clipboard.writeText(snippet);
     setCopied(true);
@@ -482,7 +565,7 @@ export default function App() {
         {view === "dashboard" && (
           <div className="flex flex-col gap-5 min-w-0">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-zinc-200 pb-3">
-              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
+              <div role="tablist" aria-label="Dashboard sections" className="flex items-center gap-1.5 overflow-x-auto pb-1 sm:pb-0">
                 <TabButton
                   active={tab === "endpoints"}
                   onClick={() => setTab("endpoints")}
@@ -545,6 +628,7 @@ export default function App() {
                     <pre className="font-mono text-[11px] leading-relaxed bg-[#18181B] border border-zinc-800 rounded-xl p-3.5 text-zinc-200 overflow-x-auto">
 {`curl -i -X POST https://port4.dev/mcp/demo \\
   -H "Content-Type: application/json" \\
+  -H "MCP-Protocol-Version: 2026-07-28" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping"}}'`}
                     </pre>
                   </div>
@@ -554,49 +638,137 @@ export default function App() {
                       <span className="text-sm font-semibold text-zinc-900">Scoped API Keys</span>
                       <button
                         type="button"
-                        onClick={handleCreateApiKey}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-[#F6821F]/40 bg-[#F6821F]/10 px-3 min-h-[40px] sm:min-h-[32px] text-xs font-medium text-[#C25906] hover:bg-[#F6821F]/20 cursor-pointer"
+                        disabled={creatingKey}
+                        onClick={() => void handleCreateApiKey()}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-[#F6821F]/40 bg-[#F6821F]/10 px-3 min-h-[40px] sm:min-h-[32px] text-xs font-medium text-[#C25906] hover:bg-[#F6821F]/20 cursor-pointer disabled:opacity-60"
                       >
                         <KeyRound className="w-3.5 h-3.5" />
-                        Generate
+                        {creatingKey ? "Generating..." : "Generate"}
                       </button>
                     </div>
-                    {newApiKey && (
-                      <div className="font-mono text-xs bg-orange-50/60 border border-[#F6821F]/40 rounded-xl p-3 text-zinc-900 break-all">
-                        <div className="text-[10px] font-semibold text-[#C25906] mb-1">
-                          New API Key (copy now — shown once):
-                        </div>
-                        {newApiKey}
+
+                    <div className="rounded-xl bg-zinc-50 border border-zinc-200 p-3 flex flex-col gap-2.5">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <input
+                          aria-label="API key name"
+                          value={keyName}
+                          onChange={(e) => setKeyName(e.target.value)}
+                          placeholder="CLI Deploy Key"
+                          maxLength={64}
+                          className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px] text-zinc-900 focus:outline-none focus:border-[#F6821F]"
+                        />
+                        <select
+                          aria-label="API key expiration"
+                          value={expiresInDays}
+                          onChange={(e) => setExpiresInDays(e.target.value)}
+                          className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px] text-zinc-800 focus:outline-none focus:border-[#F6821F]"
+                        >
+                          <option value="">No expiration</option>
+                          <option value="7">Expires in 7 days</option>
+                          <option value="30">Expires in 30 days</option>
+                          <option value="90">Expires in 90 days</option>
+                          <option value="365">Expires in 365 days</option>
+                        </select>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3 font-mono text-[11px] text-zinc-700">
+                        <span className="text-zinc-500">Scopes:</span>
+                        {(["tenant:read", "tenant:write", "ledger:read"] as const).map((scope) => (
+                          <label key={scope} className="inline-flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={keyScopes.includes(scope)}
+                              onChange={() => toggleKeyScope(scope)}
+                              className="accent-[#F6821F]"
+                            />
+                            <span>{scope}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {keyError && (
+                      <div
+                        role="alert"
+                        className="font-mono text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2"
+                      >
+                        {keyError}
                       </div>
                     )}
+
+                    {newApiKey && (
+                      <div className="font-mono text-xs bg-orange-50/60 border border-[#F6821F]/40 rounded-xl p-3 text-zinc-900 flex flex-col gap-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[10px] font-semibold text-[#C25906]">
+                            New API Key (copy now — shown once):
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={copyNewApiKey}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-[#F6821F]/35 bg-white text-[10px] text-[#C25906] hover:bg-orange-50 cursor-pointer"
+                            >
+                              {keyCopied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                              {keyCopied ? "Copied" : "Copy"}
+                            </button>
+                            <button
+                              type="button"
+                              aria-label="Dismiss API key"
+                              onClick={() => setNewApiKey(null)}
+                              className="p-0.5 text-zinc-500 hover:text-zinc-900 cursor-pointer"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                        <div className="break-all">{newApiKey}</div>
+                      </div>
+                    )}
+
                     <div className="flex flex-col gap-2">
                       {apiKeys.length === 0 ? (
                         <div className="font-mono text-xs bg-zinc-50 border border-zinc-200 rounded-xl p-3.5 text-zinc-500">
                           No active API keys. Click Generate to create a scoped key.
                         </div>
                       ) : (
-                        apiKeys.map((k) => (
-                          <div
-                            key={k.id}
-                            className="flex items-center justify-between gap-2 font-mono text-xs bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2"
-                          >
-                            <div className="min-w-0">
-                              <div className="text-zinc-900 font-medium truncate">
-                                {k.name} · <span className="text-zinc-500">{k.key_prefix}•••</span>
-                              </div>
-                              <div className="text-[10px] text-zinc-500">
-                                Scopes: {k.scopes ?? "tenant:read,tenant:write"}
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => void handleRevokeApiKey(k.id)}
-                              className="px-2.5 py-1 rounded border border-rose-200 bg-rose-50 text-rose-700 text-[11px] hover:bg-rose-100 cursor-pointer shrink-0"
+                        apiKeys.map((k) => {
+                          const isExpired = Boolean(
+                            k.expires_at && Number.isFinite(Date.parse(k.expires_at)) && Date.parse(k.expires_at) <= Date.now()
+                          );
+                          return (
+                            <div
+                              key={k.id}
+                              className="flex items-center justify-between gap-2 font-mono text-xs bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2"
                             >
-                              Revoke
-                            </button>
-                          </div>
-                        ))
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5 text-zinc-900 font-medium">
+                                  <span className="truncate">{k.name}</span>
+                                  <span className="text-zinc-400">·</span>
+                                  <span className="text-zinc-500">{k.key_prefix}•••</span>
+                                  {isExpired && (
+                                    <span className="px-1.5 py-0.5 rounded bg-rose-50 border border-rose-200 text-rose-700 text-[10px]">
+                                      Expired
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[10px] text-zinc-500">
+                                  Scopes: {k.scopes ?? "tenant:read,tenant:write"}
+                                </div>
+                                <div className="text-[10px] text-zinc-500">
+                                  {k.expires_at ? `Expires: ${k.expires_at.slice(0, 10)}` : "No expiration"} ·{" "}
+                                  {k.last_used_at ? `Last used: ${k.last_used_at.slice(0, 10)}` : "Never used"}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                disabled={revokingKeyId === k.id}
+                                onClick={() => void handleRevokeApiKey(k.id)}
+                                className="px-2.5 py-1 rounded border border-rose-200 bg-rose-50 text-rose-700 text-[11px] hover:bg-rose-100 cursor-pointer shrink-0 disabled:opacity-60"
+                              >
+                                {revokingKeyId === k.id ? "Revoking..." : "Revoke"}
+                              </button>
+                            </div>
+                          );
+                        })
                       )}
                     </div>
                   </div>
@@ -720,6 +892,7 @@ function NavLink({
   return (
     <a
       href={href}
+      aria-current={active ? "page" : undefined}
       onClick={(e) => {
         e.preventDefault();
         onNavigate();
@@ -750,6 +923,7 @@ function MobileNavLink({
   return (
     <a
       href={href}
+      aria-current={active ? "page" : undefined}
       onClick={(e) => {
         e.preventDefault();
         onNavigate();
@@ -789,6 +963,8 @@ function TabButton({
   return (
     <button
       type="button"
+      role="tab"
+      aria-selected={active}
       onClick={onClick}
       className={`inline-flex items-center gap-2 px-3.5 min-h-[42px] sm:min-h-[36px] rounded-lg text-xs font-medium whitespace-nowrap transition cursor-pointer ${
         active

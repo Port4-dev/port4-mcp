@@ -1,3 +1,5 @@
+import type { AppBindings } from "../types";
+
 export type NetworkFamily = "evm" | "solana";
 
 export interface SupportedNetwork {
@@ -142,7 +144,24 @@ export function isSupportedNetwork(networkId: string): boolean {
 }
 
 export function getNetworkFamily(networkId: string): NetworkFamily {
-  return NETWORK_BY_ID.get(networkId)?.family ?? (networkId.startsWith("solana:") ? "solana" : "evm");
+  const normalized = (networkId ?? "").trim();
+  return (
+    NETWORK_BY_ID.get(normalized)?.family ??
+    (normalized.startsWith("solana:") ? "solana" : "evm")
+  );
+}
+
+export function getNetworkTreasury(
+  env: Pick<AppBindings, "PORT4_TREASURY_WALLET" | "PORT4_TREASURY_SOLANA_WALLET">,
+  networkId: string
+): string | null {
+  const family = getNetworkFamily(networkId);
+  if (family === "solana") {
+    const sol = env.PORT4_TREASURY_SOLANA_WALLET?.trim();
+    return sol && SOLANA_ADDRESS_RE.test(sol) ? sol : null;
+  }
+  const evm = env.PORT4_TREASURY_WALLET?.trim();
+  return evm && EVM_ADDRESS_RE.test(evm) ? evm : null;
 }
 
 export function isValidWalletForNetwork(networkId: string, address: string): boolean {

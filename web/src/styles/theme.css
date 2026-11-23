@@ -30,7 +30,8 @@
   a,
   button,
   input,
-  select {
+  select,
+  textarea {
     touch-action: manipulation;
   }
 }

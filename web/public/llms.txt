@@ -1,15 +1,17 @@
 # Port4 (port4.dev)
 
-> Paid MCP gateway for monetizing any HTTP API per call with USDC via the x402 payment protocol.
+> Paid MCP gateway for monetizing any HTTP API per call with USDC or Tempo OUSD via the x402 v2 payment protocol, Visa Trusted Agent Protocol (TAP), and Cloudflare Code Mode.
 
 ## Overview
-Port4 turns REST APIs into pay-per-call Model Context Protocol (MCP) endpoints hosted at `https://{tenant}.port4.dev/mcp`. AI agents can discover tools and pay per invocation using HTTP 402 (`x402` v2) without creating an account.
+Port4 turns REST APIs, OpenAPI 3.x specs, or upstream MCP servers into pay-per-call Model Context Protocol (MCP) endpoints hosted at `https://{tenant}.port4.dev/mcp` (or `https://port4.dev/mcp/{tenant}`). AI agents discover tools and pay per invocation using HTTP 402 (`x402` v2 or Tempo OUSD MPP) without creating an account.
 
 ## Links
 - Homepage: https://port4.dev
 - Developer Docs: https://port4.dev/docs
 - Interactive Sandbox: https://port4.dev/sandbox
-- Console: https://port4.dev/console
+- Console / Dashboard: https://port4.dev/dashboard (alias `/console`)
+- OpenAPI Discovery (`x-payment-info`): `GET https://{tenant}.port4.dev/openapi.json` and `GET https://port4.dev/mcp/{tenant}/openapi.json`
+- CLI & STDIO Bridge: `npx -y port4-mcp` (`packages/port4-mcp`)
 - GitHub: https://github.com/Port4-dev
 - Contact: info@port4.dev
 
@@ -20,19 +22,56 @@ Port4 turns REST APIs into pay-per-call Model Context Protocol (MCP) endpoints h
   - `Content-Type: application/json`
   - `MCP-Protocol-Version: 2026-07-28`
   - `Mcp-Method: tools/list | tools/call`
-  - `Mcp-Name: <tool_name>` (required for `tools/call`)
-- Payment Protocol: x402 v2 (`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE` Base64 JSON headers)
-- Settlement Network: Base Sepolia (`eip155:84532`), USDC (`exact` scheme)
+  - `Mcp-Name: <tool_name>` (required for `tools/call`; use `code` in `codemode`, or `search` / `execute` in `openapi_codemode`)
+- Payment Protocols:
+  - **x402 v2 (`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE` Base64 JSON headers)**
+  - **Tempo OUSD MPP (`WWW-Authenticate: Payment`, `Authorization: Payment <b64url>`, `Payment-Receipt`)**
+- Optional Agent Identity & Access Control:
+  - **Visa Trusted Agent Protocol (TAP)**: `require_visa_tap` (with optional `allow_tap_simulated`) verifies RFC 9421 Ed25519 signatures (`Signature-Input`, `Signature`, `Content-Digest`, `Signature-Agent`) against `auth.visacli.sh` and forwards `X-Port4-Tap-Agent` upstream.
+  - **Cloudflare One Access (`x402+oauth_v2`)**: `Cf-Access-Jwt-Assertion` or `CF-Access-Client-Id` + `CF-Access-Client-Secret`.
+- Cloudflare Code Mode (`@cloudflare/codemode` + `LOADER`):
+  - `direct`: 1 tool = 1 paid call
+  - `codemode`: single `code` tool executing multi-step JavaScript inside an isolated Dynamic Worker (`globalOutbound: null`)
+  - `openapi_codemode`: `search` (free) + `execute` (paid)
+
+## Supported Settlement Networks (12 Chains via `GET /api/networks`)
+- **EVM Circle USDC (`exact` scheme, `0x...`):**
+  - Base Mainnet (`eip155:8453`)
+  - Base Sepolia (`eip155:84532`)
+  - Arbitrum One (`eip155:42161`)
+  - Arbitrum Sepolia (`eip155:421614`)
+  - Optimism (`eip155:10`)
+  - Polygon PoS (`eip155:137`)
+  - Ethereum Mainnet (`eip155:1`)
+  - Avalanche C-Chain (`eip155:43114`)
+- **Tempo OUSD (`exact` / MPP, `0x...`):**
+  - Tempo Mainnet (`eip155:4217`)
+  - Tempo Testnet (`eip155:42431`)
+- **Solana SPL USDC (`exact` scheme, Base58):**
+  - Solana Mainnet (`solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp`)
+  - Solana Devnet (`solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1`)
 
 ## Demo Endpoint
-- Endpoint: `https://port4.dev/sandbox/mcp` (or `https://demo.port4.dev/mcp`)
+- Endpoint: `https://port4.dev/mcp/demo` (also `https://demo.port4.dev/mcp` and `https://port4.dev/sandbox/mcp`)
 - Tools:
+  - `ping` ($0.001 USDC) — `{ "message": "hello port4" }`
   - `market_quote` ($0.001 USDC) — `{ "symbol": "ETH-USD" }`
   - `edge_dns_lookup` ($0.002 USDC) — `{ "domain": "port4.dev" }`
 
 ## Control Plane API (Developers)
-Authenticate with a Bearer API key (`Authorization: Bearer p4_live_...`):
+Authenticate with a scoped Bearer API key (`Authorization: Bearer p4_live_...`):
+- `GET https://port4.dev/api/networks` — List all 12 supported settlement networks
 - `GET https://port4.dev/api/tenants` — List your endpoints and tools
 - `POST https://port4.dev/api/tenants` — Create a paid MCP endpoint
+- `PATCH https://port4.dev/api/tenants/:id` — Update endpoint config, payout wallets, Code Mode, Visa TAP, or CF Access
+- `DELETE https://port4.dev/api/tenants/:id` — Archive an endpoint
+- `POST https://port4.dev/api/tenants/:id/verify-upstream` — Verify upstream domain via `/.well-known/port4-verification.txt`
+- `POST https://port4.dev/api/tenants/:id/rotate-secret` — Rotate upstream HMAC signing secret
+- `POST https://port4.dev/api/tenants/:id/import-openapi` — Import OpenAPI 3.x spec into tools
+- `POST https://port4.dev/api/tenants/:id/sync-mcp` — Sync tools from an upstream MCP server
+- `POST https://port4.dev/api/tenants/:id/test-call` — Execute an owner-authenticated upstream test call
 - `POST https://port4.dev/api/tenants/:id/tools` — Add a paid tool to an endpoint
+- `PATCH https://port4.dev/api/tenants/:id/tools/:toolId` — Update a tool
+- `DELETE https://port4.dev/api/tenants/:id/tools/:toolId` — Delete a tool
 - `GET https://port4.dev/api/ledger` — Fetch settled transactions and revenue summary
+- `GET/POST/DELETE https://port4.dev/api/keys` — Manage scoped API keys (`tenant:read`, `tenant:write`, `ledger:read`)
