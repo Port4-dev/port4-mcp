@@ -24,11 +24,14 @@ jobs:
           npm --prefix web ci
       - name: Typecheck Worker & SPA
         run: npm run typecheck
+      - name: Build Frontend SPA
+        run: npm run build:web
       - name: Run Conformance & Security Suite
         run: npm test
       - name: Run port4-mcp CLI Self-Test
         run: npm run test:cli
-      - name: Build Frontend SPA
-        run: npm run build:web
       - name: Run Local Workerd E2E Suite
-        run: npm run test:e2e
+        run: |
+          trap 'rm -f .dev.vars' EXIT
+          printf 'JWT_SECRET=%s\n' "$(openssl rand -hex 32)" > .dev.vars
+          npm run test:e2e
