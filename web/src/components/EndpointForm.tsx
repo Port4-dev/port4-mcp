@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Check,
   Coins,
@@ -27,7 +27,7 @@ export interface ToolItem {
   id: string;
   name: string;
   description: string;
-  http_method: "GET" | "POST" | "PUT" | "DELETE";
+  http_method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   upstream_path: string;
   input_schema_json: string;
   price_usd: string;
@@ -37,6 +37,11 @@ export interface TenantItem {
   id: string;
   subdomain: string;
   name: string;
+  status?: "active" | "suspended" | "archived";
+  call_count?: number;
+  rate_limit_rpm?: number;
+  daily_quota?: number;
+  webhook_url?: string | null;
   upstream_base_url: string;
   payout_wallet: string;
   payout_wallets?: PayoutWalletEntry[];
@@ -81,7 +86,7 @@ interface DraftState {
   allowTapSimulated: boolean;
   toolName: string;
   toolDescription: string;
-  toolMethod: "GET" | "POST" | "PUT" | "DELETE";
+  toolMethod: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   toolPath: string;
   priceUsd: string;
   inputSchemaJson: string;
@@ -132,6 +137,7 @@ export function EndpointForm({
 }: EndpointFormProps) {
   const [draft, setDraft] = useState<DraftState>(loadDraft);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
   const [verifyingTenantId, setVerifyingTenantId] = useState<string | null>(null);
@@ -164,6 +170,9 @@ export function EndpointForm({
     auth_mode: "x402" | "x402+oauth_v2";
     cf_access_team_domain: string;
     cf_access_aud: string;
+    rate_limit_rpm: number;
+    daily_quota: number;
+    webhook_url: string;
   }>({
     name: "",
     upstream_base_url: "",
@@ -182,7 +191,10 @@ export function EndpointForm({
     allow_tap_simulated: false,
     auth_mode: "x402",
     cf_access_team_domain: "",
-    cf_access_aud: ""
+    cf_access_aud: "",
+    rate_limit_rpm: 120,
+    daily_quota: 10000,
+    webhook_url: ""
   });
   const [openApiImport, setOpenApiImport] = useState<{
     tenantId: string;
@@ -197,7 +209,7 @@ export function EndpointForm({
     toolId: string;
     name: string;
     description: string;
-    http_method: "GET" | "POST" | "PUT" | "DELETE";
+    http_method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     upstream_path: string;
     price_usd: string;
     input_schema_json: string;
@@ -207,7 +219,7 @@ export function EndpointForm({
   const [newTool, setNewTool] = useState({
     name: "",
     description: "",
-    http_method: "POST" as "GET" | "POST" | "PUT" | "DELETE",
+    http_method: "POST" as "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
     upstream_path: "/v1/action",
     price_usd: "0.002",
     input_schema_json: '{"type":"object","properties":{}}'
@@ -236,6 +248,7 @@ export function EndpointForm({
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submittingRef.current) return;
     setError(null);
     if (!isValidWalletAddress(draft.network, draft.payoutWallet)) {
       setError(
@@ -259,6 +272,7 @@ export function EndpointForm({
       return;
     }
 
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       if (!authenticated) {
@@ -315,6 +329,7 @@ export function EndpointForm({
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create endpoint");
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -341,7 +356,10 @@ export function EndpointForm({
       allow_tap_simulated: t.allow_tap_simulated === 1,
       auth_mode: t.auth_mode ?? "x402",
       cf_access_team_domain: t.cf_access_team_domain ?? "",
-      cf_access_aud: t.cf_access_aud ?? ""
+      cf_access_aud: t.cf_access_aud ?? "",
+      rate_limit_rpm: t.rate_limit_rpm ?? 120,
+      daily_quota: t.daily_quota ?? 10000,
+      webhook_url: t.webhook_url ?? ""
     });
   };
 
@@ -416,7 +434,10 @@ export function EndpointForm({
           allow_tap_simulated: tenantEdit.allow_tap_simulated ? 1 : 0,
           auth_mode: tenantEdit.auth_mode,
           cf_access_team_domain: tenantEdit.cf_access_team_domain.trim() || null,
-          cf_access_aud: tenantEdit.cf_access_aud.trim() || null
+          cf_access_aud: tenantEdit.cf_access_aud.trim() || null,
+          rate_limit_rpm: tenantEdit.rate_limit_rpm,
+          daily_quota: tenantEdit.daily_quota,
+          webhook_url: tenantEdit.webhook_url.trim() || null
         })
       });
       if (!res.ok) {
@@ -1010,20 +1031,21 @@ export function EndpointForm({
               <select
                 value={draft.toolMethod}
                 onChange={(e) =>
-                  updateDraft("toolMethod", e.target.value as "GET" | "POST" | "PUT" | "DELETE")
+                  updateDraft("toolMethod", e.target.value as "GET" | "POST" | "PUT" | "PATCH" | "DELETE")
                 }
                 className="font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[44px] sm:min-h-[36px]"
               >
                 <option value="GET">GET</option>
                 <option value="POST">POST</option>
                 <option value="PUT">PUT</option>
+                <option value="PATCH">PATCH</option>
                 <option value="DELETE">DELETE</option>
               </select>
               <input
                 required
                 value={draft.priceUsd}
                 onChange={(e) => updateDraft("priceUsd", e.target.value)}
-                placeholder="0.005"
+                placeholder="0.005 (or 0)"
                 className="font-mono text-sm sm:text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[44px] sm:min-h-[36px] text-[#C25906] font-medium"
               />
             </div>
@@ -1148,9 +1170,19 @@ export function EndpointForm({
                             Domain Verified
                           </span>
                         )}
+                        {tenant.status === "suspended" && (
+                          <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-rose-50 text-rose-700 border-rose-200">
+                            Suspended
+                          </span>
+                        )}
                       </div>
                       <div className="font-mono text-xs text-zinc-600 mt-1 break-all">
                         {tenant.endpoint_url}
+                      </div>
+                      <div className="font-mono text-[10px] text-zinc-500 mt-0.5">
+                        {tenant.call_count ?? 0} calls · {tenant.rate_limit_rpm ?? 120} RPM ·{" "}
+                        {(tenant.daily_quota ?? 10000).toLocaleString()} / day
+                        {tenant.webhook_url ? " · Webhook active" : ""}
                       </div>
                     </div>
 
@@ -1567,6 +1599,47 @@ export function EndpointForm({
                             </>
                           )}
                         </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <input
+                            type="number"
+                            min={1}
+                            max={600}
+                            value={tenantEdit.rate_limit_rpm}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({
+                                ...p,
+                                rate_limit_rpm: Number(e.target.value) || 120
+                              }))
+                            }
+                            title="Rate limit (requests per minute)"
+                            placeholder="RPM (e.g. 120)"
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                          />
+                          <input
+                            type="number"
+                            min={1}
+                            max={1000000}
+                            value={tenantEdit.daily_quota}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({
+                                ...p,
+                                daily_quota: Number(e.target.value) || 10000
+                              }))
+                            }
+                            title="Daily call quota"
+                            placeholder="Daily quota"
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                          />
+                          <input
+                            value={tenantEdit.webhook_url}
+                            onChange={(e) =>
+                              setTenantEdit((p) => ({ ...p, webhook_url: e.target.value }))
+                            }
+                            placeholder="Alert Webhook URL (https://...)"
+                            className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
+                          />
+                        </div>
                       </div>
 
                       {openApiImport?.tenantId === tenant.id && (
@@ -1733,7 +1806,12 @@ export function EndpointForm({
                           value={editingTool.http_method}
                           onChange={(e) =>
                             setEditingTool((p) =>
-                              p ? { ...p, http_method: e.target.value as "GET" | "POST" | "PUT" | "DELETE" } : null
+                              p
+                                ? {
+                                    ...p,
+                                    http_method: e.target.value as "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+                                  }
+                                : null
                             )
                           }
                           className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
@@ -1741,6 +1819,7 @@ export function EndpointForm({
                           <option value="GET">GET</option>
                           <option value="POST">POST</option>
                           <option value="PUT">PUT</option>
+                          <option value="PATCH">PATCH</option>
                           <option value="DELETE">DELETE</option>
                         </select>
                         <input
@@ -1820,7 +1899,7 @@ export function EndpointForm({
                           onChange={(e) =>
                             setNewTool((p) => ({
                               ...p,
-                              http_method: e.target.value as "GET" | "POST" | "PUT" | "DELETE"
+                              http_method: e.target.value as "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
                             }))
                           }
                           className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[36px]"
@@ -1828,6 +1907,7 @@ export function EndpointForm({
                           <option value="GET">GET</option>
                           <option value="POST">POST</option>
                           <option value="PUT">PUT</option>
+                          <option value="PATCH">PATCH</option>
                           <option value="DELETE">DELETE</option>
                         </select>
                         <input

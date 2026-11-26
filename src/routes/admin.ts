@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { AppEnv, TenantStatus, UserPlan } from "../types";
+import type { AppEnv, TenantStatus, UserPlan, X402SettlementReceipt } from "../types";
 import { requireAdmin } from "./auth";
 import { invalidateTenantKv, syncTenantToKv, syncUserTenantsToKv } from "../lib/kv-sync";
 import { getSupportedNetwork } from "../lib/networks";
@@ -368,4 +368,98 @@ adminRoutes.get("/transactions", async (c) => {
     offset,
     transactions
   });
+});
+
+/**
+ * 6. Admin Audit Trail Viewer
+ */
+adminRoutes.get("/audit-logs", async (c) => {
+  const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") ?? "50") || 50));
+  const offset = Math.max(0, Number(c.req.query("offset") ?? "0") || 0);
+  const action = (c.req.query("action") ?? "").trim();
+
+  const whereClause = action ? "WHERE a.action = ?" : "";
+  const bindings: unknown[] = action ? [action, limit, offset] : [limit, offset];
+
+  const res = await c.env.DB.prepare(
+    `SELECT a.id, a.actor_user_id, u.login AS actor_login, a.action, a.target_type, a.target_id, a.metadata_json, a.created_at
+     FROM audit_logs a
+     LEFT JOIN users u ON u.id = a.actor_user_id
+     ${whereClause}
+     ORDER BY a.created_at DESC
+     LIMIT ? OFFSET ?`
+  )
+    .bind(...bindings)
+    .all<{
+      id: string;
+      actor_user_id: string | null;
+      actor_login: string | null;
+      action: string;
+      target_type: string;
+      target_id: string;
+      metadata_json: string | null;
+      created_at: string;
+    }>();
+
+  return c.json({
+    limit,
+    offset,
+    audit_logs: res.results ?? []
+  });
+});
+
+/**
+ * 7. Reconcile Stuck Payment (`settlement_pending` -> `release` or `mark_settled`)
+ */
+adminRoutes.post("/payments/:fingerprint/reconcile", async (c) => {
+  const fingerprint = c.req.param("fingerprint").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
+    return c.json(
+      { error: "invalid_fingerprint", message: "Payment fingerprint must be a 64-char SHA-256 hex digest." },
+      400
+    );
+  }
+
+  let body: { action?: "release" | "mark_settled"; receipt?: X402SettlementReceipt };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+
+  if (body.action !== "release" && body.action !== "mark_settled") {
+    return c.json({ error: "invalid_action", message: "Action must be 'release' or 'mark_settled'." }, 400);
+  }
+
+  const stub = c.env.PAYMENT_REPLAY_GUARD.get(
+    c.env.PAYMENT_REPLAY_GUARD.idFromName(fingerprint)
+  );
+  const reconcileRes = await stub.fetch("https://payment-replay/admin_reconcile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operation: "admin_reconcile",
+      action: body.action,
+      receipt: body.receipt
+    })
+  });
+  const reconcileJson = (await reconcileRes.json()) as {
+    ok?: boolean;
+    status?: string;
+    error?: string;
+  };
+
+  if (!reconcileRes.ok) {
+    return c.json(reconcileJson, reconcileRes.status as 400 | 404 | 409 | 500);
+  }
+
+  const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  await c.env.DB.prepare(
+    `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+     VALUES (?, ?, 'admin.payment_reconcile', 'payment', ?, ?)`
+  )
+    .bind(auditId, c.get("user")?.id ?? null, fingerprint, JSON.stringify({ action: body.action }))
+    .run();
+
+  return c.json({ ok: true, fingerprint, ...reconcileJson });
 });

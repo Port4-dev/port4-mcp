@@ -1,1 +1,1 @@
-export { authRoutes, getAuthenticatedUser, requireAdmin, requireAuth } from "../routes/auth";
+export { authRoutes, getAuthenticatedUser, requireAdmin, requireAuth, requireScope } from "../routes/auth";

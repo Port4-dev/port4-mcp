@@ -16,6 +16,7 @@
  */
 
 import fs from "node:fs";
+import nodeCrypto from "node:crypto";
 import readline from "node:readline";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
@@ -234,6 +235,24 @@ export function extractPaymentRequired(res, body) {
   return body?.x402 && typeof body.x402 === "object" ? body.x402 : null;
 }
 
+export function selectPaymentRequirement(paymentRequired, preferredNetwork = "") {
+  const accepts = Array.isArray(paymentRequired?.accepts) ? paymentRequired.accepts : [];
+  const exactReqs = accepts.filter(
+    (r) =>
+      r &&
+      typeof r === "object" &&
+      r.scheme === "exact" &&
+      typeof r.network === "string" &&
+      (r.network.startsWith("eip155:") || r.network.startsWith("solana:"))
+  );
+  if (exactReqs.length === 0) return null;
+  const preferred = typeof preferredNetwork === "string" ? preferredNetwork.trim() : "";
+  if (preferred) {
+    return exactReqs.find((r) => r.network === preferred) ?? null;
+  }
+  return exactReqs[0];
+}
+
 export function selectEvmPaymentRequirement(paymentRequired, preferredNetwork = "") {
   const accepts = Array.isArray(paymentRequired?.accepts) ? paymentRequired.accepts : [];
   const evmReqs = accepts.filter(
@@ -308,6 +327,10 @@ export function parseCliArgs(argv) {
     apiBase: (process.env.PORT4_API_BASE || "https://port4.dev").replace(/\/$/, ""),
     apiKey: process.env.PORT4_API_KEY || "",
     privateKey: process.env.PORT4_PRIVATE_KEY || "",
+    solanaPrivateKey: process.env.PORT4_SOLANA_PRIVATE_KEY || "",
+    mppCredential: process.env.PORT4_MPP_CREDENTIAL || "",
+    tapPrivateKey: process.env.PORT4_TAP_PRIVATE_KEY || "",
+    tapKeyId: process.env.PORT4_TAP_KEY_ID || "",
     network: process.env.PORT4_NETWORK || "",
     maxPerCallUsd: rawMaxPerCall,
     maxSessionUsd: rawMaxSession,
@@ -317,6 +340,16 @@ export function parseCliArgs(argv) {
     paymentSignature: process.env.PORT4_PAYMENT_SIGNATURE || "",
     price: "0.005",
     mcpMode: "openapi_codemode",
+    mcpPath: "/mcp",
+    subdomain: "",
+    name: "",
+    upstream: "",
+    wallet: "",
+    method: "POST",
+    upstreamPath: "",
+    description: "",
+    schema: '{"type":"object","properties":{}}',
+    limit: "50",
     selfTest: false,
     version: false,
     help: false
@@ -370,6 +403,36 @@ export function parseCliArgs(argv) {
       }
       opts.mcpMode = val;
       i++;
+    } else if (a === "--mcp-path") {
+      opts.mcpPath = requireValue(a, i).trim();
+      i++;
+    } else if (a === "--subdomain") {
+      opts.subdomain = requireValue(a, i).trim().toLowerCase();
+      i++;
+    } else if (a === "--name") {
+      opts.name = requireValue(a, i).trim();
+      i++;
+    } else if (a === "--upstream") {
+      opts.upstream = validateHttpUrl(requireValue(a, i), "--upstream");
+      i++;
+    } else if (a === "--wallet") {
+      opts.wallet = requireValue(a, i).trim();
+      i++;
+    } else if (a === "--method") {
+      opts.method = requireValue(a, i).trim().toUpperCase();
+      i++;
+    } else if (a === "--path") {
+      opts.upstreamPath = requireValue(a, i).trim();
+      i++;
+    } else if (a === "--description") {
+      opts.description = requireValue(a, i).trim();
+      i++;
+    } else if (a === "--schema") {
+      opts.schema = requireValue(a, i);
+      i++;
+    } else if (a === "--limit") {
+      opts.limit = requireValue(a, i).trim();
+      i++;
     } else if (a.startsWith("-")) {
       throw new Error(`Unknown flag '${a}'. Run 'port4-mcp --help' for usage.`);
     } else {
@@ -382,7 +445,19 @@ export function parseCliArgs(argv) {
 
   if (positional.length > 0) {
     const first = positional[0];
-    if (["bridge", "inspect", "tenants", "import-openapi", "help"].includes(first)) {
+    if (
+      [
+        "bridge",
+        "inspect",
+        "tenants",
+        "import-openapi",
+        "create",
+        "tools",
+        "sync-mcp",
+        "ledger",
+        "help"
+      ].includes(first)
+    ) {
       command = first;
       positional.shift();
     } else if (first.startsWith("https://") || first.startsWith("http://")) {
@@ -394,6 +469,100 @@ export function parseCliArgs(argv) {
   }
 
   return { command, positional, opts };
+}
+
+export function signTapHeaders({
+  method,
+  url,
+  headers = {},
+  rawBody = "",
+  privateKeyPem,
+  keyId,
+  tag = "agent-payer-auth",
+  nowSec = Math.floor(Date.now() / 1000),
+  nonce = nodeCrypto.randomBytes(32).toString("base64")
+}) {
+  const parsed = new URL(url);
+  const bodyBuf = typeof rawBody === "string" ? Buffer.from(rawBody, "utf8") : Buffer.from(rawBody);
+  const digestB64 = nodeCrypto.createHash("sha256").update(bodyBuf).digest("base64");
+  const contentDigest = `sha-256=:${digestB64}:`;
+  const created = nowSec;
+  const expires = nowSec + (tag === "agent-payer-auth" ? 300 : 60);
+  const components = ["@method", "@scheme", "@authority", "@path", "@query", "content-digest"];
+  const compStr = components.map((c) => `"${c}"`).join(" ");
+  const sigParams = `(${compStr});created=${created};expires=${expires};keyid="${keyId}";alg="ed25519";nonce="${nonce}";tag="${tag}"`;
+
+  const derived = {
+    "@method": method.toUpperCase(),
+    "@scheme": parsed.protocol.replace(/:$/, ""),
+    "@authority": parsed.host,
+    "@path": parsed.pathname || "/",
+    "@query": parsed.search || "?",
+    "content-digest": contentDigest
+  };
+  const baseLines = components.map((name) => `"${name}": ${derived[name] ?? headers[name] ?? ""}`);
+  baseLines.push(`"@signature-params": ${sigParams}`);
+  const base = Buffer.from(baseLines.join("\n"), "utf8");
+  const keyObj = nodeCrypto.createPrivateKey(privateKeyPem.replace(/\\n/g, "\n"));
+  const sigB64 = nodeCrypto.sign(null, base, keyObj).toString("base64");
+
+  return {
+    "Content-Digest": contentDigest,
+    "Signature-Input": `sig2=${sigParams}`,
+    Signature: `sig2=:${sigB64}:`
+  };
+}
+
+export async function trySignWithSolanaPrivateKey(
+  solanaPrivateKey,
+  paymentRequired,
+  selectedReq,
+  deps = null
+) {
+  if (!solanaPrivateKey) {
+    return {
+      ok: false,
+      reason: "missing_solana_private_key",
+      hint: "Set PORT4_SOLANA_PRIVATE_KEY to enable Solana x402 signing."
+    };
+  }
+  try {
+    const x402Svm = deps?.x402Svm ?? (await import("@x402/svm"));
+    if (typeof x402Svm.ExactSvmScheme !== "function") {
+      return {
+        ok: false,
+        reason: "unsupported_x402_svm",
+        hint: "Install @x402/svm@^2.0.0 to enable Solana SPL USDC signing."
+      };
+    }
+    const signer = deps?.signer ?? solanaPrivateKey;
+    const scheme = new x402Svm.ExactSvmScheme(signer);
+    const x402Version = Number(paymentRequired?.x402Version ?? 2);
+    const partial = await scheme.createPaymentPayload(x402Version, selectedReq);
+    if (!partial?.payload) {
+      throw new Error("ExactSvmScheme.createPaymentPayload returned empty payload.");
+    }
+    const paymentPayload = {
+      x402Version: partial.x402Version ?? x402Version,
+      scheme: selectedReq.scheme,
+      network: selectedReq.network,
+      accepted: selectedReq,
+      ...(paymentRequired?.resource ? { resource: paymentRequired.resource } : {}),
+      payload: partial.payload
+    };
+    return {
+      ok: true,
+      header: Buffer.from(JSON.stringify(paymentPayload), "utf8").toString("base64"),
+      requirement: selectedReq,
+      paymentPayload
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "solana_signing_failed",
+      hint: err instanceof Error ? err.message : "Install @x402/svm to sign Solana payments."
+    };
+  }
 }
 
 export async function trySignWithEvmPrivateKey(
@@ -565,6 +734,7 @@ export async function forwardToPort4Edge(
     };
   }
 
+  const serializedMsg = JSON.stringify(msg);
   const buildHeaders = (sig) => {
     const h = {
       "Content-Type": "application/json",
@@ -581,8 +751,27 @@ export async function forwardToPort4Edge(
     if (opts.cfAccessJwt) {
       h["Cf-Access-Jwt-Assertion"] = opts.cfAccessJwt;
     }
+    if (opts.mppCredential && msg.method === "tools/call" && !sig) {
+      h["Authorization"] = opts.mppCredential.startsWith("Payment ")
+        ? opts.mppCredential
+        : `Payment ${opts.mppCredential}`;
+    }
     if (sig && msg.method === "tools/call") {
       h["PAYMENT-SIGNATURE"] = sig;
+    }
+    if (opts.tapPrivateKey && opts.tapKeyId) {
+      Object.assign(
+        h,
+        signTapHeaders({
+          method: "POST",
+          url: opts.url,
+          headers: h,
+          rawBody: serializedMsg,
+          privateKeyPem: opts.tapPrivateKey,
+          keyId: opts.tapKeyId,
+          tag: msg.method === "tools/call" ? "agent-payer-auth" : "agent-browser-auth"
+        })
+      );
     }
     return h;
   };
@@ -590,7 +779,7 @@ export async function forwardToPort4Edge(
   const res = await fetchImpl(opts.url, {
     method: "POST",
     headers: buildHeaders(opts.paymentSignature),
-    body: JSON.stringify(msg)
+    body: serializedMsg
   });
 
   if (res.status === 402) {
@@ -598,9 +787,21 @@ export async function forwardToPort4Edge(
     const body = safeParseJsonText(rawText) ?? {};
     const paymentRequired = extractPaymentRequired(res, body);
     const evmReq = selectEvmPaymentRequirement(paymentRequired, opts.network);
-    const displayReq = evmReq ?? paymentRequired?.accepts?.[0] ?? null;
+    const selectedReq = selectPaymentRequirement(paymentRequired, opts.network);
+    const activeReq = opts.network
+      ? selectedReq
+      : opts.privateKey && evmReq
+        ? evmReq
+        : opts.solanaPrivateKey && selectedReq?.network?.startsWith("solana:")
+          ? selectedReq
+          : (evmReq ?? selectedReq);
+    const isSolana = Boolean(activeReq?.network?.startsWith("solana:"));
+    const canSign = Boolean(
+      activeReq && ((isSolana && opts.solanaPrivateKey) || (!isSolana && opts.privateKey))
+    );
+    const displayReq = activeReq ?? selectedReq ?? paymentRequired?.accepts?.[0] ?? null;
 
-    if (!opts.privateKey || !evmReq) {
+    if (!canSign || !activeReq) {
       let budgetGuard = { allowed: true, dryRun: true };
       if (displayReq) {
         try {
@@ -660,7 +861,7 @@ export async function forwardToPort4Edge(
 
     let amountMicro;
     try {
-      amountMicro = resolveRequirementMicroUsd(evmReq);
+      amountMicro = resolveRequirementMicroUsd(activeReq);
     } catch (err) {
       return {
         jsonrpc: "2.0",
@@ -714,7 +915,9 @@ export async function forwardToPort4Edge(
 
     let committed = false;
     try {
-      const signed = await signerImpl(opts.privateKey, paymentRequired, evmReq);
+      const signed = isSolana
+        ? await trySignWithSolanaPrivateKey(opts.solanaPrivateKey, paymentRequired, activeReq)
+        : await signerImpl(opts.privateKey, paymentRequired, activeReq);
       if (!signed?.ok || !signed.header) {
         return {
           jsonrpc: "2.0",
@@ -970,6 +1173,145 @@ export async function runImportOpenApi(tenantId, specSource, opts, fetchImpl = g
   console.log(JSON.stringify(json, null, 2));
 }
 
+export async function runCreateTenant(opts, fetchImpl = globalThis.fetch) {
+  if (!opts.apiKey) {
+    console.error("Error: PORT4_API_KEY (or --api-key p4_live_...) is required.");
+    process.exit(1);
+  }
+  if (!opts.subdomain || !opts.upstream || !opts.wallet) {
+    console.error(
+      "Usage: port4-mcp create --subdomain <slug> --upstream <https://...> --wallet <addr> [--name <name>] [--network eip155:84532] [--mcp-mode direct]"
+    );
+    process.exit(1);
+  }
+  const res = await fetchImpl(`${opts.apiBase}/api/tenants`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${opts.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      subdomain: opts.subdomain,
+      name: opts.name || opts.subdomain,
+      upstream_base_url: opts.upstream,
+      payout_wallet: opts.wallet,
+      network: opts.network || "eip155:84532",
+      mcp_mode: opts.mcpMode || "direct"
+    })
+  });
+  const text = await res.text().catch(() => "");
+  const json = safeParseJsonText(text) ?? { raw: text };
+  if (!res.ok) {
+    console.error(`Error: POST /api/tenants failed with HTTP ${res.status}:\n${JSON.stringify(json, null, 2)}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify(json, null, 2));
+}
+
+export async function runToolsCommand(subcommand, tenantId, arg3, opts, fetchImpl = globalThis.fetch) {
+  if (!opts.apiKey) {
+    console.error("Error: PORT4_API_KEY (or --api-key p4_live_...) is required.");
+    process.exit(1);
+  }
+  if (subcommand === "add") {
+    if (!tenantId || !arg3 || !opts.upstreamPath) {
+      console.error(
+        "Usage: port4-mcp tools add <tenant_id> <tool_name> --path </v1/op> [--method POST] [--price 0.005]"
+      );
+      process.exit(1);
+    }
+    const res = await fetchImpl(`${opts.apiBase}/api/tenants/${encodeURIComponent(tenantId)}/tools`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${opts.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        name: arg3,
+        description: opts.description || `Paid MCP tool ${arg3}`,
+        http_method: opts.method || "POST",
+        upstream_path: opts.upstreamPath,
+        price_usd: opts.price || "0.005",
+        input_schema_json: opts.schema || '{"type":"object","properties":{}}'
+      })
+    });
+    const json = safeParseJsonText(await res.text().catch(() => "")) ?? {};
+    if (!res.ok) {
+      console.error(`Error: HTTP ${res.status}:\n${JSON.stringify(json, null, 2)}`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify(json, null, 2));
+    return;
+  }
+
+  if (subcommand === "delete") {
+    if (!tenantId || !arg3) {
+      console.error("Usage: port4-mcp tools delete <tenant_id> <tool_id>");
+      process.exit(1);
+    }
+    const res = await fetchImpl(
+      `${opts.apiBase}/api/tenants/${encodeURIComponent(tenantId)}/tools/${encodeURIComponent(arg3)}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${opts.apiKey}` }
+      }
+    );
+    const json = safeParseJsonText(await res.text().catch(() => "")) ?? {};
+    if (!res.ok) {
+      console.error(`Error: HTTP ${res.status}:\n${JSON.stringify(json, null, 2)}`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify(json, null, 2));
+    return;
+  }
+
+  console.error("Usage: port4-mcp tools <add|delete> ...");
+  process.exit(1);
+}
+
+export async function runSyncMcp(tenantId, opts, fetchImpl = globalThis.fetch) {
+  if (!opts.apiKey || !tenantId) {
+    console.error("Usage: PORT4_API_KEY=... port4-mcp sync-mcp <tenant_id> [--mcp-path /mcp] [--price 0.005]");
+    process.exit(1);
+  }
+  const res = await fetchImpl(`${opts.apiBase}/api/tenants/${encodeURIComponent(tenantId)}/sync-mcp`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${opts.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      mcp_path: opts.mcpPath || "/mcp",
+      default_price_usd: opts.price || "0.005"
+    })
+  });
+  const json = safeParseJsonText(await res.text().catch(() => "")) ?? {};
+  if (!res.ok) {
+    console.error(`Error: HTTP ${res.status}:\n${JSON.stringify(json, null, 2)}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify(json, null, 2));
+}
+
+export async function runLedger(opts, fetchImpl = globalThis.fetch) {
+  if (!opts.apiKey) {
+    console.error("Error: PORT4_API_KEY is required.");
+    process.exit(1);
+  }
+  const res = await fetchImpl(
+    `${opts.apiBase}/api/ledger?limit=${encodeURIComponent(opts.limit || "50")}`,
+    {
+      headers: { Authorization: `Bearer ${opts.apiKey}` }
+    }
+  );
+  const json = safeParseJsonText(await res.text().catch(() => "")) ?? {};
+  if (!res.ok) {
+    console.error(`Error: HTTP ${res.status}:\n${JSON.stringify(json, null, 2)}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify(json, null, 2));
+}
+
 export function printHelp() {
   console.log(`port4-mcp v${CLI_VERSION} — Port4 Paid MCP & x402 CLI Bridge (https://port4.dev)
 
@@ -977,7 +1319,12 @@ Usage:
   port4-mcp bridge --url <https://{tenant}.port4.dev/mcp> [--max-per-call-usd 0.05] [--max-session-usd 1.00] [--network eip155:8453]
   port4-mcp inspect <https://{tenant}.port4.dev/mcp>
   port4-mcp tenants [--api-key p4_live_...] [--api-base https://port4.dev]
+  port4-mcp create --subdomain <slug> --upstream <https://...> --wallet <addr> [--network eip155:84532]
+  port4-mcp tools add <tenant_id> <tool_name> --path </v1/op> [--method POST] [--price 0.005]
+  port4-mcp tools delete <tenant_id> <tool_id>
+  port4-mcp sync-mcp <tenant_id> [--mcp-path /mcp] [--price 0.005]
   port4-mcp import-openapi <tenant_id> <https://api.example.com/openapi.json | ./spec.json> [--price 0.005] [--mcp-mode openapi_codemode]
+  port4-mcp ledger [--limit 50]
   port4-mcp --self-test
   port4-mcp --version
 
@@ -987,10 +1334,14 @@ Note: Automatic EIP-3009 signing requires optional peer dependencies \`@x402/evm
 Environment Variables:
   PORT4_MCP_URL              Target Port4 MCP endpoint URL
   PORT4_API_BASE             Control-plane API base URL (default: https://port4.dev)
-  PORT4_NETWORK              Preferred EVM settlement network (e.g. eip155:8453, eip155:84532)
+  PORT4_NETWORK              Preferred EVM/Solana settlement network (e.g. eip155:8453, solana:...)
   PORT4_MAX_PER_CALL_USD     Maximum USDC/OUSD price allowed per tool call (default: 0.10)
   PORT4_MAX_SESSION_USD      Maximum cumulative USDC/OUSD spend per session (default: 2.00)
   PORT4_PRIVATE_KEY          Optional EVM private key for auto-signing (requires @x402/evm + viem)
+  PORT4_SOLANA_PRIVATE_KEY   Optional Solana private key for auto-signing (requires @x402/svm)
+  PORT4_MPP_CREDENTIAL       Optional Tempo OUSD MPP Base64URL credential (Authorization: Payment)
+  PORT4_TAP_PRIVATE_KEY      Optional Ed25519 PEM private key for Visa TAP RFC 9421 signing
+  PORT4_TAP_KEY_ID           Optional Visa TAP keyid / JKT paired with PORT4_TAP_PRIVATE_KEY
   PORT4_API_KEY              Scoped developer API key (p4_live_...) for control-plane commands
   CF_ACCESS_CLIENT_ID        Optional Cloudflare Access Service Token Client ID
   CF_ACCESS_CLIENT_SECRET    Optional Cloudflare Access Service Token Client Secret
@@ -1223,7 +1574,40 @@ export async function runSelfTest() {
   assert.equal(reply403.error.code, -32000);
   assert.equal(reply403.error.data.status, 403);
 
-  console.log("   PASS: Port4 STDIO MCP Bridge self-test (lifecycle + BigInt budget + multi-rail + x402 v2 envelope + rollback) passed.");
+  // 6. Multi-rail Solana selection + Visa TAP Ed25519 signing + new CLI arg parsing
+  const solSelected = selectPaymentRequirement(multiRailPayload, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+  assert.equal(solSelected?.network, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+
+  const { privateKey: tapPrivPem } = nodeCrypto.generateKeyPairSync("ed25519", {
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" }
+  });
+  const tapHeaders = signTapHeaders({
+    method: "POST",
+    url: "https://port4.dev/mcp/demo",
+    rawBody: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+    privateKeyPem: tapPrivPem,
+    keyId: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  });
+  assert.match(tapHeaders["Content-Digest"], /^sha-256=:/);
+  assert.match(tapHeaders["Signature-Input"], /^sig2=\("@method" "@scheme" "@authority" "@path" "@query" "content-digest"\)/);
+  assert.match(tapHeaders.Signature, /^sig2=:/);
+
+  const parsedCreate = parseCliArgs([
+    "node",
+    "port4-mcp",
+    "create",
+    "--subdomain",
+    "myapi",
+    "--upstream",
+    "https://api.example.com",
+    "--wallet",
+    "0x1111111111111111111111111111111111111111"
+  ]);
+  assert.equal(parsedCreate.command, "create");
+  assert.equal(parsedCreate.opts.subdomain, "myapi");
+
+  console.log("   PASS: Port4 STDIO MCP Bridge self-test (lifecycle + BigInt budget + multi-rail + TAP + x402 v2 envelope + rollback) passed.");
 }
 
 export async function runCli(argv = process.argv) {
@@ -1264,6 +1648,26 @@ export async function runCli(argv = process.argv) {
 
   if (command === "import-openapi") {
     await runImportOpenApi(positional[0], positional[1], opts);
+    process.exit(0);
+  }
+
+  if (command === "create") {
+    await runCreateTenant(opts);
+    process.exit(0);
+  }
+
+  if (command === "tools") {
+    await runToolsCommand(positional[0], positional[1], positional[2], opts);
+    process.exit(0);
+  }
+
+  if (command === "sync-mcp") {
+    await runSyncMcp(positional[0], opts);
+    process.exit(0);
+  }
+
+  if (command === "ledger") {
+    await runLedger(opts);
     process.exit(0);
   }
 

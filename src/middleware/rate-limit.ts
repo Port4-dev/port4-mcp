@@ -2,6 +2,7 @@ import type { MiddlewareHandler } from "hono";
 import type { RateLimitConsumeInput, RateLimitConsumeResult } from "../durable-objects";
 import type { AppEnv } from "../types";
 import { sha256Hex } from "../lib/crypto";
+import { dispatchTenantWebhook } from "../lib/webhooks";
 
 const WINDOW_SECONDS = 60;
 const DEFAULT_REQUESTS_PER_MINUTE = 120;
@@ -67,6 +68,14 @@ export const edgeRateLimitMiddleware: MiddlewareHandler<AppEnv> = async (c, next
   c.header("RateLimit-Reset", String(Math.ceil(result.resetAt / 1000)));
   if (!result.allowed) {
     c.header("Retry-After", String(Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000))));
+    if (result.reason === "daily_quota_exceeded" && tenant.webhook_url) {
+      c.executionCtx.waitUntil(
+        dispatchTenantWebhook(tenant, "quota.exceeded", {
+          daily_quota: result.dailyQuota,
+          limit_rpm: result.limitRpm
+        })
+      );
+    }
     return c.json(
       {
         error: result.reason ?? "rate_limit_exceeded",

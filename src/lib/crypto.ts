@@ -167,15 +167,23 @@ export function decodeBase64Json<T>(base64: string): T {
   return JSON.parse(decoder.decode(bytes)) as T;
 }
 
-export function usdToAtomicUsdc(priceUsd: string): string {
+export function usdToAtomicUsdc(
+  priceUsd: string,
+  options?: { allowZero?: boolean }
+): string {
   const cleaned = priceUsd.replace(/^\$/, "").trim();
   if (!/^\d+(?:\.\d{1,6})?$/.test(cleaned)) {
-    throw new Error("Price must be a positive USD decimal with no more than 6 fractional digits.");
+    throw new Error("Price must be a non-negative USD decimal with no more than 6 fractional digits.");
   }
   const [whole, fraction = ""] = cleaned.split(".");
   const atomic = BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
-  if (atomic <= 0n || atomic > 1_000_000_000_000n) {
-    throw new Error("Price must be between 0.000001 and 1,000,000 USD.");
+  const minAtomic = options?.allowZero ? 0n : 1n;
+  if (atomic < minAtomic || atomic > 1_000_000_000_000n) {
+    throw new Error(
+      options?.allowZero
+        ? "Price must be between 0 and 1,000,000 USD."
+        : "Price must be between 0.000001 and 1,000,000 USD."
+    );
   }
   return atomic.toString();
 }

@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { sign, verify } from "hono/jwt";
-import type { AppEnv, AuthUser } from "../types";
+import type { ApiKeyScope, AppEnv, AuthUser } from "../types";
 import { randomHex, sha256Hex, timingSafeEqualString } from "../lib/crypto";
 
 const SESSION_COOKIE = "port4_session";
@@ -70,6 +70,41 @@ async function fetchUserById(c: Context<AppEnv>, userId: string): Promise<AuthUs
   };
 }
 
+const AUTH_FAILURE_LIMIT_PER_MINUTE = 10;
+
+async function recordAuthFailureAndCheckLimit(
+  c: Context<AppEnv>
+): Promise<{ blocked: boolean; retryAfter: number }> {
+  if (!c.env.EDGE_RATE_LIMITER) {
+    return { blocked: false, retryAfter: 60 };
+  }
+  try {
+    const source = c.req.header("CF-Connecting-IP") ?? "local";
+    const key = await sha256Hex(`auth_fail:${source}`);
+    const stub = c.env.EDGE_RATE_LIMITER.get(c.env.EDGE_RATE_LIMITER.idFromName(key));
+    const input = { limit: AUTH_FAILURE_LIMIT_PER_MINUTE, windowSeconds: 60, dailyQuota: 500 };
+    const rpcStub = stub as unknown as {
+      consume?: (arg: typeof input) => Promise<{ allowed: boolean; resetAt: number }>;
+    };
+    let result: { allowed: boolean; resetAt: number };
+    if (typeof rpcStub.consume === "function") {
+      result = await rpcStub.consume(input);
+    } else {
+      const res = await stub.fetch("https://rate-limit/consume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input)
+      });
+      if (!res.ok) return { blocked: false, retryAfter: 60 };
+      result = (await res.json()) as { allowed: boolean; resetAt: number };
+    }
+    const retryAfter = Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000));
+    return { blocked: !result.allowed, retryAfter };
+  } catch {
+    return { blocked: false, retryAfter: 60 };
+  }
+}
+
 export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser | null> {
   // 1. Check Bearer API Key for CLI/CI deployments (enforces revocation, expiration, and scopes)
   const authHeader = c.req.header("Authorization");
@@ -104,6 +139,7 @@ export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser
         is_admin: Number(row.is_admin) === 1 ? 1 : 0,
         plan: row.plan === "pro" ? "pro" : "free",
         auth_via: "api_key",
+        api_key_id: row.api_key_id,
         api_key_scopes: row.scopes.split(",").map((s) => s.trim()).filter(Boolean)
       };
     }
@@ -123,23 +159,18 @@ export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser
     }
 
     const tokenHash = await sha256Hex(token);
-    const revoked = await c.env.DB.prepare(
-      "SELECT token_hash FROM revoked_sessions WHERE token_hash = ? LIMIT 1"
-    )
-      .bind(tokenHash)
-      .first<{ token_hash: string }>();
-    if (revoked) {
+    const [revoked, freshUser] = await Promise.all([
+      c.env.DB.prepare("SELECT token_hash FROM revoked_sessions WHERE token_hash = ? LIMIT 1")
+        .bind(tokenHash)
+        .first<{ token_hash: string }>(),
+      fetchUserById(c, payload.sub)
+    ]);
+    if (revoked || !freshUser) {
       return null;
     }
 
     return {
-      id: payload.sub,
-      github_id: typeof payload.github_id === "string" ? payload.github_id : "0",
-      login: payload.login,
-      avatar_url: typeof payload.avatar_url === "string" ? payload.avatar_url : null,
-      email: typeof payload.email === "string" ? payload.email : null,
-      is_admin: payload.is_admin === 1 ? 1 : 0,
-      plan: payload.plan === "pro" ? "pro" : "free",
+      ...freshUser,
       auth_via: "session"
     };
   } catch {
@@ -150,6 +181,22 @@ export async function getAuthenticatedUser(c: Context<AppEnv>): Promise<AuthUser
 export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const user = await getAuthenticatedUser(c);
   if (!user) {
+    const hasCredentialAttempt = Boolean(
+      c.req.header("Authorization") || getCookie(c, SESSION_COOKIE)
+    );
+    if (hasCredentialAttempt) {
+      const rl = await recordAuthFailureAndCheckLimit(c);
+      if (rl.blocked) {
+        c.header("Retry-After", String(rl.retryAfter));
+        return c.json(
+          {
+            error: "auth_rate_limited",
+            message: "Too many failed authentication attempts. Retry later."
+          },
+          429
+        );
+      }
+    }
     return c.json(
       {
         error: "unauthorized",
@@ -161,6 +208,66 @@ export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   c.set("user", user);
   await next();
 };
+
+/**
+ * Enforces fine-grained API key scopes on control-plane routes.
+ * Interactive browser sessions (`auth_via === "session"`) and `admin:all` keys are authorized;
+ * scoped developer API keys (`tenant:read`, `tenant:write`, `ledger:read`) are restricted accordingly.
+ */
+export function requireScope(
+  scope: Exclude<ApiKeyScope, "admin:all">
+): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    const user = c.get("user") ?? (await getAuthenticatedUser(c));
+    if (!user) {
+      return c.json(
+        {
+          error: "unauthorized",
+          message: "Valid GitHub OAuth session cookie or Bearer API key required."
+        },
+        401
+      );
+    }
+    if (!c.get("user")) {
+      c.set("user", user);
+    }
+
+    if (user.auth_via !== "api_key") {
+      await next();
+      return;
+    }
+
+    const scopes = user.api_key_scopes ?? [];
+    if (scopes.includes("admin:all")) {
+      await next();
+      return;
+    }
+
+    if (scope === "keys:write") {
+      return c.json(
+        {
+          error: "insufficient_api_key_scope",
+          required_scope: scope,
+          message: "Interactive session or admin:all scope required to manage API keys."
+        },
+        403
+      );
+    }
+
+    if (!scopes.includes(scope)) {
+      return c.json(
+        {
+          error: "insufficient_api_key_scope",
+          required_scope: scope,
+          message: `API key is missing required scope '${scope}'.`
+        },
+        403
+      );
+    }
+
+    await next();
+  };
+}
 
 /**
  * Super-Admin Guard Middleware:
@@ -384,10 +491,18 @@ authRoutes.post("/logout", async (c) => {
       const payload = await verify(token, getJwtSecret(c), "HS256");
       const tokenHash = await sha256Hex(token);
       if (typeof payload.sub === "string") {
+        const expSec =
+          typeof payload.exp === "number" && Number.isFinite(payload.exp)
+            ? payload.exp
+            : Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
+        const expiresAt = new Date(expSec * 1000)
+          .toISOString()
+          .replace("T", " ")
+          .slice(0, 19);
         await c.env.DB.prepare(
-          "INSERT OR IGNORE INTO revoked_sessions (token_hash, user_id) VALUES (?, ?)"
+          "INSERT OR IGNORE INTO revoked_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)"
         )
-          .bind(tokenHash, payload.sub)
+          .bind(tokenHash, payload.sub, expiresAt)
           .run();
       }
     } catch {

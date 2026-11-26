@@ -316,6 +316,7 @@ interface IdempotencyRecord {
     | "completed";
   claimedAt: number;
   leaseToken: string;
+  recheckLeaseUntil?: number;
   context: PaymentExecutionContext;
   receipt?: X402SettlementReceipt;
   responseBody?: string;
@@ -323,6 +324,12 @@ interface IdempotencyRecord {
 
 export type ReplayClaimResult =
   | { status: "claimed"; claimed: true; leaseToken: string }
+  | {
+      status: "recheck_settlement_pending";
+      claimed: true;
+      leaseToken: string;
+      receipt?: X402SettlementReceipt;
+    }
   | {
       status: "retry_upstream";
       claimed: true;
@@ -351,7 +358,12 @@ export type ReplayReleaseResult =
   | { released: false; status: IdempotencyRecord["status"] };
 
 type ReplayOperation =
-  | { operation?: "claim"; context: PaymentExecutionContext; leaseToken: string }
+  | {
+      operation?: "claim";
+      context: PaymentExecutionContext;
+      leaseToken: string;
+      allowPendingRecheck?: boolean;
+    }
   | {
       operation?: "mark_settlement_pending";
       leaseToken: string;
@@ -369,7 +381,12 @@ type ReplayOperation =
       responseBody: string;
     }
   | { operation?: "release"; leaseToken: string }
-  | { operation?: "mark_upstream_failed"; leaseToken: string };
+  | { operation?: "mark_upstream_failed"; leaseToken: string }
+  | {
+      operation?: "admin_reconcile";
+      action: "release" | "mark_settled";
+      receipt?: X402SettlementReceipt;
+    };
 
 type ReplayOperationName = NonNullable<ReplayOperation["operation"]>;
 
@@ -382,10 +399,12 @@ const PATH_OPERATION_MAP: Record<string, ReplayOperationName> = {
   "/complete": "complete",
   "/release": "release",
   "/mark_upstream_failed": "mark_upstream_failed",
-  "/upstream-failed": "mark_upstream_failed"
+  "/upstream-failed": "mark_upstream_failed",
+  "/admin_reconcile": "admin_reconcile"
 };
 
 const IN_FLIGHT_LEASE_MS = 60_000;
+const RECHECK_PENDING_LEASE_MS = 15_000;
 const RECORD_TTL_MS = 86_400_000;
 const MAX_CACHED_RESPONSE_BYTES = 65_536;
 
@@ -420,7 +439,8 @@ export class PaymentReplayGuard extends DurableObject<AppBindings> {
     const existing = await this.ctx.storage.get<IdempotencyRecord>("record");
     if (
       !existing ||
-      (existing.status === "in_flight" && existing.leaseToken === leaseToken)
+      ((existing.status === "in_flight" || existing.status === "settlement_pending") &&
+        existing.leaseToken === leaseToken)
     ) {
       await this.ctx.storage.delete("record");
       await this.ctx.storage.deleteAlarm();
@@ -445,11 +465,54 @@ export class PaymentReplayGuard extends DurableObject<AppBindings> {
       ...existing,
       status: "settlement_pending",
       claimedAt: now,
+      recheckLeaseUntil: 0,
       receipt
     };
     await this.ctx.storage.put("record", updated);
     await this.ctx.storage.setAlarm(now + RECORD_TTL_MS);
     return { status: 200, body: { ok: true, status: updated.status } };
+  }
+
+  private async handleAdminReconcile(
+    action: "release" | "mark_settled",
+    receipt?: X402SettlementReceipt
+  ): Promise<{ status: number; body: { ok: boolean; action: string; status?: string; error?: string } }> {
+    const existing = await this.ctx.storage.get<IdempotencyRecord>("record");
+    if (!existing) {
+      return { status: 404, body: { ok: false, action, error: "record_not_found" } };
+    }
+    if (existing.status === "completed") {
+      return { status: 409, body: { ok: false, action, error: "already_completed" } };
+    }
+    if (action === "release") {
+      await this.ctx.storage.delete("record");
+      await this.ctx.storage.deleteAlarm();
+      return { status: 200, body: { ok: true, action, status: "released" } };
+    }
+    const now = Date.now();
+    const resolvedReceipt: X402SettlementReceipt = receipt ?? {
+      ...(existing.receipt ?? {
+        transaction: "",
+        network: existing.context.network,
+        payer: "admin-reconciled",
+        mode: "facilitator",
+        isPlatformFee: false,
+        payTo: existing.context.payTo
+      }),
+      success: true,
+      settlementPending: false,
+      errorReason: null
+    };
+    const updated: IdempotencyRecord = {
+      ...existing,
+      status: "settled_pending_upstream",
+      claimedAt: 0,
+      recheckLeaseUntil: 0,
+      receipt: resolvedReceipt
+    };
+    await this.ctx.storage.put("record", updated);
+    await this.ctx.storage.setAlarm(now + RECORD_TTL_MS);
+    return { status: 200, body: { ok: true, action, status: updated.status } };
   }
 
   private async handleMarkSettled(
@@ -529,7 +592,8 @@ export class PaymentReplayGuard extends DurableObject<AppBindings> {
 
   private async handleClaim(
     context: PaymentExecutionContext,
-    leaseToken: string
+    leaseToken: string,
+    allowPendingRecheck = false
   ): Promise<
     | { status: 200; body: ReplayClaimResult }
     | { status: 400; body: { error: string } }
@@ -566,6 +630,30 @@ export class PaymentReplayGuard extends DurableObject<AppBindings> {
       }
 
       if (existing.status === "settlement_pending") {
+        if (allowPendingRecheck) {
+          if (existing.recheckLeaseUntil && now < existing.recheckLeaseUntil) {
+            return {
+              status: 200,
+              body: { status: "in_flight", claimed: false }
+            };
+          }
+          const refreshed: IdempotencyRecord = {
+            ...existing,
+            leaseToken,
+            recheckLeaseUntil: now + RECHECK_PENDING_LEASE_MS
+          };
+          await this.ctx.storage.put("record", refreshed);
+          await this.ctx.storage.setAlarm(now + RECORD_TTL_MS);
+          return {
+            status: 200,
+            body: {
+              status: "recheck_settlement_pending",
+              claimed: true,
+              leaseToken,
+              receipt: existing.receipt
+            }
+          };
+        }
         return {
           status: 200,
           body: {
@@ -629,9 +717,10 @@ export class PaymentReplayGuard extends DurableObject<AppBindings> {
 
   async claim(
     context: PaymentExecutionContext,
-    leaseToken: string
+    leaseToken: string,
+    allowPendingRecheck = false
   ): Promise<ReplayClaimResult> {
-    const res = await this.handleClaim(context, leaseToken);
+    const res = await this.handleClaim(context, leaseToken, allowPendingRecheck);
     if (res.status !== 200) {
       throw new Error(res.body.error);
     }
@@ -726,8 +815,28 @@ export class PaymentReplayGuard extends DurableObject<AppBindings> {
     }
 
     if (operation === "claim") {
-      const payload = body as { context: PaymentExecutionContext; leaseToken: string };
-      const res = await this.handleClaim(payload.context, payload.leaseToken);
+      const payload = body as {
+        context: PaymentExecutionContext;
+        leaseToken: string;
+        allowPendingRecheck?: boolean;
+      };
+      const res = await this.handleClaim(
+        payload.context,
+        payload.leaseToken,
+        Boolean(payload.allowPendingRecheck)
+      );
+      return Response.json(res.body, { status: res.status });
+    }
+
+    if (operation === "admin_reconcile") {
+      const payload = body as {
+        action?: "release" | "mark_settled";
+        receipt?: X402SettlementReceipt;
+      };
+      if (payload.action !== "release" && payload.action !== "mark_settled") {
+        return Response.json({ error: "invalid_reconcile_action" }, { status: 400 });
+      }
+      const res = await this.handleAdminReconcile(payload.action, payload.receipt);
       return Response.json(res.body, { status: res.status });
     }
 

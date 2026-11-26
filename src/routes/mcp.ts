@@ -21,6 +21,7 @@ import {
   searchTenantTools
 } from "../lib/codemode";
 import { validateToolArguments } from "../lib/schema-validator";
+import { dispatchTenantWebhook } from "../lib/webhooks";
 
 export class UpstreamHttpError extends Error {
   readonly status: number;
@@ -182,7 +183,7 @@ async function dispatchUpstreamTool(params: {
   }
 
   let serializedBody = "";
-  let httpMethod: "GET" | "POST" | "PUT" | "DELETE" = tool.http_method;
+  let httpMethod: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" = tool.http_method;
 
   if (isRemoteMcp) {
     httpMethod = "POST";
@@ -268,27 +269,52 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     return c.json({ error: "gateway_context_missing" }, 500);
   }
 
+  // 0. Stateless liveness check (`ping`)
+  if (mcp.method === "ping") {
+    c.header("Cache-Control", "no-store");
+    c.header("X-Port4-Tenant", tenant.subdomain);
+    c.header("MCP-Protocol-Version", mcp.protocolVersion);
+    return c.json({
+      jsonrpc: "2.0",
+      id: mcp.rpcId,
+      result: {}
+    });
+  }
+
   // 1. Edge-cached stateless tool discovery (Direct MCP or Code Mode)
   if (mcp.method === "tools/list") {
     const resolvedAsset = resolveUsdcAsset(tenant.network, c.env.X402_USDC_ASSET);
-    const tools =
+    const allTools =
       tenant.mcp_mode !== "direct"
         ? buildCodeModeMcpTools(tenant, resolvedAsset)
         : tenant.tools.map((tool) => ({
             name: tool.name,
             description: tool.description,
             inputSchema: safeParseSchema(tool.input_schema_json),
-            _meta: {
-              x402: {
-                scheme: "exact",
-                network: tenant.network,
-                asset: resolvedAsset,
-                priceUsd: `$${tool.price_usd}`,
-                amountAtomic: tool.price_atomic,
-                payTo: tenant.payout_wallet
-              }
-            }
+            _meta:
+              tool.price_atomic === "0"
+                ? { free: true }
+                : {
+                    x402: {
+                      scheme: "exact",
+                      network: tenant.network,
+                      asset: resolvedAsset,
+                      priceUsd: `$${tool.price_usd}`,
+                      amountAtomic: tool.price_atomic,
+                      payTo: tenant.payout_wallet
+                    }
+                  }
           }));
+
+    const PAGE_SIZE = 50;
+    const rawCursor = mcp.cursor ? Number.parseInt(mcp.cursor, 10) : 0;
+    const offset = Number.isInteger(rawCursor) && rawCursor > 0 ? rawCursor : 0;
+    const pagedTools =
+      allTools.length > PAGE_SIZE || offset > 0
+        ? allTools.slice(offset, offset + PAGE_SIZE)
+        : allTools;
+    const nextCursor =
+      offset + pagedTools.length < allTools.length ? String(offset + pagedTools.length) : undefined;
 
     c.header("Cache-Control", "public, max-age=300");
     c.header("X-Port4-Tenant", tenant.subdomain);
@@ -298,11 +324,14 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     return c.json({
       jsonrpc: "2.0",
       id: mcp.rpcId,
-      result: { tools }
+      result: {
+        tools: pagedTools,
+        ...(nextCursor ? { nextCursor } : {})
+      }
     });
   }
 
-  // 2. Tool invocation (free `search` in openapi_codemode, or x402-settled `code`/`execute`/direct)
+  // 2. Tool invocation (free `search`, free `$0` direct tools, or x402-settled `code`/`execute`/direct)
   if (mcp.method === "tools/call") {
     // 2a. Free progressive discovery (`search`) in OpenAPI Code Mode
     if (tenant.mcp_mode === "openapi_codemode" && mcp.toolName === "search") {
@@ -326,8 +355,9 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     const tool = c.get("selectedTool");
     const receipt = c.get("x402Receipt");
     const startedAt = c.get("requestStartedAt") ?? Date.now();
+    const isFreeDirectTool = Boolean(tool && tool.price_atomic === "0" && tenant.mcp_mode === "direct");
 
-    if (!tool || !receipt) {
+    if (!tool || (!receipt && !isFreeDirectTool)) {
       return c.json(
         {
           jsonrpc: "2.0",
@@ -338,11 +368,22 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       );
     }
 
+    const effectiveReceipt: X402SettlementReceipt = receipt ?? {
+      success: true,
+      transaction: "free",
+      network: tenant.network,
+      payer: "free",
+      errorReason: null,
+      mode: "sandbox",
+      isPlatformFee: false,
+      payTo: tenant.payout_wallet
+    };
+
     const paymentFingerprint = c.get("paymentFingerprint");
     const leaseToken = c.get("paymentLeaseToken") ?? "";
     const tapVerified = c.get("tapVerified");
 
-    // Validate tool arguments against JSON Schema BEFORE upstream execution
+    // Validate tool arguments against JSON Schema BEFORE upstream execution (defense-in-depth)
     const argCheck = validateToolArguments(tool.input_schema_json, mcp.arguments);
     if (!argCheck.ok) {
       return c.json(
@@ -357,7 +398,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
 
     const colo = (c.req.raw.cf as { colo?: string } | undefined)?.colo ?? "LOCAL";
     const requestId = `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const idempotencyKey = paymentFingerprint ?? receipt.transaction;
+    const idempotencyKey = paymentFingerprint ?? effectiveReceipt.transaction;
     let upstreamResult: unknown;
     let isToolError = false;
 
@@ -378,7 +419,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
             tenant,
             tool: subTool,
             args: subArgs,
-            receipt,
+            receipt: effectiveReceipt,
             colo,
             requestId: `${requestId}_s${subcallIndex}`,
             idempotencyKey: `${idempotencyKey}:${subTool.name}:${subcallIndex}`,
@@ -392,7 +433,8 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
           error: execOutcome.error,
           logs: execOutcome.logs ?? [],
           subcalls: execOutcome.subcalls,
-          consumedAtomic: execOutcome.consumedAtomic
+          consumedAtomic: execOutcome.consumedAtomic,
+          breakdown: execOutcome.breakdown
         };
       } else {
         upstreamResult = {
@@ -402,6 +444,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
             subcalls: execOutcome.subcalls,
             consumedAtomic: execOutcome.consumedAtomic,
             authorizedAtomic: tool.price_atomic,
+            breakdown: execOutcome.breakdown,
             mode: tenant.mcp_mode
           }
         };
@@ -413,7 +456,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
           tenant,
           tool,
           args: mcp.arguments,
-          receipt,
+          receipt: effectiveReceipt,
           colo,
           requestId,
           idempotencyKey,
@@ -444,6 +487,15 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
             message: err.message
           };
         } else {
+          if (tenant.webhook_url) {
+            c.executionCtx.waitUntil(
+              dispatchTenantWebhook(tenant, "upstream.error", {
+                tool: tool.name,
+                status: err instanceof UpstreamHttpError ? err.status : 502,
+                message: err instanceof Error ? err.message : "Upstream unavailable"
+              })
+            );
+          }
           // Transient 5xx / 429 / 408 / network timeout: clear in-flight lease age so caller can immediately retry upstream without re-settling
           if (paymentFingerprint && leaseToken) {
             const replayStub = c.env.PAYMENT_REPLAY_GUARD.get(
@@ -473,11 +525,26 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
     }
 
     const latencyMs = Math.max(1, Date.now() - startedAt);
+    if (isFreeDirectTool) {
+      c.header("Cache-Control", "no-store");
+      c.header("X-Port4-Tenant", tenant.subdomain);
+      c.header("MCP-Protocol-Version", mcp.protocolVersion);
+      return c.json({
+        jsonrpc: "2.0",
+        id: mcp.rpcId,
+        result: {
+          content: [{ type: "text", text: JSON.stringify(upstreamResult, null, 2) }],
+          isError: isToolError,
+          _meta: { free: true, latencyMs }
+        }
+      });
+    }
+
     // Deterministic event ID per payment authorization prevents duplicate financial rows across retries
     const txId = paymentFingerprint
       ? `tx_${paymentFingerprint.slice(0, 24)}`
       : `tx_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const status = receipt.mode === "sandbox" ? "sandbox_settled" : "settled";
+    const status = effectiveReceipt.mode === "sandbox" ? "sandbox_settled" : "settled";
 
     const responsePayload = {
       jsonrpc: "2.0" as const,
@@ -492,12 +559,12 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
         isError: isToolError,
         _meta: {
           x402: {
-            txHash: receipt.transaction,
-            network: receipt.network,
-            payer: receipt.payer,
+            txHash: effectiveReceipt.transaction,
+            network: effectiveReceipt.network,
+            payer: effectiveReceipt.payer,
             amountUsd: `$${tool.price_usd}`,
             latencyMs,
-            mode: receipt.mode
+            mode: effectiveReceipt.mode
           }
         }
       }
@@ -517,7 +584,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
         body: JSON.stringify({
           operation: "complete",
           leaseToken,
-          receipt,
+          receipt: effectiveReceipt,
           responseBody: serializedResponse
         })
       });
@@ -529,14 +596,14 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       tenantId: tenant.id,
       tenantSubdomain: tenant.subdomain,
       toolName: tool.name,
-      payerWallet: receipt.payer,
+      payerWallet: effectiveReceipt.payer,
       amountAtomic: tool.price_atomic,
       amountUsd: tool.price_usd,
-      network: receipt.network,
-      txHash: receipt.transaction,
+      network: effectiveReceipt.network,
+      txHash: effectiveReceipt.transaction,
       latencyMs,
       status,
-      isPlatformFee: receipt.isPlatformFee,
+      isPlatformFee: effectiveReceipt.isPlatformFee,
       tapAgentId: tapVerified?.agentId ?? null,
       occurredAt: new Date().toISOString()
     };
@@ -553,11 +620,11 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
         tenant: tenant.subdomain,
         tool: tool.name,
         amountUsd: tool.price_usd,
-        network: receipt.network,
-        txHash: receipt.transaction,
+        network: effectiveReceipt.network,
+        txHash: effectiveReceipt.transaction,
         latencyMs,
-        isPlatformFee: receipt.isPlatformFee,
-        mode: receipt.mode
+        isPlatformFee: effectiveReceipt.isPlatformFee,
+        mode: effectiveReceipt.mode
       })
     );
 
@@ -574,7 +641,7 @@ export async function handleMcpRequest(c: Context<AppEnv>): Promise<Response> {
       id: mcp.rpcId,
       error: {
         code: -32601,
-        message: `Method '${mcp.method}' not supported. Supported stateless methods: tools/list, tools/call.`
+        message: `Method '${mcp.method}' not supported. Supported stateless methods: tools/list, tools/call, ping.`
       }
     },
     400

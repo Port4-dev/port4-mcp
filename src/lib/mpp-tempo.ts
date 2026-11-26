@@ -410,29 +410,28 @@ export async function verifyMppPaymentCredential(params: {
     };
   }
 
-  if (Array.isArray(txReceipt.logs) && txReceipt.logs.length > 0) {
-    const expectedRecipientTopic = `0x000000000000000000000000${credential.recipient.slice(2).toLowerCase()}`;
-    const requiredAmount = BigInt(credential.amount);
-    const hasMatchingTransfer = txReceipt.logs.some((log) => {
-      if (!log || typeof log.address !== "string" || !Array.isArray(log.topics)) return false;
-      if (log.address.toLowerCase() !== TEMPO_OUSD_ADDRESS.toLowerCase()) return false;
-      if ((log.topics[0] ?? "").toLowerCase() !== ERC20_TRANSFER_TOPIC0) return false;
-      if ((log.topics[2] ?? "").toLowerCase() !== expectedRecipientTopic) return false;
-      try {
-        const transferred = BigInt(log.data && log.data !== "0x" ? log.data : "0x0");
-        return transferred >= requiredAmount;
-      } catch {
-        return false;
-      }
-    });
-    if (!hasMatchingTransfer) {
-      return {
-        ok: false,
-        status: 402,
-        error: "tempo_ousd_transfer_log_missing",
-        message: "Tempo transaction receipt does not contain a matching OUSD Transfer log to recipient."
-      };
+  const logs = Array.isArray(txReceipt.logs) ? txReceipt.logs : [];
+  const expectedRecipientTopic = `0x000000000000000000000000${credential.recipient.slice(2).toLowerCase()}`;
+  const requiredAmount = BigInt(credential.amount);
+  const hasMatchingTransfer = logs.some((log) => {
+    if (!log || typeof log.address !== "string" || !Array.isArray(log.topics)) return false;
+    if (log.address.toLowerCase() !== TEMPO_OUSD_ADDRESS.toLowerCase()) return false;
+    if ((log.topics[0] ?? "").toLowerCase() !== ERC20_TRANSFER_TOPIC0) return false;
+    if ((log.topics[2] ?? "").toLowerCase() !== expectedRecipientTopic) return false;
+    try {
+      const transferred = BigInt(log.data && log.data !== "0x" ? log.data : "0x0");
+      return transferred >= requiredAmount;
+    } catch {
+      return false;
     }
+  });
+  if (!hasMatchingTransfer) {
+    return {
+      ok: false,
+      status: 402,
+      error: "tempo_ousd_transfer_log_missing",
+      message: "Tempo transaction receipt does not contain a matching OUSD Transfer log to recipient."
+    };
   }
 
   const network = `eip155:${credential.chainId}`;
@@ -665,12 +664,17 @@ export function buildTenantOpenApiDocument(
         // keep default
       }
 
+      const isFreeTool = tool.price_atomic === "0";
       paths[`${mcpPath}/tools/${encodeURIComponent(tool.name)}`] = {
         post: {
           operationId: tool.name,
-          summary: tool.description || `Paid MCP tool ${tool.name}`,
-          description: `${tool.description} (Stateless MCP 2026-07-28 tools/call '${tool.name}', $${tool.price_usd} OUSD/USDC)`,
-          "x-payment-info": buildPaymentInfo(tool.price_atomic),
+          summary: tool.description || `${isFreeTool ? "Free" : "Paid"} MCP tool ${tool.name}`,
+          description: isFreeTool
+            ? `${tool.description} (Stateless MCP 2026-07-28 tools/call '${tool.name}', Free)`
+            : `${tool.description} (Stateless MCP 2026-07-28 tools/call '${tool.name}', $${tool.price_usd} OUSD/USDC)`,
+          ...(isFreeTool
+            ? { "x-port4-free": true }
+            : { "x-payment-info": buildPaymentInfo(tool.price_atomic) }),
           requestBody: {
             required: true,
             content: {

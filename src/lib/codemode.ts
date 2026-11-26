@@ -226,6 +226,7 @@ export async function executeCodeModePlan(params: {
   logs?: string[];
   subcalls: number;
   consumedAtomic: string;
+  breakdown: Array<{ tool: string; atomic: string }>;
 }> {
   const { env, tenant, code, authorizedAtomicBudget, dispatchTool } = params;
 
@@ -234,7 +235,8 @@ export async function executeCodeModePlan(params: {
       ok: false,
       error: "Dynamic Worker LOADER binding is not configured on this gateway.",
       subcalls: 0,
-      consumedAtomic: "0"
+      consumedAtomic: "0",
+      breakdown: []
     };
   }
 
@@ -244,7 +246,8 @@ export async function executeCodeModePlan(params: {
       ok: false,
       error: "Code must be a non-empty JavaScript async arrow function under 32 KiB.",
       subcalls: 0,
-      consumedAtomic: "0"
+      consumedAtomic: "0",
+      breakdown: []
     };
   }
 
@@ -252,6 +255,7 @@ export async function executeCodeModePlan(params: {
   const budgetCap = BigInt(/^\d+$/.test(authorizedAtomicBudget) ? authorizedAtomicBudget : "10000");
   let subcalls = 0;
   let consumedAtomic = 0n;
+  const breakdown: Array<{ tool: string; atomic: string }> = [];
 
   const fns: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
   const uniqueMap = buildUniqueToolMap(tenant.tools);
@@ -283,6 +287,7 @@ export async function executeCodeModePlan(params: {
       }
 
       consumedAtomic += toolCost;
+      breakdown.push({ tool: tool.name, atomic: toolCost.toString() });
       return dispatchTool(tool, argsObj, subcalls);
     };
   }
@@ -294,7 +299,7 @@ export async function executeCodeModePlan(params: {
   });
 
   const normalized = normalizeCode(trimmed);
-  const outcome = await executor.execute(normalized, fns);
+  const outcome = await executor.execute(normalized, [{ name: "codemode", fns }]);
 
   if (outcome.error) {
     return {
@@ -302,7 +307,8 @@ export async function executeCodeModePlan(params: {
       error: outcome.error,
       logs: outcome.logs,
       subcalls,
-      consumedAtomic: consumedAtomic.toString()
+      consumedAtomic: consumedAtomic.toString(),
+      breakdown
     };
   }
 
@@ -311,6 +317,7 @@ export async function executeCodeModePlan(params: {
     result: truncateResult(outcome.result, { maxTokens: 6000 }),
     logs: outcome.logs,
     subcalls,
-    consumedAtomic: consumedAtomic.toString()
+    consumedAtomic: consumedAtomic.toString(),
+    breakdown
   };
 }

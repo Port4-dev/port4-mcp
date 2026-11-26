@@ -1,4 +1,4 @@
-import { Activity, CheckCircle2, Clock, Coins, ExternalLink } from "lucide-react";
+import { Activity, CheckCircle2, Clock, Coins, Download, ExternalLink, Search } from "lucide-react";
 import { isSafeHttpsUrl } from "../lib/wallets";
 
 export interface LedgerTransaction {
@@ -16,6 +16,19 @@ export interface LedgerTransaction {
   created_at: string;
 }
 
+export interface DailyLedgerPoint {
+  day_utc: string;
+  calls: number;
+  usd: string;
+}
+
+export interface LedgerFilters {
+  tool: string;
+  status: string;
+  offset: number;
+  limit: number;
+}
+
 interface RevenueTableProps {
   transactions: LedgerTransaction[];
   summary: {
@@ -23,9 +36,43 @@ interface RevenueTableProps {
     total_usd: string;
     avg_latency_ms: number;
   };
+  authenticated?: boolean;
+  dailySeries?: DailyLedgerPoint[];
+  pagination?: {
+    limit: number;
+    offset: number;
+    total: number;
+    has_more: boolean;
+  };
+  filters?: LedgerFilters;
+  onFiltersChange?: (next: LedgerFilters) => void;
 }
 
-export function RevenueTable({ transactions, summary }: RevenueTableProps) {
+export function RevenueTable({
+  transactions,
+  summary,
+  authenticated = false,
+  dailySeries = [],
+  pagination,
+  filters,
+  onFiltersChange
+}: RevenueTableProps) {
+  const activeFilters: LedgerFilters = filters ?? {
+    tool: "",
+    status: "",
+    offset: 0,
+    limit: 50
+  };
+
+  const maxDailyCalls = Math.max(1, ...dailySeries.map((d) => d.calls));
+
+  const buildExportUrl = (format: "csv" | "json") => {
+    const params = new URLSearchParams({ format });
+    if (activeFilters.tool.trim()) params.set("tool", activeFilters.tool.trim());
+    if (activeFilters.status) params.set("status", activeFilters.status);
+    return `/api/ledger/export?${params.toString()}`;
+  };
+
   return (
     <div className="flex flex-col gap-4">
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -45,6 +92,100 @@ export function RevenueTable({ transactions, summary }: RevenueTableProps) {
           value={`${summary.avg_latency_ms} ms`}
         />
       </div>
+
+      {dailySeries.length > 0 && (
+        <div className="cf-card rounded-2xl p-4 flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-zinc-900">Daily Call Volume (UTC)</span>
+            <span className="font-mono text-[10px] text-zinc-500">
+              Last {dailySeries.length} active days
+            </span>
+          </div>
+          <svg
+            viewBox={`0 0 ${Math.max(140, dailySeries.length * 28)} 64`}
+            className="w-full h-16 overflow-visible"
+            role="img"
+            aria-label="Daily call volume bar chart"
+          >
+            {dailySeries.map((pt, idx) => {
+              const barHeight = Math.max(4, Math.round((pt.calls / maxDailyCalls) * 44));
+              const x = idx * 28 + 4;
+              const y = 52 - barHeight;
+              return (
+                <g key={pt.day_utc}>
+                  <title>{`${pt.day_utc}: ${pt.calls} calls ($${pt.usd})`}</title>
+                  <rect
+                    x={x}
+                    y={y}
+                    width={18}
+                    height={barHeight}
+                    rx={3}
+                    fill="#F6821F"
+                    fillOpacity={0.85}
+                  />
+                  <text
+                    x={x + 9}
+                    y={62}
+                    textAnchor="middle"
+                    fontSize="7"
+                    fill="#71717A"
+                    fontFamily="monospace"
+                  >
+                    {pt.day_utc.slice(5)}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+      )}
+
+      {authenticated && onFiltersChange && (
+        <div className="cf-card rounded-2xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-2.5" />
+              <input
+                aria-label="Filter ledger by tool"
+                value={activeFilters.tool}
+                onChange={(e) =>
+                  onFiltersChange({ ...activeFilters, tool: e.target.value, offset: 0 })
+                }
+                placeholder="Filter tool..."
+                className="font-mono text-xs bg-white border border-zinc-300 rounded-lg pl-8 pr-3 min-h-[34px] text-zinc-900 focus:outline-none focus:border-[#F6821F]"
+              />
+            </div>
+            <select
+              aria-label="Filter ledger by status"
+              value={activeFilters.status}
+              onChange={(e) =>
+                onFiltersChange({ ...activeFilters, status: e.target.value, offset: 0 })
+              }
+              className="font-mono text-xs bg-white border border-zinc-300 rounded-lg px-2.5 min-h-[34px] text-zinc-800"
+            >
+              <option value="">All Statuses</option>
+              <option value="settled">Settled (On-Chain)</option>
+              <option value="sandbox_settled">Sandbox Simulated</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-2">
+            <a
+              href={buildExportUrl("csv")}
+              className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 bg-white px-2.5 min-h-[34px] font-mono text-[11px] text-zinc-700 hover:border-[#F6821F]"
+            >
+              <Download className="w-3 h-3" />
+              Export CSV
+            </a>
+            <a
+              href={buildExportUrl("json")}
+              className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 bg-white px-2.5 min-h-[34px] font-mono text-[11px] text-zinc-700 hover:border-[#F6821F]"
+            >
+              <Download className="w-3 h-3" />
+              JSON
+            </a>
+          </div>
+        </div>
+      )}
 
       <div className="cf-card rounded-2xl overflow-hidden min-w-0">
         <div className="overflow-x-auto">
@@ -114,6 +255,42 @@ export function RevenueTable({ transactions, summary }: RevenueTableProps) {
             </tbody>
           </table>
         </div>
+        {pagination && onFiltersChange && (pagination.offset > 0 || pagination.has_more) && (
+          <div className="px-4 py-2.5 border-t border-zinc-200 bg-zinc-50 flex items-center justify-between font-mono text-[11px] text-zinc-600">
+            <span>
+              Showing {pagination.offset + 1}–{pagination.offset + transactions.length} of{" "}
+              {pagination.total}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={pagination.offset <= 0}
+                onClick={() =>
+                  onFiltersChange({
+                    ...activeFilters,
+                    offset: Math.max(0, activeFilters.offset - activeFilters.limit)
+                  })
+                }
+                className="px-2.5 py-1 rounded border border-zinc-300 bg-white disabled:opacity-40 cursor-pointer"
+              >
+                Prev
+              </button>
+              <button
+                type="button"
+                disabled={!pagination.has_more}
+                onClick={() =>
+                  onFiltersChange({
+                    ...activeFilters,
+                    offset: activeFilters.offset + activeFilters.limit
+                  })
+                }
+                className="px-2.5 py-1 rounded border border-zinc-300 bg-white disabled:opacity-40 cursor-pointer"
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

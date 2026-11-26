@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -12,11 +12,12 @@ import {
   Menu,
   ReceiptText,
   ShieldCheck,
+  Star,
   TerminalSquare,
   X
 } from "lucide-react";
 import type { TenantItem } from "./components/EndpointForm";
-import type { LedgerTransaction } from "./components/RevenueTable";
+import type { DailyLedgerPoint, LedgerFilters, LedgerTransaction } from "./components/RevenueTable";
 import type { FeaturedTenant } from "./components/Docs";
 
 // Code-split heavy views so `/` loads minimal JS on throttled 3G connections
@@ -31,7 +32,7 @@ const AdminDashboard = lazy(() =>
   import("./components/AdminDashboard").then((m) => ({ default: m.AdminDashboard }))
 );
 
-type PageView = "home" | "docs" | "dashboard" | "admin" | "notfound";
+type PageView = "home" | "docs" | "dashboard" | "admin" | "terms" | "privacy" | "notfound";
 type DashboardTab = "endpoints" | "ledger" | "deploy";
 
 interface AuthState {
@@ -53,6 +54,8 @@ function viewFromPath(pathname: string): PageView {
   if (clean === "/docs" || clean === "/sandbox") return "docs";
   if (clean === "/dashboard" || clean === "/console") return "dashboard";
   if (clean === "/admin") return "admin";
+  if (clean === "/terms") return "terms";
+  if (clean === "/privacy") return "privacy";
   return "notfound";
 }
 
@@ -60,6 +63,8 @@ function pathFromView(view: Exclude<PageView, "notfound">): string {
   if (view === "docs") return "/docs";
   if (view === "dashboard") return "/dashboard";
   if (view === "admin") return "/admin";
+  if (view === "terms") return "/terms";
+  if (view === "privacy") return "/privacy";
   return "/";
 }
 
@@ -88,6 +93,21 @@ export default function App() {
   const [tenants, setTenants] = useState<TenantItem[]>([]);
   const [transactions, setTransactions] = useState<LedgerTransaction[]>([]);
   const [summary, setSummary] = useState({ total_calls: 0, total_usd: "0.0000", avg_latency_ms: 0 });
+  const [dailySeries, setDailySeries] = useState<DailyLedgerPoint[]>([]);
+  const [ledgerPagination, setLedgerPagination] = useState<{
+    limit: number;
+    offset: number;
+    total: number;
+    has_more: boolean;
+  }>({ limit: 50, offset: 0, total: 0, has_more: false });
+  const [ledgerFilters, setLedgerFilters] = useState<LedgerFilters>({
+    tool: "",
+    status: "",
+    offset: 0,
+    limit: 50
+  });
+  const [upgradeMessage, setUpgradeMessage] = useState<string | null>(null);
+  const [upgradingPlan, setUpgradingPlan] = useState(false);
   const [apiKeys, setApiKeys] = useState<
     Array<{
       id: string;
@@ -106,6 +126,8 @@ export default function App() {
   const [expiresInDays, setExpiresInDays] = useState<string>("");
   const [keyError, setKeyError] = useState<string | null>(null);
   const [creatingKey, setCreatingKey] = useState(false);
+  const creatingKeyRef = useRef(false);
+  const upgradingPlanRef = useRef(false);
   const [revokingKeyId, setRevokingKeyId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -150,9 +172,16 @@ export default function App() {
 
       if (view === "dashboard") {
         if (meJson.authenticated) {
+          const ledgerParams = new URLSearchParams({
+            limit: String(ledgerFilters.limit),
+            offset: String(ledgerFilters.offset)
+          });
+          if (ledgerFilters.tool.trim()) ledgerParams.set("tool", ledgerFilters.tool.trim());
+          if (ledgerFilters.status) ledgerParams.set("status", ledgerFilters.status);
+
           const [tRes, lRes, kRes] = await Promise.all([
             fetch("/api/tenants", { signal: controller.signal }),
-            fetch("/api/ledger", { signal: controller.signal }),
+            fetch(`/api/ledger?${ledgerParams.toString()}`, { signal: controller.signal }),
             fetch("/api/keys", { signal: controller.signal })
           ]);
           if (tRes.ok) {
@@ -163,9 +192,13 @@ export default function App() {
             const lJson = (await lRes.json()) as {
               transactions: LedgerTransaction[];
               summary: { total_calls: number; total_usd: string; avg_latency_ms: number };
+              daily_series?: DailyLedgerPoint[];
+              pagination?: { limit: number; offset: number; total: number; has_more: boolean };
             };
             setTransactions(lJson.transactions);
             setSummary(lJson.summary);
+            setDailySeries(lJson.daily_series ?? []);
+            if (lJson.pagination) setLedgerPagination(lJson.pagination);
           }
           if (kRes.ok) {
             const kJson = (await kRes.json()) as {
@@ -205,7 +238,7 @@ export default function App() {
     } finally {
       clearTimeout(timer);
     }
-  }, [view]);
+  }, [view, ledgerFilters]);
 
   useEffect(() => {
     void loadData();
@@ -219,16 +252,21 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    let logoutOk = false;
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
+      const res = await fetch("/api/auth/logout", { method: "POST" });
+      logoutOk = res.ok;
     } finally {
+      setAuth((prev) => ({ ...prev, loaded: true, authenticated: false, user: null }));
       setTenants([]);
       setApiKeys([]);
       setNewApiKey(null);
       setKeyError(null);
       setMobileMenuOpen(false);
       if (view === "admin") navigate("home");
-      await loadData();
+      if (logoutOk) {
+        await loadData();
+      }
     }
   };
 
@@ -239,6 +277,7 @@ export default function App() {
   };
 
   const handleCreateApiKey = async () => {
+    if (creatingKeyRef.current) return;
     setKeyError(null);
     if (!auth.authenticated) {
       if (auth.githubConfigured) {
@@ -252,6 +291,7 @@ export default function App() {
       setKeyError("Select at least one API key scope.");
       return;
     }
+    creatingKeyRef.current = true;
     setCreatingKey(true);
     try {
       const payload: {
@@ -284,6 +324,7 @@ export default function App() {
     } catch (err) {
       setKeyError(err instanceof Error ? err.message : "Failed to create API key.");
     } finally {
+      creatingKeyRef.current = false;
       setCreatingKey(false);
     }
   };
@@ -313,6 +354,31 @@ export default function App() {
     void navigator.clipboard.writeText(newApiKey);
     setKeyCopied(true);
     setTimeout(() => setKeyCopied(false), 1800);
+  };
+
+  const handleUpgradeToPro = async () => {
+    if (upgradingPlanRef.current) return;
+    upgradingPlanRef.current = true;
+    setUpgradeMessage(null);
+    setUpgradingPlan(true);
+    try {
+      const res = await fetch("/api/billing/upgrade", { method: "POST" });
+      const data = (await res.json().catch(() => ({}))) as {
+        checkout_url?: string;
+        message?: string;
+        error?: string;
+      };
+      if (data.checkout_url) {
+        window.location.assign(data.checkout_url);
+        return;
+      }
+      setUpgradeMessage(data.message || data.error || "Contact info@port4.dev to upgrade to Pro.");
+    } catch {
+      setUpgradeMessage("Unable to initiate plan upgrade right now.");
+    } finally {
+      upgradingPlanRef.current = false;
+      setUpgradingPlan(false);
+    }
   };
 
   const copyCurl = () => {
@@ -595,9 +661,32 @@ export default function App() {
                   <span className="px-2 py-0.5 rounded bg-[#F6821F]/10 border border-[#F6821F]/25 text-[#C25906]">
                     {auth.user.plan === "pro" ? "Pro · 1% fee" : "Free · 3% fee"}
                   </span>
+                  {auth.user.plan !== "pro" && (
+                    <button
+                      type="button"
+                      disabled={upgradingPlan}
+                      onClick={() => void handleUpgradeToPro()}
+                      className="px-2.5 py-0.5 rounded bg-zinc-900 text-white hover:bg-zinc-800 text-[10px] cursor-pointer disabled:opacity-60"
+                    >
+                      {upgradingPlan ? "Opening..." : "Upgrade to Pro (1%)"}
+                    </button>
+                  )}
                 </div>
               )}
             </div>
+
+            {upgradeMessage && (
+              <div className="font-mono text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-xl px-4 py-2.5 flex items-center justify-between gap-2">
+                <span>{upgradeMessage}</span>
+                <button
+                  type="button"
+                  onClick={() => setUpgradeMessage(null)}
+                  className="text-amber-700 hover:text-amber-950 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
 
             <Suspense fallback={<ViewSkeleton />}>
               {tab === "endpoints" && (
@@ -609,7 +698,17 @@ export default function App() {
                 />
               )}
 
-              {tab === "ledger" && <RevenueTable transactions={transactions} summary={summary} />}
+              {tab === "ledger" && (
+                <RevenueTable
+                  transactions={transactions}
+                  summary={summary}
+                  authenticated={auth.authenticated}
+                  dailySeries={dailySeries}
+                  pagination={ledgerPagination}
+                  filters={ledgerFilters}
+                  onFiltersChange={setLedgerFilters}
+                />
+              )}
 
               {tab === "deploy" && (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
@@ -791,6 +890,41 @@ export default function App() {
           </Suspense>
         )}
 
+        {/* Clean Legal Pages */}
+        {view === "terms" && (
+          <div className="max-w-3xl mx-auto cf-card rounded-2xl p-6 sm:p-8 flex flex-col gap-4">
+            <h1 className="text-2xl font-bold text-zinc-900">Terms of Service</h1>
+            <p className="text-sm text-zinc-600 leading-relaxed">
+              Port4 (<code className="font-mono text-xs">port4.dev</code>) provides a non-custodial
+              Model Context Protocol (MCP) and x402 / Tempo MPP payment gateway at the Cloudflare
+              Edge. Port4 never custodies developer or agent funds; payments settle directly to
+              configured tenant wallets or the Port4 platform treasury during deterministic fee
+              cycles (3% Free tier / 1% Pro tier).
+            </p>
+            <p className="text-sm text-zinc-600 leading-relaxed">
+              Developers are responsible for the availability, legality, and accuracy of their
+              upstream APIs. Port4 reserves the right to suspend abusive or fraudulent endpoints.
+              Questions: <a href="mailto:info@port4.dev" className="text-[#C25906] underline">info@port4.dev</a>.
+            </p>
+          </div>
+        )}
+
+        {view === "privacy" && (
+          <div className="max-w-3xl mx-auto cf-card rounded-2xl p-6 sm:p-8 flex flex-col gap-4">
+            <h1 className="text-2xl font-bold text-zinc-900">Privacy Policy</h1>
+            <p className="text-sm text-zinc-600 leading-relaxed">
+              Port4 stores only your GitHub account identifier, login handle, optional email,
+              endpoint configuration, encrypted upstream credentials (AES-256-GCM), and settled
+              transaction metadata required for financial ledger auditing and rate limiting.
+            </p>
+            <p className="text-sm text-zinc-600 leading-relaxed">
+              API request/response payloads pass transiently through Cloudflare Workers and Dynamic
+              Worker sandboxes and are not stored in our database. For data export or deletion
+              requests, contact <a href="mailto:info@port4.dev" className="text-[#C25906] underline">info@port4.dev</a>.
+            </p>
+          </div>
+        )}
+
         {/* Clean 404 Page: "Lost on Port5" */}
         {view === "notfound" && (
           <div className="max-w-lg mx-auto cf-card rounded-2xl p-6 sm:p-10 flex flex-col items-center text-center gap-4 my-6">
@@ -854,12 +988,33 @@ export default function App() {
               llms.txt
             </a>
             <a
-              href="https://github.com/Port4-dev"
-              target="_blank"
-              rel="noreferrer"
+              href="/terms"
+              onClick={(e) => {
+                e.preventDefault();
+                navigate("terms");
+              }}
               className="hover:text-[#F6821F] py-1"
             >
-              GitHub
+              Terms
+            </a>
+            <a
+              href="/privacy"
+              onClick={(e) => {
+                e.preventDefault();
+                navigate("privacy");
+              }}
+              className="hover:text-[#F6821F] py-1"
+            >
+              Privacy
+            </a>
+            <a
+              href="https://github.com/Port4-dev/port4-mcp"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 hover:text-[#F6821F] py-1"
+            >
+              <Star className="w-3 h-3" />
+              Star on GitHub
             </a>
             <a
               href="https://x.com/Port4dotDev"

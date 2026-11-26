@@ -253,6 +253,41 @@ console.log(await res.json());`}
     }
   }'`}
           />
+          <h3 className="text-sm font-semibold text-zinc-900 mt-2">
+            Verify Origin Authenticity (<code className="font-mono text-xs">X-Port4-Signature</code>)
+          </h3>
+          <p className="text-sm text-zinc-600">
+            Verify Port4&apos;s HMAC-SHA256 signature on your origin server so callers cannot bypass
+            x402 settlement by hitting your upstream directly:
+          </p>
+          <CodeBlock
+            id="origin-hmac-verify"
+            title="TypeScript / Cloudflare Worker — Verify X-Port4-Signature"
+            code={`export async function verifyPort4Request(req: Request, signingSecret: string): Promise<boolean> {
+  const ts = req.headers.get("X-Port4-Timestamp") ?? "";
+  const sig = (req.headers.get("X-Port4-Signature") ?? "").replace(/^v1=/, "");
+  const tenant = req.headers.get("X-Port4-Tenant") ?? "";
+  const tool = req.headers.get("X-Port4-Tool") ?? "";
+  const tx = req.headers.get("X-Port4-Tx") ?? "";
+  if (!ts || !sig || Math.abs(Math.floor(Date.now() / 1000) - Number(ts)) > 300) return false;
+
+  const bodyBytes = new TextEncoder().encode(await req.clone().text());
+  const bodyDigest = await crypto.subtle.digest("SHA-256", bodyBytes);
+  const bodyHash = Array.from(new Uint8Array(bodyDigest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  const msg = \`\${ts}.\${tenant}.\${tool}.\${tx}.\${bodyHash}\`;
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(signingSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg));
+  const expected = Array.from(new Uint8Array(mac)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return sig.toLowerCase() === expected.toLowerCase();
+}`}
+          />
         </section>
 
         {/* 6. Featured Endpoints */}

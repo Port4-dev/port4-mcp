@@ -2,6 +2,12 @@
   "name": "port4",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
+  "homepage": "https://port4.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Port4-dev/port4-mcp.git"
+  },
   "type": "module",
   "bin": {
     "port4-mcp": "cli/port4-mcp.mjs"
@@ -15,6 +21,9 @@
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
     "typecheck": "tsc --noEmit && npm --prefix web run typecheck",
     "test": "node scripts/test-conformance.mjs",
+    "test:cli": "node packages/port4-mcp/bin/port4-mcp.mjs --self-test",
+    "test:e2e": "node scripts/test-local-e2e.mjs",
+    "test:all": "npm run typecheck && npm test && npm run test:cli",
     "db:migrate:local": "wrangler d1 migrations apply port4-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply port4-db --remote"
   },

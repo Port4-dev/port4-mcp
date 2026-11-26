@@ -90,6 +90,17 @@ interface AdminTrafficHour {
   avg_latency_ms: number;
 }
 
+interface AdminAuditLogEntry {
+  id: string;
+  actor_user_id: string | null;
+  actor_login: string | null;
+  action: string;
+  target_type: string;
+  target_id: string;
+  metadata_json: string | null;
+  created_at: string;
+}
+
 export function AdminDashboard({
   authLoaded,
   authenticated,
@@ -102,6 +113,8 @@ export function AdminDashboard({
   const [users, setUsers] = useState<AdminRegisteredUser[]>([]);
   const [trafficHours, setTrafficHours] = useState<AdminTrafficHour[]>([]);
   const [transactions, setTransactions] = useState<AdminTx[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AdminAuditLogEntry[]>([]);
+  const [txOffset, setTxOffset] = useState(0);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"" | "active" | "suspended">("");
@@ -124,16 +137,17 @@ export function AdminDashboard({
       if (debouncedSearch.trim()) params.set("q", debouncedSearch.trim());
       if (statusFilter) params.set("status", statusFilter);
 
-      const [sRes, tRes, uRes, trRes, txRes] = await Promise.all([
+      const [sRes, tRes, uRes, trRes, txRes, alRes] = await Promise.all([
         fetch("/api/admin/stats"),
         fetch(`/api/admin/tenants?${params.toString()}`),
         fetch("/api/admin/users"),
         fetch("/api/admin/traffic"),
-        fetch("/api/admin/transactions?limit=100")
+        fetch(`/api/admin/transactions?limit=50&offset=${txOffset}`),
+        fetch("/api/admin/audit-logs?limit=30")
       ]);
 
-      if (!sRes.ok || !tRes.ok || !uRes.ok || !trRes.ok || !txRes.ok) {
-        const failed = [sRes, tRes, uRes, trRes, txRes].find((r) => !r.ok);
+      if (!sRes.ok || !tRes.ok || !uRes.ok || !trRes.ok || !txRes.ok || !alRes.ok) {
+        const failed = [sRes, tRes, uRes, trRes, txRes, alRes].find((r) => !r.ok);
         const errBody = failed ? ((await failed.json().catch(() => ({}))) as { message?: string; error?: string }) : {};
         throw new Error(errBody.message || errBody.error || `Admin sync failed (${failed?.status ?? 500})`);
       }
@@ -147,12 +161,14 @@ export function AdminDashboard({
       setTrafficHours(trJson.hours);
       const txJson = (await txRes.json()) as { transactions: AdminTx[] };
       setTransactions(txJson.transactions);
+      const alJson = (await alRes.json()) as { audit_logs: AdminAuditLogEntry[] };
+      setAuditLogs(alJson.audit_logs);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load admin telemetry.");
     } finally {
       setLoading(false);
     }
-  }, [isAdmin, debouncedSearch, statusFilter]);
+  }, [isAdmin, debouncedSearch, statusFilter, txOffset]);
 
   useEffect(() => {
     void loadAll();
@@ -502,6 +518,39 @@ export function AdminDashboard({
           <h2 className="text-sm font-semibold text-zinc-900">Hourly Gateway Traffic (Last 48h UTC)</h2>
           <span className="font-mono text-[11px] text-zinc-500">{trafficHours.length} active hours</span>
         </div>
+        {trafficHours.length > 0 && (() => {
+          const ordered = trafficHours.slice(0, 24).reverse();
+          const maxCalls = Math.max(1, ...ordered.map((x) => x.total_calls));
+          return (
+            <div className="px-4 pt-3 pb-1 border-b border-zinc-200 bg-zinc-50/50">
+              <svg
+                viewBox={`0 0 ${Math.max(240, ordered.length * 18)} 52`}
+                className="w-full h-14 overflow-visible"
+                role="img"
+                aria-label="Hourly gateway traffic chart"
+              >
+                {ordered.map((h, idx) => {
+                  const barH = Math.max(3, Math.round((h.total_calls / maxCalls) * 40));
+                  const x = idx * 18 + 2;
+                  return (
+                    <rect
+                      key={h.hour_utc}
+                      x={x}
+                      y={44 - barH}
+                      width={12}
+                      height={barH}
+                      rx={2}
+                      fill="#F6821F"
+                      fillOpacity={0.85}
+                    >
+                      <title>{`${h.hour_utc}: ${h.total_calls} calls ($${h.volume_usd})`}</title>
+                    </rect>
+                  );
+                })}
+              </svg>
+            </div>
+          );
+        })()}
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse font-mono text-xs whitespace-nowrap">
             <thead>
@@ -540,8 +589,28 @@ export function AdminDashboard({
 
       <section className="cf-card rounded-2xl overflow-hidden">
         <div className="p-4 border-b border-zinc-200 flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-zinc-900">Global Audit Ledger (Latest 100)</h2>
-          <span className="font-mono text-[11px] text-zinc-500">{transactions.length} records</span>
+          <h2 className="text-sm font-semibold text-zinc-900">Global Audit Ledger</h2>
+          <div className="flex items-center gap-2 font-mono text-[11px] text-zinc-500">
+            <span>
+              Offset {txOffset} · {transactions.length} rows
+            </span>
+            <button
+              type="button"
+              disabled={txOffset <= 0}
+              onClick={() => setTxOffset((o) => Math.max(0, o - 50))}
+              className="px-2 py-0.5 rounded border border-zinc-300 bg-white text-zinc-700 disabled:opacity-40 cursor-pointer"
+            >
+              Prev
+            </button>
+            <button
+              type="button"
+              disabled={transactions.length < 50}
+              onClick={() => setTxOffset((o) => o + 50)}
+              className="px-2 py-0.5 rounded border border-zinc-300 bg-white text-zinc-700 disabled:opacity-40 cursor-pointer"
+            >
+              Next
+            </button>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse font-mono text-xs">
@@ -605,6 +674,51 @@ export function AdminDashboard({
                 </tr>
                 );
               })}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="cf-card rounded-2xl overflow-hidden">
+        <div className="p-4 border-b border-zinc-200 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-zinc-900">Admin &amp; Security Audit Trail</h2>
+          <span className="font-mono text-[11px] text-zinc-500">{auditLogs.length} events</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse font-mono text-xs whitespace-nowrap">
+            <thead>
+              <tr className="border-b border-zinc-200 bg-zinc-50 text-[11px] uppercase text-zinc-500">
+                <th className="py-2.5 px-4">Time (UTC)</th>
+                <th className="py-2.5 px-4">Actor</th>
+                <th className="py-2.5 px-4">Action</th>
+                <th className="py-2.5 px-4">Target</th>
+                <th className="py-2.5 px-4">Details</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-200">
+              {auditLogs.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="py-6 px-4 text-center text-zinc-400">
+                    No audit events recorded yet.
+                  </td>
+                </tr>
+              ) : (
+                auditLogs.map((log) => (
+                  <tr key={log.id} className="hover:bg-orange-50/40">
+                    <td className="py-2.5 px-4 text-zinc-500">{log.created_at}</td>
+                    <td className="py-2.5 px-4 text-zinc-800">
+                      {log.actor_login ? `@${log.actor_login}` : log.actor_user_id ?? "system"}
+                    </td>
+                    <td className="py-2.5 px-4 text-[#C25906]">{log.action}</td>
+                    <td className="py-2.5 px-4 text-zinc-600">
+                      {log.target_type}:{log.target_id}
+                    </td>
+                    <td className="py-2.5 px-4 text-zinc-500 max-w-xs truncate">
+                      {log.metadata_json ?? "—"}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

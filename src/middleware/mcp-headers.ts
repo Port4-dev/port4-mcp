@@ -294,6 +294,7 @@ export const mcpHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) =
     method: body.method,
     toolName: bodyToolName,
     rpcId,
+    cursor: typeof body.params?.cursor === "string" ? body.params.cursor : undefined,
     arguments:
       body.params?.arguments &&
       typeof body.params.arguments === "object" &&

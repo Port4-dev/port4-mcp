@@ -73,5 +73,7 @@ Authenticate with a scoped Bearer API key (`Authorization: Bearer p4_live_...`):
 - `POST https://port4.dev/api/tenants/:id/tools` — Add a paid tool to an endpoint
 - `PATCH https://port4.dev/api/tenants/:id/tools/:toolId` — Update a tool
 - `DELETE https://port4.dev/api/tenants/:id/tools/:toolId` — Delete a tool
-- `GET https://port4.dev/api/ledger` — Fetch settled transactions and revenue summary
+- `GET https://port4.dev/api/ledger` — Fetch settled transactions, pagination, daily series, and revenue summary
+- `GET https://port4.dev/api/ledger/export?format=csv|json` — Export filtered ledger transactions
 - `GET/POST/DELETE https://port4.dev/api/keys` — Manage scoped API keys (`tenant:read`, `tenant:write`, `ledger:read`)
+- `GET https://port4.dev/api/billing/plans` & `POST https://port4.dev/api/billing/upgrade` — Plan tiers & Stripe upgrade

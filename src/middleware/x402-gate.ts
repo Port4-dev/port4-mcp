@@ -45,6 +45,7 @@ import {
   normalizePayoutWallets,
   resolveUsdcAssetForNetwork
 } from "../lib/networks";
+import { validateToolArguments } from "../lib/schema-validator";
 
 interface DecodedX402Signature extends X402PaymentSignaturePayload {
   accepted?: Partial<X402PaymentRequirement>;
@@ -541,6 +542,23 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
 
   c.set("selectedTool", tool);
 
+  // Free direct tools ($0) bypass payment gate after Enterprise OAuth check, with pre-execution argument validation
+  if (!isCodeModeExec && tool.price_atomic === "0") {
+    const freeArgCheck = validateToolArguments(tool.input_schema_json, mcp.arguments);
+    if (!freeArgCheck.ok) {
+      return c.json(
+        {
+          jsonrpc: "2.0",
+          id: mcp.rpcId,
+          error: { code: -32602, message: `Invalid tool arguments: ${freeArgCheck.error}` }
+        },
+        400
+      );
+    }
+    await next();
+    return;
+  }
+
   const signatureHeader = c.req.header("PAYMENT-SIGNATURE")?.trim();
   const mppToken = extractMppAuthorizationToken(c.req.header("Authorization"));
 
@@ -623,6 +641,19 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     );
   }
 
+  // Validate tool arguments BEFORE claiming or settling payment so malformed inputs never charge the agent
+  const preSettleArgCheck = validateToolArguments(tool.input_schema_json, mcp.arguments);
+  if (!preSettleArgCheck.ok) {
+    return c.json(
+      {
+        jsonrpc: "2.0",
+        id: mcp.rpcId,
+        error: { code: -32602, message: `Invalid tool arguments: ${preSettleArgCheck.error}` }
+      },
+      400
+    );
+  }
+
   // --- Branch A: Tempo OUSD Machine Payments Protocol (`Authorization: Payment <b64url>`) ---
   if (mppToken) {
     const expectedChainId = primaryIsTestnet ? TEMPO_TESTNET_CHAIN_ID : TEMPO_MAINNET_CHAIN_ID;
@@ -669,7 +700,12 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     const replayClaim = await replayStub.fetch("https://payment-replay/claim", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ operation: "claim", context: paymentContext, leaseToken })
+      body: JSON.stringify({
+        operation: "claim",
+        context: paymentContext,
+        leaseToken,
+        allowPendingRecheck: true
+      })
     });
 
     if (!replayClaim.ok) {
@@ -679,6 +715,7 @@ export const x402GateMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => 
     const replayResult = (await replayClaim.json()) as {
       status?:
         | "claimed"
+        | "recheck_settlement_pending"
         | "retry_upstream"
         | "completed"
         | "in_flight"

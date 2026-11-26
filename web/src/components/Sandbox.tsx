@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   CheckCircle2,
   ExternalLink,
@@ -50,8 +50,11 @@ export function Sandbox({ onSettled }: SandboxProps) {
   const [phase, setPhase] = useState<"idle" | "running" | "settled" | "error">("idle");
   const [data, setData] = useState<SandboxRunResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const runningRef = useRef(false);
 
   const runSandbox = async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
     setPhase("running");
     setError(null);
     try {
@@ -70,6 +73,8 @@ export function Sandbox({ onSettled }: SandboxProps) {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sandbox failed");
       setPhase("error");
+    } finally {
+      runningRef.current = false;
     }
   };
 

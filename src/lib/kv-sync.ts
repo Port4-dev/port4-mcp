@@ -55,6 +55,7 @@ export async function loadTenantFromD1(
             COALESCE(t.codemode_max_subcalls, 10) AS codemode_max_subcalls,
             t.cf_access_team_domain,
             t.cf_access_aud,
+            t.webhook_url,
             COALESCE(u.plan, 'free') AS owner_plan
      FROM tenants t
      LEFT JOIN users u ON u.id = t.user_id
@@ -139,6 +140,7 @@ export async function loadTenantFromD1(
     codemode_max_subcalls: Math.min(50, Math.max(1, Number(tenant.codemode_max_subcalls ?? 10))),
     cf_access_team_domain: tenant.cf_access_team_domain ?? null,
     cf_access_aud: tenant.cf_access_aud ?? null,
+    webhook_url: tenant.webhook_url ?? null,
     tools: toolsResult.results ?? [],
     cached_at: new Date().toISOString()
   };

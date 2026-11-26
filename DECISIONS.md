@@ -40,4 +40,4 @@
 
 ## ADR-010: Dual-Rail Agent Monetization — Visa TAP (`RFC 9421`) & Tempo OUSD MPP
 - **Status:** Accepted
-- **Decision:** Support Visa Trusted Agent Protocol (`Signature-Input` / `Signature` / `Content-Digest` Ed25519 & ECDSA-P256 verification against Visa Agent Directory RFC 7638 JKT keys, plus distributed nonce reservation in `EdgeRateLimiter`) alongside Tempo OUSD Machine Payments Protocol (`WWW-Authenticate: Payment` dual-rail 402 challenges and `/openapi.json` `x-payment-info` discovery).
+- **Decision:** Support Visa Trusted Agent Protocol (`Signature-Input` / `Signature` / `Content-Digest` Ed25519 verification against Visa Agent Directory RFC 7638 JKT keys, plus distributed nonce reservation in `EdgeRateLimiter`) alongside Tempo OUSD Machine Payments Protocol (`WWW-Authenticate: Payment` dual-rail 402 challenges, strict ERC-20 `Transfer` log verification, and `/openapi.json` `x-payment-info` discovery).

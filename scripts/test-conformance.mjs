@@ -890,6 +890,20 @@ function buildTenantRecord(overrides = {}) {
   };
 }
 
+function makeTempoOusdTransferLog(from, to, amountAtomic) {
+  const padAddr = (addr) => `0x000000000000000000000000${addr.replace(/^0x/i, "").toLowerCase()}`;
+  const amtHex = BigInt(amountAtomic).toString(16).padStart(64, "0");
+  return {
+    address: mppTempoMod.TEMPO_OUSD_ADDRESS,
+    topics: [
+      "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      padAddr(from),
+      padAddr(to)
+    ],
+    data: `0x${amtHex}`
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 3. Test Registry & Runner
 // ---------------------------------------------------------------------------
@@ -998,7 +1012,7 @@ registerTest("T1-F1-06", "F1", 1, async () => {
 
 // --- F2: D1 Schema & Migrations ---
 registerTest("T1-F2-01", "F2", 1, async () => {
-  assert.equal(MIGRATION_SQL_LIST.length, 9);
+  assert.equal(MIGRATION_SQL_LIST.length, 10);
   const db = new MockD1Database(true);
   try {
     const fk = await db.prepare("PRAGMA foreign_key_check").all();
@@ -2166,7 +2180,13 @@ registerTest(
             result: {
               status: "0x1",
               transactionHash: `0x${"aa".repeat(32)}`,
-              logs: []
+              logs: [
+                makeTempoOusdTransferLog(
+                  "0x1111111111111111111111111111111111111111",
+                  "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                  "1000"
+                )
+              ]
             }
           }),
         async () => {
@@ -2801,7 +2821,7 @@ registerTest("T1-F14-03", "F14", 1, async () => {
 
 registerTest("T1-F14-04", "F14", 1, async () => {
   assert.equal(MIGRATION_FILES[0], "0001_init.sql");
-  assert.equal(MIGRATION_FILES[MIGRATION_FILES.length - 1], "0009_visa_tap_and_mpp.sql");
+  assert.equal(MIGRATION_FILES[MIGRATION_FILES.length - 1], "0010_ops_billing_and_hygiene.sql");
 });
 
 registerTest("T1-F14-05", "F14", 1, async () => {
@@ -3855,7 +3875,21 @@ registerTest(
       await withMockFetch(
         async (url) => {
           if (url.includes("/cdn-cgi/access/certs")) return Response.json({ keys: [jwk] });
-          return Response.json({ jsonrpc: "2.0", id: 1, result: { status: "0x1", transactionHash: `0x${"bb".repeat(32)}`, logs: [] } });
+          return Response.json({
+            jsonrpc: "2.0",
+            id: 1,
+            result: {
+              status: "0x1",
+              transactionHash: `0x${"bb".repeat(32)}`,
+              logs: [
+                makeTempoOusdTransferLog(
+                  "0x1111111111111111111111111111111111111111",
+                  "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                  "1000"
+                )
+              ]
+            }
+          });
         },
         async () => {
           const rNoJwt = await h.callApp("https://port4.dev/mcp/demo", {
@@ -4165,7 +4199,17 @@ registerTest(
           return Response.json({
             jsonrpc: "2.0",
             id: 1,
-            result: { status: "0x1", transactionHash: txHash, logs: [] }
+            result: {
+              status: "0x1",
+              transactionHash: txHash,
+              logs: [
+                makeTempoOusdTransferLog(
+                  "0x1111111111111111111111111111111111111111",
+                  "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                  "1000"
+                )
+              ]
+            }
           });
         },
         async () => {
@@ -4994,7 +5038,21 @@ registerTest(
       await withMockFetch(
         async (url) => {
           if (url.includes("/cdn-cgi/access/certs")) return Response.json({ keys: [jwk] });
-          return Response.json({ jsonrpc: "2.0", id: 1, result: { status: "0x1", transactionHash: `0x${"31".repeat(32)}`, logs: [] } });
+          return Response.json({
+            jsonrpc: "2.0",
+            id: 1,
+            result: {
+              status: "0x1",
+              transactionHash: `0x${"31".repeat(32)}`,
+              logs: [
+                makeTempoOusdTransferLog(
+                  "0x1111111111111111111111111111111111111111",
+                  "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                  "1000"
+                )
+              ]
+            }
+          });
         },
         async () => {
           const rOnlyMpp = await h.callApp("https://port4.dev/mcp/demo", {
@@ -5872,7 +5930,22 @@ registerTest(
         payer: "0x1111111111111111111111111111111111111111"
       });
       await withMockFetch(
-        async () => Response.json({ jsonrpc: "2.0", id: 1, result: { status: "0x1", transactionHash: `0x${"e3".repeat(32)}`, logs: [] } }),
+        async () =>
+          Response.json({
+            jsonrpc: "2.0",
+            id: 1,
+            result: {
+              status: "0x1",
+              transactionHash: `0x${"e3".repeat(32)}`,
+              logs: [
+                makeTempoOusdTransferLog(
+                  "0x1111111111111111111111111111111111111111",
+                  reqDecoded.recipient,
+                  reqDecoded.amount
+                )
+              ]
+            }
+          }),
         async () => {
           const r200 = await h.callApp("https://port4.dev/mcp/demo", {
             method: "POST",
@@ -6220,6 +6293,363 @@ registerTest(
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// 3b. Hardening & Feature-Completeness Regression Suite (Audit Remediation)
+// ---------------------------------------------------------------------------
+registerTest("T5-SEC-01", "F11", 1, async () => {
+  const h = createHarness();
+  try {
+    const dev = await h.seedUser({ isAdmin: 0 });
+    const createKey = async (scopes) => {
+      const res = await h.callApp("https://port4.dev/api/keys", {
+        method: "POST",
+        headers: { Origin: "https://port4.dev", Cookie: dev.cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: scopes.join(","), scopes })
+      });
+      assert.equal(res.status, 201);
+      return (await res.json()).secret;
+    };
+
+    const ledgerKey = await createKey(["ledger:read"]);
+    const readKey = await createKey(["tenant:read"]);
+
+    // ledger:read cannot read/write tenants or mint keys
+    assert.equal((await h.callApp("https://port4.dev/api/tenants", { headers: { Authorization: `Bearer ${ledgerKey}` } })).status, 403);
+    assert.equal((await h.callApp("https://port4.dev/api/tenants", { method: "POST", headers: { Authorization: `Bearer ${ledgerKey}`, "Content-Type": "application/json" }, body: "{}" })).status, 403);
+    assert.equal((await h.callApp("https://port4.dev/api/keys", { headers: { Authorization: `Bearer ${ledgerKey}` } })).status, 403);
+    assert.equal((await h.callApp("https://port4.dev/api/ledger", { headers: { Authorization: `Bearer ${ledgerKey}` } })).status, 200);
+
+    // tenant:read can GET /tenants but cannot POST /tenants or GET /ledger
+    assert.equal((await h.callApp("https://port4.dev/api/tenants", { headers: { Authorization: `Bearer ${readKey}` } })).status, 200);
+    assert.equal((await h.callApp("https://port4.dev/api/tenants", { method: "POST", headers: { Authorization: `Bearer ${readKey}`, "Content-Type": "application/json" }, body: "{}" })).status, 403);
+    assert.equal((await h.callApp("https://port4.dev/api/ledger", { headers: { Authorization: `Bearer ${readKey}` } })).status, 403);
+  } finally {
+    h.close();
+  }
+});
+
+registerTest("T5-SEC-02", "F11", 1, async () => {
+  const h = createHarness();
+  try {
+    const dev = await h.seedUser({ isAdmin: 0 });
+    const createRes = await h.callApp("https://port4.dev/api/tenants", {
+      method: "POST",
+      headers: { Origin: "https://port4.dev", Cookie: dev.cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        subdomain: "sanitest",
+        name: "SaniTest",
+        upstream_base_url: "https://api.sanitest.example",
+        payout_wallet: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+        upstream_auth_type: "bearer",
+        upstream_auth_secret: "super-secret-upstream-token"
+      })
+    });
+    assert.equal(createRes.status, 201);
+    const createJson = await createRes.json();
+    assert.equal(createJson.tenant.upstream_signing_secret, undefined);
+    assert.equal(createJson.tenant.upstream_auth_secret, undefined);
+    assert.equal(createJson.tenant.has_upstream_auth_secret, true);
+
+    const addToolRes = await h.callApp(`https://port4.dev/api/tenants/${createJson.tenant.id}/tools`, {
+      method: "POST",
+      headers: { Origin: "https://port4.dev", Cookie: dev.cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "op1", http_method: "GET", upstream_path: "/v1/op1", price_usd: "0" })
+    });
+    assert.equal(addToolRes.status, 201);
+    const addToolJson = await addToolRes.json();
+    assert.equal(addToolJson.tenant.upstream_signing_secret, undefined);
+    assert.equal(addToolJson.tenant.upstream_auth_secret, undefined);
+    assert.equal(addToolJson.tenant.has_upstream_auth_secret, true);
+  } finally {
+    h.close();
+  }
+});
+
+registerTest("T5-SEC-03", "F9", 1, async () => {
+  const h = createHarness({ TEMPO_RPC_URL: "https://tempo-rpc.example" });
+  try {
+    const txHash = `0x${"cd".repeat(32)}`;
+    const mpp = makeMppAuthHeader({
+      challengeId: "ch_empty_logs",
+      txHash,
+      amount: "1000",
+      currency: mppTempoMod.TEMPO_OUSD_ADDRESS,
+      recipient: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+      chainId: 42431,
+      payer: "0x1111111111111111111111111111111111111111"
+    });
+    await withMockFetch(
+      async () => Response.json({ jsonrpc: "2.0", id: 1, result: { status: "0x1", transactionHash: txHash, logs: [] } }),
+      async () => {
+        const res = await h.callApp("https://port4.dev/mcp/demo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: mpp },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "ping", arguments: {} } })
+        });
+        assert.equal(res.status, 402);
+        assert.equal((await res.json()).error, "tempo_ousd_transfer_log_missing");
+      }
+    );
+  } finally {
+    h.close();
+  }
+});
+
+registerTest("T5-SEC-04", "F9", 1, async () => {
+  const h = createHarness({ TEMPO_RPC_URL: "https://tempo-rpc.example" });
+  try {
+    const txHash = `0x${"ef".repeat(32)}`;
+    const mpp = makeMppAuthHeader({
+      challengeId: "ch_pending_recover",
+      txHash,
+      amount: "1000",
+      currency: mppTempoMod.TEMPO_OUSD_ADDRESS,
+      recipient: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+      chainId: 42431,
+      payer: "0x1111111111111111111111111111111111111111"
+    });
+    let mined = false;
+    await withMockFetch(
+      async () => {
+        if (!mined) return Response.json({ jsonrpc: "2.0", id: 1, result: null });
+        return Response.json({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            status: "0x1",
+            transactionHash: txHash,
+            logs: [
+              makeTempoOusdTransferLog(
+                "0x1111111111111111111111111111111111111111",
+                "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                "1000"
+              )
+            ]
+          }
+        });
+      },
+      async () => {
+        const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "ping", arguments: {} } });
+        const r1 = await h.callApp("https://port4.dev/mcp/demo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: mpp },
+          body
+        });
+        assert.equal(r1.status, 409);
+        assert.equal((await r1.json()).error, "payment_settlement_pending");
+
+        mined = true;
+        const r2 = await h.callApp("https://port4.dev/mcp/demo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: mpp },
+          body
+        });
+        assert.equal(r2.status, 200);
+        assert.ok(r2.headers.get("payment-receipt"));
+      }
+    );
+  } finally {
+    h.close();
+  }
+});
+
+registerTest("T5-SEC-05", "F8", 1, async () => {
+  const h = createHarness();
+  try {
+    let settleCalls = 0;
+    const paySig = makeEvmPaymentHeader({ to: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e", value: "2000" });
+    await withMockFetch(
+      async (url) => {
+        settleCalls += 1;
+        throw new Error(`Facilitator must not be called for invalid args (${url})`);
+      },
+      async () => {
+        // edge_dns_lookup requires `domain`; passing `{}` with PAYMENT-SIGNATURE must 400 BEFORE settling
+        const res = await h.callApp("https://port4.dev/mcp/demo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "PAYMENT-SIGNATURE": paySig },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "edge_dns_lookup", arguments: {} } })
+        });
+        assert.equal(res.status, 400);
+        assert.equal(settleCalls, 0);
+      }
+    );
+  } finally {
+    h.close();
+  }
+});
+
+registerTest("T5-SEC-06", "F11", 1, async () => {
+  const h = createHarness();
+  try {
+    const res = await h.callApp("https://port4.dev/health");
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(res.headers.get("x-frame-options"), "DENY");
+    assert.match(res.headers.get("content-security-policy") || "", /default-src 'none'/);
+    assert.ok(res.headers.get("strict-transport-security"));
+
+    // Sandbox run updates usage_rollups cleanly
+    const sbx = await h.callApp("https://port4.dev/api/sandbox/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: "ping" })
+    });
+    assert.equal(sbx.status, 200);
+    await h.flush();
+    await workerEntry.queue(h.queue.drainToBatch(), h.env);
+    const rollup = await h.db.prepare("SELECT call_count FROM usage_rollups WHERE tenant_id = 'ten_port4_sandbox'").first("call_count");
+    assert.ok(Number(rollup) >= 1);
+  } finally {
+    h.close();
+  }
+});
+
+registerTest("T5-PROTO-01", "F9", 1, async () => {
+  const h = createHarness();
+  try {
+    // Advertised /openapi.json tool path routes cleanly for both 402 challenge and free $0 tool
+    const r402 = await h.callApp("https://port4.dev/mcp/demo/tools/ping", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "hi" })
+    });
+    assert.equal(r402.status, 402);
+
+    // MCP stateless ping
+    const rPing = await h.callApp("https://port4.dev/mcp/demo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "ping" })
+    });
+    assert.equal(rPing.status, 200);
+    assert.deepEqual(await rPing.json(), { jsonrpc: "2.0", id: 99, result: {} });
+
+    // Free $0 direct tool
+    await h.db
+      .prepare("INSERT INTO tools (id, tenant_id, name, description, http_method, upstream_path, input_schema_json, price_usd, price_atomic) VALUES ('tl_free', 'ten_port4_sandbox', 'free_ping', 'Free ping', 'POST', '/ping', '{}', '0', '0')")
+      .run();
+    await kvSyncMod.invalidateTenantKv(h.env, "demo");
+    const rFree = await h.callApp("https://port4.dev/mcp/demo/tools/free_ping", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "free" })
+    });
+    assert.equal(rFree.status, 200);
+    const rFreeJson = await rFree.json();
+    assert.equal(rFreeJson.result?._meta?.free, true);
+  } finally {
+    h.close();
+  }
+});
+
+registerTest("T5-PROTO-02", "F7", 1, async () => {
+  // OpenAPI $ref + PATCH + path-level params + YAML import
+  const yamlSpec = `
+openapi: "3.1.0"
+paths:
+  /items/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ItemId"
+    patch:
+      operationId: update_item
+      summary: Update item
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateBody"
+components:
+  parameters:
+    ItemId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    UpdateBody:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+`;
+  const tools = openapiImportMod.parseOpenApiSpecToTools(yamlSpec);
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0].name, "update_item");
+  assert.equal(tools[0].http_method, "PATCH");
+  const schema = JSON.parse(tools[0].input_schema_json);
+  assert.ok(schema.properties.id);
+  assert.ok(schema.properties.status);
+  assert.deepEqual(schema.required, ["id", "status"]);
+
+  // Schema validator: pattern, nested object, array.items, oneOf
+  const nestedSchema = JSON.stringify({
+    type: "object",
+    properties: {
+      code: { type: "string", pattern: "^[A-Z]{3}$" },
+      tags: { type: "array", items: { type: "integer", minimum: 1 }, minItems: 1 },
+      meta: { type: "object", required: ["env"], properties: { env: { oneOf: [{ const: "prod" }, { type: "string", enum: ["prod", "dev"] }] } } }
+    }
+  });
+  assert.equal(schemaMod.validateToolArguments(nestedSchema, { code: "bad", tags: [1] }).ok, false);
+  assert.equal(schemaMod.validateToolArguments(nestedSchema, { code: "ABC", tags: [0] }).ok, false);
+  assert.equal(schemaMod.validateToolArguments(nestedSchema, { code: "ABC", tags: [1], meta: {} }).ok, false);
+  assert.equal(schemaMod.validateToolArguments(nestedSchema, { code: "ABC", tags: [1], meta: { env: "dev" } }).ok, true);
+});
+
+registerTest("T5-OPS-01", "F11", 1, async () => {
+  const h = createHarness({
+    STRIPE_WEBHOOK_SECRET: "whsec_test_1234567890"
+  });
+  try {
+    const dev = await h.seedUser({ isAdmin: 0 });
+    const admin = await h.seedUser({ isAdmin: 1 });
+
+    // Stripe webhook upgrades user to pro
+    const evtBody = JSON.stringify({
+      id: "evt_1",
+      type: "checkout.session.completed",
+      data: { object: { client_reference_id: dev.id, customer: "cus_123" } }
+    });
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = await cryptoMod.hmacSha256Hex("whsec_test_1234567890", `${ts}.${evtBody}`);
+    const hookRes = await h.callApp("https://port4.dev/api/webhooks/stripe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Stripe-Signature": `t=${ts},v1=${sig}` },
+      body: evtBody
+    });
+    assert.equal(hookRes.status, 200);
+    const updatedPlan = await h.db.prepare("SELECT plan FROM users WHERE id = ?").bind(dev.id).first("plan");
+    assert.equal(updatedPlan, "pro");
+
+    // Admin audit-logs + payment reconcile endpoints
+    const alRes = await h.callApp("https://port4.dev/api/admin/audit-logs", {
+      headers: { Cookie: admin.cookie }
+    });
+    assert.equal(alRes.status, 200);
+    assert.ok((await alRes.json()).audit_logs.some((a) => a.action === "billing.plan_upgraded"));
+
+    // Ledger export CSV formula injection protection
+    await h.db
+      .prepare("INSERT INTO tenants (id, user_id, subdomain, name, upstream_base_url, payout_wallet, network) VALUES ('ten_exp', ?, 'expten', 'Exp', 'https://exp.example', '0x742d35Cc6634C0532925a3b844Bc454e4438f44e', 'eip155:84532')")
+      .bind(dev.id)
+      .run();
+    await h.db
+      .prepare("INSERT INTO transactions (id, tenant_id, tool_name, payer_wallet, amount_atomic, amount_usd, network, tx_hash, status, latency_ms) VALUES ('tx_exp1', 'ten_exp', '=CMD()', '0x1111', '1000', '0.001', 'eip155:84532', '0xhash', 'settled', 5)")
+      .run();
+    const csvRes = await h.callApp("https://port4.dev/api/ledger/export?format=csv", {
+      headers: { Cookie: dev.cookie }
+    });
+    assert.equal(csvRes.status, 200);
+    const csvText = await csvRes.text();
+    assert.ok(csvText.includes('"\'=CMD()"'));
+  } finally {
+    h.close();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 4. Execute All Tests & Print Summary Table

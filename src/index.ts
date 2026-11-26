@@ -10,13 +10,19 @@ import { x402GateMiddleware } from "./middleware/x402-gate";
 import { handleMcpRequest } from "./routes/mcp";
 import { apiRoutes } from "./routes/api";
 import { sandboxRoutes } from "./routes/sandbox";
-import { controlPlaneCsrfMiddleware, isTrustedBrowserOrigin } from "./middleware/security";
+import {
+  controlPlaneCsrfMiddleware,
+  isTrustedBrowserOrigin,
+  securityHeadersMiddleware
+} from "./middleware/security";
 import { edgeRateLimitMiddleware } from "./middleware/rate-limit";
 import { consumeMeteringEvents } from "./lib/metering";
 import { buildTenantOpenApiDocument } from "./lib/mpp-tempo";
 export { EdgeRateLimiter, PaymentReplayGuard } from "./durable-objects";
 
 const app = new Hono<AppEnv>();
+
+app.use("*", securityHeadersMiddleware);
 
 app.use(
   "/api/*",
@@ -263,8 +269,102 @@ const mcpMethodNotAllowed = (c: Context<AppEnv>) => {
   );
 };
 
+/**
+ * Adapts direct OpenAPI tool invocations (`POST /mcp/tools/:toolName` or `POST /mcp/:tenant/tools/:toolName`)
+ * into Stateless MCP 2026-07-28 JSON-RPC 2.0 when callers send raw argument JSON instead of an MCP envelope.
+ * Leaves signed Visa TAP or JSON-RPC 2.0 requests untouched so Content-Digest verifies byte-for-byte.
+ */
+const openApiToolPathAdapter: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const toolName = c.req.param("toolName");
+  const hasTap = Boolean(c.req.header("Signature-Input") || c.req.header("Signature"));
+  if (!toolName || hasTap) {
+    await next();
+    return;
+  }
+  const cloned = c.req.raw.clone();
+  const rawText = await cloned.text().catch(() => "");
+  let parsed: unknown = {};
+  if (rawText.trim().length > 0) {
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      await next();
+      return;
+    }
+  }
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    !Array.isArray(parsed) &&
+    (parsed as Record<string, unknown>).jsonrpc === "2.0"
+  ) {
+    await next();
+    return;
+  }
+
+  const envelope = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: {
+      name: decodeURIComponent(toolName),
+      arguments:
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : {}
+    }
+  });
+  const headers = new Headers(c.req.raw.headers);
+  headers.set("Content-Type", "application/json");
+  headers.delete("Content-Length");
+  const rewrittenReq = new Request(c.req.raw.url, {
+    method: "POST",
+    headers,
+    body: envelope
+  });
+  Object.defineProperty(c.req, "raw", { value: rewrittenReq, configurable: true });
+  await next();
+};
+
+app.post(
+  "/mcp/tools/:toolName",
+  resolveTenantMiddleware(),
+  edgeRateLimitMiddleware,
+  openApiToolPathAdapter,
+  mcpHeadersMiddleware,
+  x402GateMiddleware,
+  handleMcpRequest
+);
+
+app.post(
+  "/mcp/:tenant/tools/:toolName",
+  async (c, next) => {
+    const slug = c.req.param("tenant").trim().toLowerCase();
+    const tenant = await resolveTenant(c.env, slug);
+    if (!tenant) {
+      return c.json(
+        {
+          error: "tenant_not_found_or_suspended",
+          message: `No active Port4 gateway found for '${slug}'.`
+        },
+        404
+      );
+    }
+    c.set("tenantSubdomain", slug);
+    c.set("tenant", tenant);
+    await next();
+  },
+  edgeRateLimitMiddleware,
+  openApiToolPathAdapter,
+  mcpHeadersMiddleware,
+  x402GateMiddleware,
+  handleMcpRequest
+);
+
 app.get("/mcp", mcpMethodNotAllowed);
 app.get("/mcp/:tenant", mcpMethodNotAllowed);
+app.get("/mcp/tools/:toolName", mcpMethodNotAllowed);
+app.get("/mcp/:tenant/tools/:toolName", mcpMethodNotAllowed);
 app.get("/sandbox/mcp", mcpMethodNotAllowed);
 
 // Sandbox Data Plane alias
@@ -338,5 +438,12 @@ export default {
   },
   queue(batch: MessageBatch<unknown>, env: AppBindings): Promise<void> {
     return consumeMeteringEvents(batch, env);
+  },
+  async scheduled(_controller: ScheduledController, env: AppBindings): Promise<void> {
+    await env.DB.prepare(
+      `DELETE FROM revoked_sessions
+       WHERE (expires_at IS NOT NULL AND expires_at <= datetime('now'))
+          OR (expires_at IS NULL AND revoked_at <= datetime('now', '-8 days'))`
+    ).run();
   }
 } satisfies ExportedHandler<AppBindings>;

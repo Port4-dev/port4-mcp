@@ -98,6 +98,11 @@
 	// "analytics_engine_datasets": [
 	// 	{ "binding": "GATEWAY_ANALYTICS", "dataset": "port4_gateway_events" }
 	// ],
+	"triggers": {
+		"crons": [
+			"0 3 * * *"
+		]
+	},
 	"routes": [
 		{
 			"pattern": "port4.dev",
@@ -107,5 +112,74 @@
 			"pattern": "*.port4.dev/*",
 			"zone_name": "port4.dev"
 		}
-	]
+	],
+	"env": {
+		// IMPORTANT: Before deploying `--env staging`, replace the placeholder bindings below with
+		// dedicated staging resources (`wrangler d1 create port4-db-staging`,
+		// `wrangler kv namespace create TENANT_ROUTING_STAGING`, `wrangler queues create port4-metering-staging`)
+		// so staging traffic and backup restores remain strictly isolated from production.
+		"staging": {
+			"name": "port4-gateway-staging",
+			"vars": {
+				"APP_URL": "https://staging.port4.dev",
+				"DEMO_AUTH_ENABLED": "true",
+				"FACILITATOR_URL": "https://x402.org/facilitator",
+				"X402_FACILITATOR_URL": "https://x402.org/facilitator",
+				"X402_NETWORK": "eip155:84532",
+				"X402_USDC_ASSET": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+				"SANDBOX_PAYOUT_WALLET": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+				"TEMPO_MAINNET_RPC_URL": "https://rpc.tempo.xyz",
+				"TEMPO_TESTNET_RPC_URL": "https://rpc.moderato.tempo.xyz"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "port4-db",
+					"database_id": "833d7aa9-ffaa-4a9c-92e0-dfda811647b1",
+					"migrations_dir": "migrations"
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "TENANT_ROUTING",
+					"id": "b5d0c5acba7a402d9ad1960ae1c9c184"
+				}
+			],
+			"worker_loaders": [
+				{
+					"binding": "LOADER"
+				}
+			],
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "EDGE_RATE_LIMITER",
+						"class_name": "EdgeRateLimiter"
+					},
+					{
+						"name": "PAYMENT_REPLAY_GUARD",
+						"class_name": "PaymentReplayGuard"
+					}
+				]
+			},
+			"queues": {
+				"producers": [
+					{
+						"binding": "METERING_EVENTS",
+						"queue": "port4-metering"
+					}
+				],
+				"consumers": [
+					{
+						"queue": "port4-metering",
+						"max_batch_size": 100,
+						"max_batch_timeout": 5,
+						"max_retries": 5,
+						"dead_letter_queue": "port4-metering-dlq",
+						"retry_delay": 30
+					}
+				]
+			}
+		}
+	}
 }

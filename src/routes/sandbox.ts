@@ -1,5 +1,11 @@
 import { Hono } from "hono";
-import type { AppEnv, X402PaymentRequired, X402PaymentSignaturePayload } from "../types";
+import type {
+  AppEnv,
+  MeteringEvent,
+  X402PaymentRequired,
+  X402PaymentSignaturePayload
+} from "../types";
+import type { RateLimitConsumeResult } from "../durable-objects";
 import {
   decodeBase64Json,
   encodeBase64Json,
@@ -9,6 +15,7 @@ import {
 } from "../lib/crypto";
 import { buildPaymentRequired, getSandboxSigningSecret } from "../middleware/x402-gate";
 import { resolveTenant } from "../lib/kv-sync";
+import { writeGatewayAnalytics } from "../lib/metering";
 import { requireAdmin } from "./auth";
 import { controlPlaneCsrfMiddleware } from "../middleware/security";
 
@@ -94,6 +101,41 @@ export const sandboxRoutes = new Hono<AppEnv>();
  */
 sandboxRoutes.post("/run", async (c) => {
   const startedAt = Date.now();
+  const sourceIp = c.req.header("CF-Connecting-IP") ?? "local";
+  try {
+    const rlKey = await sha256Hex(`sandbox-run:${sourceIp}`);
+    const rlStub = c.env.EDGE_RATE_LIMITER.get(c.env.EDGE_RATE_LIMITER.idFromName(rlKey));
+    const rpcStub = rlStub as unknown as {
+      consume?: (input: {
+        limit: number;
+        windowSeconds: number;
+        dailyQuota: number;
+      }) => Promise<RateLimitConsumeResult>;
+    };
+    const rlResult =
+      typeof rpcStub.consume === "function"
+        ? await rpcStub.consume({ limit: 30, windowSeconds: 60, dailyQuota: 300 })
+        : ((await (
+            await rlStub.fetch("https://rate-limit/consume", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ limit: 30, windowSeconds: 60, dailyQuota: 300 })
+            })
+          ).json()) as RateLimitConsumeResult);
+    if (!rlResult.allowed) {
+      c.header("Retry-After", String(rlResult.resetSeconds || 60));
+      return c.json(
+        {
+          error: rlResult.reason ?? "rate_limit_exceeded",
+          message: "Sandbox rate limit exceeded. Try again shortly."
+        },
+        429
+      );
+    }
+  } catch {
+    // Allow sandbox to continue if DO is unavailable in isolated unit tests
+  }
+
   let body: { tool?: string; arguments?: Record<string, unknown> } = {};
   try {
     body = (await c.req.json()) as { tool?: string; arguments?: Record<string, unknown> };
@@ -158,30 +200,77 @@ sandboxRoutes.post("/run", async (c) => {
   const toolOutput = executeInternalSandboxTool(tool.name, args, colo);
   const latencyMs = Math.max(1, Date.now() - startedAt);
   const txId = `tx_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  const occurredAt = new Date().toISOString();
+  const hourBucket = `${occurredAt.slice(0, 13)}:00:00.000Z`;
 
-  c.executionCtx.waitUntil(
-    c.env.DB.batch([
-      c.env.DB.prepare(
-        `INSERT INTO transactions
-         (id, tenant_id, tool_name, payer_wallet, amount_atomic, amount_usd, network, tx_hash, status, latency_ms, is_platform_fee)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sandbox_settled', ?, ?)`
-      ).bind(
-        txId,
-        tenant.id,
-        tool.name,
-        payer,
-        tool.price_atomic,
-        tool.price_usd,
-        requirement.network,
-        txHash,
-        latencyMs,
-        isPlatformFee ? 1 : 0
-      ),
-      c.env.DB.prepare("UPDATE tenants SET call_count = call_count + 1 WHERE id = ?").bind(
-        tenant.id
-      )
-    ])
-  );
+  const meteringEvent: MeteringEvent = {
+    id: txId,
+    tenantId: tenant.id,
+    tenantSubdomain: tenant.subdomain,
+    toolName: tool.name,
+    payerWallet: payer,
+    amountAtomic: tool.price_atomic,
+    amountUsd: tool.price_usd,
+    network: requirement.network,
+    txHash,
+    latencyMs,
+    status: "sandbox_settled",
+    isPlatformFee,
+    tapAgentId: null,
+    occurredAt
+  };
+
+  writeGatewayAnalytics(c.env, meteringEvent);
+
+  if (c.env.METERING_EVENTS) {
+    c.executionCtx.waitUntil(c.env.METERING_EVENTS.send(meteringEvent));
+  } else {
+    c.executionCtx.waitUntil(
+      c.env.DB.batch([
+        c.env.DB.prepare(
+          `INSERT INTO transactions
+           (id, tenant_id, tool_name, payer_wallet, amount_atomic, amount_usd, network, tx_hash, status, latency_ms, is_platform_fee, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sandbox_settled', ?, ?, ?)`
+        ).bind(
+          txId,
+          tenant.id,
+          tool.name,
+          payer,
+          tool.price_atomic,
+          tool.price_usd,
+          requirement.network,
+          txHash,
+          latencyMs,
+          isPlatformFee ? 1 : 0,
+          occurredAt
+        ),
+        c.env.DB.prepare(
+          `INSERT INTO usage_rollups
+           (tenant_id, tool_name, network, hour_start, call_count, gross_usd, gross_atomic, total_latency_ms, sandbox_call_count, platform_fee_call_count)
+           VALUES (?, ?, ?, ?, 1, ?, ?, ?, 1, ?)
+           ON CONFLICT(tenant_id, tool_name, network, hour_start) DO UPDATE SET
+             call_count = call_count + 1,
+             gross_usd = gross_usd + excluded.gross_usd,
+             gross_atomic = gross_atomic + excluded.gross_atomic,
+             total_latency_ms = total_latency_ms + excluded.total_latency_ms,
+             sandbox_call_count = sandbox_call_count + 1,
+             platform_fee_call_count = platform_fee_call_count + excluded.platform_fee_call_count`
+        ).bind(
+          tenant.id,
+          tool.name,
+          requirement.network,
+          hourBucket,
+          Number(tool.price_usd),
+          Number(tool.price_atomic),
+          latencyMs,
+          isPlatformFee ? 1 : 0
+        ),
+        c.env.DB.prepare(
+          "UPDATE tenants SET call_count = call_count + 1, settled_call_sequence = COALESCE(settled_call_sequence, 0) + 1 WHERE id = ?"
+        ).bind(tenant.id)
+      ])
+    );
+  }
 
   return c.json({
     ok: true,

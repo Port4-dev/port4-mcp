@@ -34,6 +34,15 @@
   textarea {
     touch-action: manipulation;
   }
+
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid var(--cf-orange);
+    outline-offset: 2px;
+  }
 }
 
 .cf-hero-bg {

@@ -5,6 +5,7 @@ export type TenantStatus = "active" | "suspended" | "archived";
 export type McpMode = "direct" | "codemode" | "openapi_codemode";
 export type ToolSourceType = "rest" | "mcp" | "openapi" | "internal";
 export type UpstreamAuthType = "none" | "bearer" | "api_key_header";
+export type ApiKeyScope = "tenant:read" | "tenant:write" | "ledger:read" | "keys:write" | "admin:all";
 
 export interface AppBindings extends CloudflareBindings {
   PORT4_TREASURY_WALLET?: string;
@@ -23,6 +24,9 @@ export interface AppBindings extends CloudflareBindings {
   TEMPO_RPC_URL?: string;
   TEMPO_MAINNET_RPC_URL?: string;
   TEMPO_TESTNET_RPC_URL?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  STRIPE_PRO_PRICE_ID?: string;
 }
 
 export interface MeteringEvent {
@@ -51,6 +55,7 @@ export interface AuthUser {
   is_admin: number;
   plan: UserPlan;
   auth_via?: "session" | "api_key";
+  api_key_id?: string;
   api_key_scopes?: string[];
 }
 
@@ -59,7 +64,7 @@ export interface ToolRecord {
   tenant_id: string;
   name: string;
   description: string;
-  http_method: "GET" | "POST" | "PUT" | "DELETE";
+  http_method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   upstream_path: string;
   input_schema_json: string;
   price_usd: string;
@@ -101,6 +106,7 @@ export interface TenantRecord {
   codemode_max_subcalls?: number;
   cf_access_team_domain?: string | null;
   cf_access_aud?: string | null;
+  webhook_url?: string | null;
   deleted_at?: string | null;
   created_at?: string;
   updated_at?: string;
@@ -136,6 +142,7 @@ export interface TenantRoutingRecord {
   codemode_max_subcalls: number;
   cf_access_team_domain: string | null;
   cf_access_aud: string | null;
+  webhook_url: string | null;
   tools: ToolRecord[];
   cached_at: string;
 }
@@ -173,6 +180,7 @@ export interface McpValidatedContext {
   method: string;
   toolName: string | null;
   rpcId: string | number | null;
+  cursor?: string;
   arguments: Record<string, unknown>;
 }
 

@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 import type { AppEnv, TenantRecord, ToolRecord, TransactionRecord } from "../types";
-import { requireAuth } from "../middleware/auth";
-import { invalidateTenantKv, syncTenantToKv } from "../lib/kv-sync";
+import { requireAuth, requireScope } from "../middleware/auth";
+import {
+  invalidateTenantKv,
+  sanitizeTenantRoutingRecord,
+  syncTenantToKv,
+  syncUserTenantsToKv
+} from "../lib/kv-sync";
 import {
   decryptSecretAtRest,
   encryptSecretAtRest,
@@ -13,7 +18,7 @@ import {
   usdToAtomicUsdc
 } from "../lib/crypto";
 import { normalizeAccessTeamDomain } from "../lib/cloudflare-access";
-import { parseOpenApiSpecToTools } from "../lib/openapi-import";
+import { parseOpenApiSpecToTools, parseOpenApiTextOrObject } from "../lib/openapi-import";
 import {
   SUPPORTED_NETWORKS,
   getSupportedNetwork,
@@ -32,7 +37,7 @@ const UPSTREAM_AUTH_TYPES = new Set(["none", "bearer", "api_key_header"]);
 const RESERVED_SUBDOMAINS = new Set(["www", "api", "app", "admin", "auth", "status", "docs"]);
 const SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const TOOL_NAME_RE = /^[a-zA-Z0-9_-]{2,64}$/;
-const HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
+const HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 
 function validateUpstreamBaseUrl(
   value: string,
@@ -102,7 +107,17 @@ function validateToolDefinition(input: {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || schema.length > 32 * 1024) {
       return { error: "invalid_input_schema" };
     }
-    return { value: { name, description, http_method: method, upstream_path: upstreamPath, price_usd: priceUsd, input_schema_json: schema, price_atomic: usdToAtomicUsdc(priceUsd) } };
+    return {
+      value: {
+        name,
+        description,
+        http_method: method,
+        upstream_path: upstreamPath,
+        price_usd: priceUsd,
+        input_schema_json: schema,
+        price_atomic: usdToAtomicUsdc(priceUsd, { allowZero: true })
+      }
+    };
   } catch {
     return { error: "invalid_price_or_input_schema" };
   }
@@ -177,18 +192,208 @@ apiRoutes.get("/public/ledger", async (c) => {
   return c.json({ transactions: rows.results ?? [] });
 });
 
+// Public billing plan comparison & Stripe availability
+apiRoutes.get("/billing/plans", (c) => {
+  const stripeConfigured = Boolean(
+    c.env.STRIPE_SECRET_KEY?.trim() && c.env.STRIPE_PRO_PRICE_ID?.trim()
+  );
+  return c.json({
+    stripeConfigured,
+    plans: [
+      {
+        id: "free",
+        name: "Developer (Free)",
+        priceUsdMonth: "0",
+        feePct: 3,
+        maxRpm: 120,
+        maxDailyQuota: 10_000
+      },
+      {
+        id: "pro",
+        name: "Pro",
+        priceUsdMonth: "29",
+        feePct: 1,
+        maxRpm: 600,
+        maxDailyQuota: 1_000_000
+      }
+    ]
+  });
+});
+
+// Stripe Webhook for self-serve Pro plan upgrades/downgrades (authenticated via Stripe-Signature HMAC)
+apiRoutes.post("/webhooks/stripe", async (c) => {
+  const webhookSecret = c.env.STRIPE_WEBHOOK_SECRET?.trim();
+  if (!webhookSecret) {
+    return c.json({ error: "stripe_webhook_not_configured" }, 501);
+  }
+  const sigHeader = c.req.header("Stripe-Signature")?.trim();
+  if (!sigHeader) {
+    return c.json({ error: "missing_stripe_signature" }, 400);
+  }
+
+  const rawBody = await c.req.text();
+  const pairs = new Map<string, string[]>();
+  for (const part of sigHeader.split(",")) {
+    const [k, v] = part.split("=");
+    if (!k || !v) continue;
+    const key = k.trim();
+    const list = pairs.get(key) ?? [];
+    list.push(v.trim());
+    pairs.set(key, list);
+  }
+  const timestamp = pairs.get("t")?.[0];
+  const signatures = pairs.get("v1") ?? [];
+  if (!timestamp || !/^\d+$/.test(timestamp) || signatures.length === 0) {
+    return c.json({ error: "invalid_stripe_signature" }, 400);
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - Number(timestamp)) > 300) {
+    return c.json({ error: "expired_stripe_signature" }, 400);
+  }
+
+  const expectedSig = await hmacSha256Hex(webhookSecret, `${timestamp}.${rawBody}`);
+  let sigValid = false;
+  for (const candidate of signatures) {
+    if (await timingSafeEqualString(candidate.toLowerCase(), expectedSig.toLowerCase())) {
+      sigValid = true;
+      break;
+    }
+  }
+  if (!sigValid) {
+    return c.json({ error: "invalid_stripe_signature" }, 400);
+  }
+
+  let event: {
+    id?: string;
+    type?: string;
+    data?: {
+      object?: {
+        client_reference_id?: string | null;
+        customer?: string | null;
+        metadata?: { user_id?: string };
+      };
+    };
+  };
+  try {
+    event = JSON.parse(rawBody) as typeof event;
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+
+  const obj = event.data?.object;
+  const userId = (obj?.client_reference_id || obj?.metadata?.user_id || "").trim();
+  const customerId = typeof obj?.customer === "string" ? obj.customer : null;
+
+  if (event.type === "checkout.session.completed" && userId) {
+    const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "UPDATE users SET plan = 'pro', billing_customer_id = COALESCE(?, billing_customer_id), plan_upgraded_at = datetime('now') WHERE id = ?"
+      ).bind(customerId, userId),
+      c.env.DB.prepare(
+        `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+         VALUES (?, ?, 'billing.plan_upgraded', 'user', ?, ?)`
+      ).bind(auditId, userId, userId, JSON.stringify({ event_id: event.id, customer: customerId }))
+    ]);
+    await syncUserTenantsToKv(c.env, userId);
+  } else if (event.type === "customer.subscription.deleted") {
+    const targetUser = userId
+      ? { id: userId }
+      : customerId
+        ? await c.env.DB.prepare("SELECT id FROM users WHERE billing_customer_id = ? LIMIT 1")
+            .bind(customerId)
+            .first<{ id: string }>()
+        : null;
+    if (targetUser) {
+      const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      await c.env.DB.batch([
+        c.env.DB.prepare("UPDATE users SET plan = 'free' WHERE id = ?").bind(targetUser.id),
+        c.env.DB.prepare(
+          `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+           VALUES (?, ?, 'billing.plan_downgraded', 'user', ?, ?)`
+        ).bind(auditId, targetUser.id, targetUser.id, JSON.stringify({ event_id: event.id }))
+      ]);
+      await syncUserTenantsToKv(c.env, targetUser.id);
+    }
+  }
+
+  return c.json({ received: true });
+});
+
 // All Control Plane routes below require a valid GitHub OAuth JWT session or Bearer API Key
 apiRoutes.use("/tenants/*", requireAuth);
 apiRoutes.use("/tenants", requireAuth);
+apiRoutes.use("/ledger/*", requireAuth);
 apiRoutes.use("/ledger", requireAuth);
 apiRoutes.use("/keys/*", requireAuth);
 apiRoutes.use("/keys", requireAuth);
+apiRoutes.use("/billing/upgrade", requireAuth);
 
-apiRoutes.get("/tenants", async (c) => {
+apiRoutes.post("/billing/upgrade", requireScope("tenant:write"), async (c) => {
+  const user = c.get("user")!;
+  if (user.plan === "pro") {
+    return c.json({ ok: true, already_pro: true, plan: "pro", fee_rate_pct: 1 });
+  }
+  const stripeKey = c.env.STRIPE_SECRET_KEY?.trim();
+  const priceId = c.env.STRIPE_PRO_PRICE_ID?.trim();
+  if (!stripeKey || !priceId) {
+    return c.json(
+      {
+        error: "stripe_not_configured",
+        message: "Self-serve Stripe billing is not enabled on this deployment. Contact info@port4.dev for a Pro plan upgrade.",
+        contact: "info@port4.dev"
+      },
+      501
+    );
+  }
+
+  const origin = (c.env.APP_URL || "https://port4.dev").replace(/\/$/, "");
+  const form = new URLSearchParams({
+    mode: "subscription",
+    "line_items[0][price]": priceId,
+    "line_items[0][quantity]": "1",
+    client_reference_id: user.id,
+    "metadata[user_id]": user.id,
+    success_url: `${origin}/dashboard?upgrade=success`,
+    cancel_url: `${origin}/dashboard?upgrade=cancelled`
+  });
+  if (user.email) form.set("customer_email", user.email);
+
+  try {
+    const res = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${stripeKey}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: form.toString(),
+      signal: AbortSignal.timeout(10_000)
+    });
+    const session = (await res.json()) as { id?: string; url?: string; error?: { message?: string } };
+    if (!res.ok || !session.url) {
+      return c.json(
+        {
+          error: "stripe_checkout_failed",
+          message: session.error?.message || "Unable to initialize Stripe Checkout session."
+        },
+        502
+      );
+    }
+    return c.json({ ok: true, session_id: session.id, checkout_url: session.url });
+  } catch {
+    return c.json({ error: "stripe_unreachable", message: "Unable to reach Stripe API." }, 502);
+  }
+});
+
+apiRoutes.get("/tenants", requireScope("tenant:read"), async (c) => {
   const user = c.get("user")!;
   const tenantsRes = await c.env.DB.prepare(
     `SELECT id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json,
-            network, auth_mode, is_active,
+            network, auth_mode, is_active, status, call_count,
+            COALESCE(rate_limit_rpm, 120) AS rate_limit_rpm,
+            COALESCE(daily_quota, 10000) AS daily_quota,
+            webhook_url,
             COALESCE(mcp_mode, 'direct') AS mcp_mode,
             COALESCE(codemode_price_usd, '0.01') AS codemode_price_usd,
             COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
@@ -243,7 +448,7 @@ apiRoutes.get("/tenants", async (c) => {
   });
 });
 
-apiRoutes.post("/tenants", async (c) => {
+apiRoutes.post("/tenants", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   let body: {
     subdomain?: string;
@@ -264,12 +469,16 @@ apiRoutes.post("/tenants", async (c) => {
     allow_tap_simulated?: boolean | number;
     cf_access_team_domain?: string;
     cf_access_aud?: string;
+    webhook_url?: string | null;
+    rate_limit_rpm?: number;
+    daily_quota?: number;
     initial_tool?: {
       name: string;
       description: string;
-      http_method?: "GET" | "POST" | "PUT" | "DELETE";
+      http_method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
       upstream_path: string;
       price_usd: string;
+      input_schema_json?: string;
     };
   };
 
@@ -404,8 +613,28 @@ apiRoutes.post("/tenants", async (c) => {
   const tenantId = `ten_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
   const upstreamSigningSecret = `p4_whsec_${randomHex(24)}`;
   const verificationToken = `port4-verify=${randomHex(16)}`;
-  const rateLimitRpm = user.plan === "pro" ? 600 : 120;
-  const dailyQuota = user.plan === "pro" ? 1_000_000 : 10_000;
+  const planMaxRpm = user.plan === "pro" ? 600 : 120;
+  const planMaxQuota = user.plan === "pro" ? 1_000_000 : 10_000;
+  const rateLimitRpm =
+    typeof body.rate_limit_rpm === "number" && Number.isFinite(body.rate_limit_rpm)
+      ? Math.min(planMaxRpm, Math.max(1, Math.floor(body.rate_limit_rpm)))
+      : planMaxRpm;
+  const dailyQuota =
+    typeof body.daily_quota === "number" && Number.isFinite(body.daily_quota)
+      ? Math.min(planMaxQuota, Math.max(1, Math.floor(body.daily_quota)))
+      : planMaxQuota;
+
+  let webhookUrl: string | null = null;
+  if (body.webhook_url && body.webhook_url.trim()) {
+    const validatedWebhook = validateUpstreamBaseUrl(body.webhook_url.trim());
+    if (!validatedWebhook) {
+      return c.json(
+        { error: "invalid_webhook_url", message: "Webhook URL must be a public HTTPS URL." },
+        400
+      );
+    }
+    webhookUrl = validatedWebhook;
+  }
 
   const requireUpstreamVerified =
     body.require_upstream_verified === true || body.require_upstream_verified === 1 ? 1 : 0;
@@ -417,8 +646,8 @@ apiRoutes.post("/tenants", async (c) => {
   try {
     await c.env.DB.prepare(
       `INSERT INTO tenants
-       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota, mcp_mode, codemode_price_usd, codemode_max_subcalls, require_upstream_verified, require_visa_tap, allow_tap_simulated, upstream_auth_type, upstream_auth_header, upstream_auth_secret, cf_access_team_domain, cf_access_aud)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, user_id, subdomain, name, upstream_base_url, payout_wallet, payout_wallets_json, network, auth_mode, is_active, upstream_signing_secret, verification_token, rate_limit_rpm, daily_quota, mcp_mode, codemode_price_usd, codemode_max_subcalls, require_upstream_verified, require_visa_tap, allow_tap_simulated, upstream_auth_type, upstream_auth_header, upstream_auth_secret, cf_access_team_domain, cf_access_aud, webhook_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         tenantId,
@@ -444,7 +673,8 @@ apiRoutes.post("/tenants", async (c) => {
         upstreamAuthHeader,
         encryptedUpstreamSecret,
         cfAccessTeamDomain,
-        cfAccessAud
+        cfAccessAud,
+        webhookUrl
       )
       .run();
   } catch {
@@ -479,7 +709,7 @@ apiRoutes.post("/tenants", async (c) => {
   const synced = await syncTenantToKv(c.env, subdomain);
   return c.json(
     {
-      tenant: synced ? { ...synced, upstream_signing_secret: undefined } : null,
+      tenant: synced ? sanitizeTenantRoutingRecord(synced) : null,
       endpoint_url: `https://${subdomain}.port4.dev/mcp`,
       upstream_signing_secret: upstreamSigningSecret,
       verification: {
@@ -494,7 +724,7 @@ apiRoutes.post("/tenants", async (c) => {
 /**
  * Verify tenant upstream domain ownership via `/.well-known/port4-verification.txt`
  */
-apiRoutes.post("/tenants/:id/verify-upstream", async (c) => {
+apiRoutes.post("/tenants/:id/verify-upstream", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
@@ -536,7 +766,7 @@ apiRoutes.post("/tenants/:id/verify-upstream", async (c) => {
 /**
  * Rotate per-tenant HMAC upstream signing secret
  */
-apiRoutes.post("/tenants/:id/rotate-secret", async (c) => {
+apiRoutes.post("/tenants/:id/rotate-secret", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
@@ -548,19 +778,24 @@ apiRoutes.post("/tenants/:id/rotate-secret", async (c) => {
   if (!tenant) return c.json({ error: "tenant_not_found" }, 404);
 
   const newSecret = `p4_whsec_${randomHex(24)}`;
-  await c.env.DB.prepare(
-    "UPDATE tenants SET upstream_signing_secret = ?, updated_at = datetime('now') WHERE id = ?"
-  )
-    .bind(newSecret, tenant.id)
-    .run();
+  const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "UPDATE tenants SET upstream_signing_secret = ?, updated_at = datetime('now') WHERE id = ?"
+    ).bind(newSecret, tenant.id),
+    c.env.DB.prepare(
+      `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+       VALUES (?, ?, 'tenant.secret_rotated', 'tenant', ?, ?)`
+    ).bind(auditId, user.id, tenant.id, JSON.stringify({ subdomain: tenant.subdomain }))
+  ]);
   await syncTenantToKv(c.env, tenant.subdomain);
   return c.json({ ok: true, upstream_signing_secret: newSecret });
 });
 
 /**
- * In-place endpoint update (name, upstream_base_url, payout_wallet, network)
+ * In-place endpoint update (name, upstream_base_url, payout_wallet, network, quotas, webhook_url)
  */
-apiRoutes.patch("/tenants/:id", async (c) => {
+apiRoutes.patch("/tenants/:id", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const existing = await c.env.DB.prepare(
@@ -568,6 +803,9 @@ apiRoutes.patch("/tenants/:id", async (c) => {
             auth_mode, COALESCE(mcp_mode, 'direct') AS mcp_mode,
             COALESCE(codemode_price_usd, '0.01') AS codemode_price_usd,
             COALESCE(codemode_max_subcalls, 10) AS codemode_max_subcalls,
+            COALESCE(rate_limit_rpm, 120) AS rate_limit_rpm,
+            COALESCE(daily_quota, 10000) AS daily_quota,
+            webhook_url,
             COALESCE(require_upstream_verified, 0) AS require_upstream_verified,
             COALESCE(require_visa_tap, 0) AS require_visa_tap,
             COALESCE(allow_tap_simulated, 0) AS allow_tap_simulated,
@@ -589,6 +827,9 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       mcp_mode: "direct" | "codemode" | "openapi_codemode";
       codemode_price_usd: string;
       codemode_max_subcalls: number;
+      rate_limit_rpm: number;
+      daily_quota: number;
+      webhook_url: string | null;
       require_upstream_verified: number;
       require_visa_tap: number;
       allow_tap_simulated: number;
@@ -611,6 +852,9 @@ apiRoutes.patch("/tenants/:id", async (c) => {
     mcp_mode?: "direct" | "codemode" | "openapi_codemode";
     codemode_price_usd?: string;
     codemode_max_subcalls?: number;
+    rate_limit_rpm?: number;
+    daily_quota?: number;
+    webhook_url?: string | null;
     require_upstream_verified?: boolean | number;
     require_visa_tap?: boolean | number;
     allow_tap_simulated?: boolean | number;
@@ -808,25 +1052,61 @@ apiRoutes.patch("/tenants/:id", async (c) => {
         : 0
       : existing.allow_tap_simulated;
 
-  await c.env.DB.prepare(
-    `UPDATE tenants
-     SET name = ?, upstream_base_url = ?, payout_wallet = ?, payout_wallets_json = ?, network = ?,
-         auth_mode = ?, mcp_mode = ?, codemode_price_usd = ?, codemode_max_subcalls = ?,
-         require_upstream_verified = ?, require_visa_tap = ?, allow_tap_simulated = ?,
-         upstream_auth_type = ?, upstream_auth_header = ?, upstream_auth_secret = ?,
-         cf_access_team_domain = ?, cf_access_aud = ?, updated_at = datetime('now')
-     WHERE id = ?`
-  )
-    .bind(
+  const planMaxRpm = user.plan === "pro" ? 600 : 120;
+  const planMaxQuota = user.plan === "pro" ? 1_000_000 : 10_000;
+  const nextRpm =
+    body.rate_limit_rpm !== undefined && Number.isFinite(Number(body.rate_limit_rpm))
+      ? Math.min(planMaxRpm, Math.max(1, Math.floor(Number(body.rate_limit_rpm))))
+      : existing.rate_limit_rpm;
+  const nextDailyQuota =
+    body.daily_quota !== undefined && Number.isFinite(Number(body.daily_quota))
+      ? Math.min(planMaxQuota, Math.max(1, Math.floor(Number(body.daily_quota))))
+      : existing.daily_quota;
+
+  let nextWebhookUrl = existing.webhook_url;
+  if (body.webhook_url !== undefined) {
+    if (!body.webhook_url || !body.webhook_url.trim()) {
+      nextWebhookUrl = null;
+    } else {
+      const validatedWebhook = validateUpstreamBaseUrl(body.webhook_url.trim());
+      if (!validatedWebhook) {
+        return c.json(
+          { error: "invalid_webhook_url", message: "Webhook URL must be a public HTTPS URL." },
+          400
+        );
+      }
+      nextWebhookUrl = validatedWebhook;
+    }
+  }
+
+  const nextPayoutWalletsJson = JSON.stringify(nextPayoutWallets);
+  const payoutChanged =
+    nextWallet !== existing.payout_wallet ||
+    nextPayoutWalletsJson !== (existing.payout_wallets_json ?? "");
+
+  const patchStatements: D1PreparedStatement[] = [
+    c.env.DB.prepare(
+      `UPDATE tenants
+       SET name = ?, upstream_base_url = ?, payout_wallet = ?, payout_wallets_json = ?, network = ?,
+           auth_mode = ?, mcp_mode = ?, codemode_price_usd = ?, codemode_max_subcalls = ?,
+           rate_limit_rpm = ?, daily_quota = ?, webhook_url = ?,
+           require_upstream_verified = ?, require_visa_tap = ?, allow_tap_simulated = ?,
+           upstream_auth_type = ?, upstream_auth_header = ?, upstream_auth_secret = ?,
+           cf_access_team_domain = ?, cf_access_aud = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    ).bind(
       nextName,
       nextUpstream,
       nextWallet,
-      JSON.stringify(nextPayoutWallets),
+      nextPayoutWalletsJson,
       nextNetwork,
       nextAuthMode,
       nextMcpMode,
       nextCodePrice,
       nextMaxSubcalls,
+      nextRpm,
+      nextDailyQuota,
+      nextWebhookUrl,
       nextRequireVerified,
       nextRequireVisaTap,
       nextAllowTapSimulated,
@@ -837,22 +1117,37 @@ apiRoutes.patch("/tenants/:id", async (c) => {
       nextAccessAud,
       existing.id
     )
-    .run();
+  ];
+
+  if (payoutChanged) {
+    const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    patchStatements.push(
+      c.env.DB.prepare(
+        `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+         VALUES (?, ?, 'tenant.payout_updated', 'tenant', ?, ?)`
+      ).bind(
+        auditId,
+        user.id,
+        existing.id,
+        JSON.stringify({ subdomain: existing.subdomain, network: nextNetwork, payout_wallet: nextWallet })
+      )
+    );
+  }
+
+  await c.env.DB.batch(patchStatements);
 
   const synced = await syncTenantToKv(c.env, existing.subdomain);
   return c.json({
     ok: true,
-    tenant: synced
-      ? { ...synced, upstream_signing_secret: undefined, upstream_auth_secret: undefined }
-      : null
+    tenant: synced ? sanitizeTenantRoutingRecord(synced) : null
   });
 });
 
 /**
- * Import an OpenAPI 3.x JSON spec (inline `spec` or public HTTPS `spec_url`) into Port4 tools,
+ * Import an OpenAPI 3.x JSON or YAML spec (inline `spec` or public HTTPS `spec_url`) into Port4 tools,
  * and optionally enable Code Mode (`codemode` or `openapi_codemode`) in one click.
  */
-apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
+apiRoutes.post("/tenants/:id/import-openapi", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
@@ -863,6 +1158,18 @@ apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
 
   if (!tenant) return c.json({ error: "tenant_not_found" }, 404);
 
+  const MAX_OPENAPI_BYTES = 256 * 1024;
+  const rawBodyText = await c.req.text();
+  if (new TextEncoder().encode(rawBodyText).byteLength > MAX_OPENAPI_BYTES) {
+    return c.json(
+      {
+        error: "payload_too_large",
+        message: "OpenAPI import payload must not exceed 256 KiB."
+      },
+      413
+    );
+  }
+
   let body: {
     spec?: unknown;
     spec_url?: string;
@@ -870,7 +1177,7 @@ apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
     mcp_mode?: "direct" | "codemode" | "openapi_codemode";
   };
   try {
-    body = await c.req.json();
+    body = JSON.parse(rawBodyText) as typeof body;
   } catch {
     return c.json({ error: "invalid_json" }, 400);
   }
@@ -891,9 +1198,19 @@ apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
       if (!res.ok) {
         return c.json({ error: "spec_fetch_failed", status: res.status }, 502);
       }
-      rawSpec = await res.json();
+      const rawText = await res.text();
+      if (new TextEncoder().encode(rawText).byteLength > MAX_OPENAPI_BYTES) {
+        return c.json(
+          {
+            error: "payload_too_large",
+            message: "Remote OpenAPI specification exceeds the 256 KiB limit."
+          },
+          413
+        );
+      }
+      rawSpec = parseOpenApiTextOrObject(rawText);
     } catch {
-      return c.json({ error: "spec_fetch_failed", message: "Unable to fetch OpenAPI JSON from URL." }, 502);
+      return c.json({ error: "spec_fetch_failed", message: "Unable to fetch or parse OpenAPI spec from URL." }, 502);
     }
   }
 
@@ -914,7 +1231,7 @@ apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
   const defaultPrice = (body.default_price_usd ?? "0.005").replace(/^\$/, "").trim();
   let priceAtomic: string;
   try {
-    priceAtomic = usdToAtomicUsdc(defaultPrice);
+    priceAtomic = usdToAtomicUsdc(defaultPrice, { allowZero: true });
   } catch {
     return c.json({ error: "invalid_price" }, 400);
   }
@@ -972,7 +1289,7 @@ apiRoutes.post("/tenants/:id/import-openapi", async (c) => {
 /**
  * In-place tool editor (name, description, http_method, upstream_path, price_usd, input_schema_json)
  */
-apiRoutes.patch("/tenants/:id/tools/:toolId", async (c) => {
+apiRoutes.patch("/tenants/:id/tools/:toolId", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const toolId = c.req.param("toolId");
@@ -1038,7 +1355,7 @@ apiRoutes.patch("/tenants/:id/tools/:toolId", async (c) => {
   const synced = await syncTenantToKv(c.env, tenant.subdomain);
   return c.json({
     ok: true,
-    tenant: synced ? { ...synced, upstream_signing_secret: undefined } : null
+    tenant: synced ? sanitizeTenantRoutingRecord(synced) : null
   });
 });
 
@@ -1046,7 +1363,7 @@ apiRoutes.patch("/tenants/:id/tools/:toolId", async (c) => {
  * Authenticated Owner Live `tools/call` Sandbox:
  * Fires a signed test call to the tenant's upstream and returns HTTP status, latency, and JSON response.
  */
-apiRoutes.post("/tenants/:id/test-call", async (c) => {
+apiRoutes.post("/tenants/:id/test-call", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
@@ -1135,7 +1452,7 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
   }
 
   let serializedBody = "";
-  let httpMethod: "GET" | "POST" | "PUT" | "DELETE" = tool.http_method;
+  let httpMethod: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" = tool.http_method;
   if (isRemoteMcp) {
     httpMethod = "POST";
     headers["MCP-Protocol-Version"] = "2026-07-28";
@@ -1213,7 +1530,7 @@ apiRoutes.post("/tenants/:id/test-call", async (c) => {
 /**
  * Native MCP-to-MCP Sync: imports tools/list (name, description, inputSchema) from an existing MCP server
  */
-apiRoutes.post("/tenants/:id/sync-mcp", async (c) => {
+apiRoutes.post("/tenants/:id/sync-mcp", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const tenant = await c.env.DB.prepare(
@@ -1309,7 +1626,6 @@ apiRoutes.post("/tenants/:id/sync-mcp", async (c) => {
     };
     const tools = json.result?.tools ?? [];
     let imported = 0;
-    const priceAtomic = usdToAtomicUsdc(defaultPriceUsd);
 
     const existingToolsRes = await c.env.DB.prepare(
       "SELECT id, name FROM tools WHERE tenant_id = ?"
@@ -1354,7 +1670,7 @@ apiRoutes.post("/tenants/:id/sync-mcp", async (c) => {
   }
 });
 
-apiRoutes.delete("/tenants/:id", async (c) => {
+apiRoutes.delete("/tenants/:id", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
 
@@ -1392,7 +1708,7 @@ apiRoutes.delete("/tenants/:id", async (c) => {
   return c.json({ ok: true, archived: true });
 });
 
-apiRoutes.post("/tenants/:id/tools", async (c) => {
+apiRoutes.post("/tenants/:id/tools", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
 
@@ -1409,7 +1725,7 @@ apiRoutes.post("/tenants/:id/tools", async (c) => {
   let body: {
     name?: string;
     description?: string;
-    http_method?: "GET" | "POST" | "PUT" | "DELETE";
+    http_method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     upstream_path?: string;
     price_usd?: string;
     input_schema_json?: string;
@@ -1442,10 +1758,13 @@ apiRoutes.post("/tenants/:id/tools", async (c) => {
     .run();
 
   const synced = await syncTenantToKv(c.env, tenant.subdomain);
-  return c.json({ tool_id: toolId, tenant: synced }, 201);
+  return c.json(
+    { tool_id: toolId, tenant: synced ? sanitizeTenantRoutingRecord(synced) : null },
+    201
+  );
 });
 
-apiRoutes.delete("/tenants/:id/tools/:toolId", async (c) => {
+apiRoutes.delete("/tenants/:id/tools/:toolId", requireScope("tenant:write"), async (c) => {
   const user = c.get("user")!;
   const tenantId = c.req.param("id");
   const toolId = c.req.param("toolId");
@@ -1468,9 +1787,62 @@ apiRoutes.delete("/tenants/:id/tools/:toolId", async (c) => {
   return c.json({ ok: true });
 });
 
-apiRoutes.get("/ledger", async (c) => {
+function escapeCsvCell(value: unknown): string {
+  const raw = String(value ?? "");
+  const safe = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
+  return `"${safe.replace(/"/g, '""')}"`;
+}
+
+function buildLedgerWhere(
+  userId: string,
+  query: { tenant?: string; tool?: string; status?: string; from?: string; to?: string }
+): { whereSql: string; params: unknown[] } {
+  const clauses = ["t.user_id = ?"];
+  const params: unknown[] = [userId];
+
+  const tenant = query.tenant?.trim().toLowerCase();
+  if (tenant) {
+    clauses.push("LOWER(t.subdomain) = ?");
+    params.push(tenant);
+  }
+  const tool = query.tool?.trim().toLowerCase();
+  if (tool) {
+    clauses.push("LOWER(tx.tool_name) LIKE ?");
+    params.push(`%${tool}%`);
+  }
+  const status = query.status?.trim();
+  if (status === "settled" || status === "sandbox_settled" || status === "failed") {
+    clauses.push("tx.status = ?");
+    params.push(status);
+  }
+  const from = query.from?.trim();
+  if (from && /^\d{4}-\d{2}-\d{2}/.test(from)) {
+    clauses.push("tx.created_at >= ?");
+    params.push(from.slice(0, 19));
+  }
+  const to = query.to?.trim();
+  if (to && /^\d{4}-\d{2}-\d{2}/.test(to)) {
+    const bound = to.length === 10 ? `${to} 23:59:59` : to.slice(0, 19);
+    clauses.push("tx.created_at <= ?");
+    params.push(bound);
+  }
+
+  return { whereSql: clauses.join(" AND "), params };
+}
+
+apiRoutes.get("/ledger", requireScope("ledger:read"), async (c) => {
   const user = c.get("user")!;
-  const [rollupSummary, txRes] = await Promise.all([
+  const limit = Math.min(200, Math.max(1, Number(c.req.query("limit") ?? "50") || 50));
+  const offset = Math.max(0, Number(c.req.query("offset") ?? "0") || 0);
+  const { whereSql, params } = buildLedgerWhere(user.id, {
+    tenant: c.req.query("tenant"),
+    tool: c.req.query("tool"),
+    status: c.req.query("status"),
+    from: c.req.query("from"),
+    to: c.req.query("to")
+  });
+
+  const [rollupSummary, txCountRow, txRes, dailyRes, byTenantRes] = await Promise.all([
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(r.call_count), 0) AS total_calls,
               COALESCE(SUM(r.gross_atomic), 0) AS total_atomic,
@@ -1483,17 +1855,50 @@ apiRoutes.get("/ledger", async (c) => {
       .bind(user.id)
       .first<{ total_calls: number; total_atomic: number; total_usd: number; total_latency_ms: number }>(),
     c.env.DB.prepare(
+      `SELECT COUNT(*) AS total
+       FROM transactions tx
+       INNER JOIN tenants t ON t.id = tx.tenant_id
+       WHERE ${whereSql}`
+    )
+      .bind(...params)
+      .first<{ total: number }>(),
+    c.env.DB.prepare(
       `SELECT tx.id, tx.tenant_id, t.subdomain AS tenant_subdomain, tx.tool_name, tx.payer_wallet,
               tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status, tx.latency_ms,
               tx.tap_agent_id, tx.created_at
        FROM transactions tx
        INNER JOIN tenants t ON t.id = tx.tenant_id
-       WHERE t.user_id = ?
+       WHERE ${whereSql}
        ORDER BY tx.created_at DESC
-       LIMIT 100`
+       LIMIT ? OFFSET ?`
+    )
+      .bind(...params, limit, offset)
+      .all<TransactionRecord>(),
+    c.env.DB.prepare(
+      `SELECT substr(tx.created_at, 1, 10) AS day_utc,
+              COUNT(*) AS calls,
+              COALESCE(SUM(CAST(tx.amount_atomic AS INTEGER)), 0) AS atomic_sum
+       FROM transactions tx
+       INNER JOIN tenants t ON t.id = tx.tenant_id
+       WHERE t.user_id = ?
+       GROUP BY day_utc
+       ORDER BY day_utc DESC
+       LIMIT 14`
     )
       .bind(user.id)
-      .all<TransactionRecord>()
+      .all<{ day_utc: string; calls: number; atomic_sum: number }>(),
+    c.env.DB.prepare(
+      `SELECT t.subdomain AS tenant_subdomain,
+              COUNT(*) AS calls,
+              COALESCE(SUM(CAST(tx.amount_atomic AS INTEGER)), 0) AS atomic_sum
+       FROM transactions tx
+       INNER JOIN tenants t ON t.id = tx.tenant_id
+       WHERE t.user_id = ?
+       GROUP BY t.subdomain
+       ORDER BY atomic_sum DESC`
+    )
+      .bind(user.id)
+      .all<{ tenant_subdomain: string; calls: number; atomic_sum: number }>()
   ]);
 
   const rawTransactions = txRes.results ?? [];
@@ -1509,10 +1914,11 @@ apiRoutes.get("/ledger", async (c) => {
     };
   });
 
+  const filteredTotal = Number(txCountRow?.total ?? transactions.length);
   const rollupCalls = Number(rollupSummary?.total_calls ?? 0);
   const rollupAtomic = Number(rollupSummary?.total_atomic ?? 0);
   const txAtomic = rawTransactions.reduce((sum, tx) => sum + Number(tx.amount_atomic || 0), 0);
-  const totalCalls = Math.max(rollupCalls, transactions.length);
+  const totalCalls = Math.max(rollupCalls, filteredTotal);
   const resolvedAtomic = rollupAtomic > 0 ? rollupAtomic : txAtomic;
   const totalUsd = (resolvedAtomic / 1_000_000).toFixed(4);
   const avgLatencyMs =
@@ -1529,11 +1935,96 @@ apiRoutes.get("/ledger", async (c) => {
       total_usd: totalUsd,
       avg_latency_ms: avgLatencyMs
     },
+    pagination: {
+      limit,
+      offset,
+      total: filteredTotal,
+      has_more: offset + transactions.length < filteredTotal
+    },
+    daily_series: (dailyRes.results ?? [])
+      .slice()
+      .reverse()
+      .map((d) => ({
+        day_utc: d.day_utc,
+        calls: Number(d.calls ?? 0),
+        usd: (Number(d.atomic_sum ?? 0) / 1_000_000).toFixed(4)
+      })),
+    by_tenant: (byTenantRes.results ?? []).map((b) => ({
+      tenant_subdomain: b.tenant_subdomain,
+      calls: Number(b.calls ?? 0),
+      usd: (Number(b.atomic_sum ?? 0) / 1_000_000).toFixed(4)
+    })),
     transactions
   });
 });
 
-apiRoutes.get("/keys", async (c) => {
+apiRoutes.get("/ledger/export", requireScope("ledger:read"), async (c) => {
+  const user = c.get("user")!;
+  const format = (c.req.query("format") ?? "csv").trim().toLowerCase();
+  const { whereSql, params } = buildLedgerWhere(user.id, {
+    tenant: c.req.query("tenant"),
+    tool: c.req.query("tool"),
+    status: c.req.query("status"),
+    from: c.req.query("from"),
+    to: c.req.query("to")
+  });
+
+  const rowsRes = await c.env.DB.prepare(
+    `SELECT tx.id, t.subdomain AS tenant_subdomain, tx.tool_name, tx.payer_wallet,
+            tx.amount_atomic, tx.amount_usd, tx.network, tx.tx_hash, tx.status, tx.latency_ms,
+            tx.tap_agent_id, tx.created_at
+     FROM transactions tx
+     INNER JOIN tenants t ON t.id = tx.tenant_id
+     WHERE ${whereSql}
+     ORDER BY tx.created_at DESC
+     LIMIT 1000`
+  )
+    .bind(...params)
+    .all<TransactionRecord>();
+
+  const rows = rowsRes.results ?? [];
+  if (format === "json") {
+    c.header("Content-Disposition", 'attachment; filename="port4-ledger.json"');
+    return c.json({ exported_at: new Date().toISOString(), count: rows.length, transactions: rows });
+  }
+
+  const header = [
+    "id",
+    "tenant_subdomain",
+    "tool_name",
+    "payer_wallet",
+    "amount_usd",
+    "amount_atomic",
+    "network",
+    "tx_hash",
+    "status",
+    "latency_ms",
+    "tap_agent_id",
+    "created_at"
+  ].join(",");
+  const lines = rows.map((r) =>
+    [
+      escapeCsvCell(r.id),
+      escapeCsvCell(r.tenant_subdomain),
+      escapeCsvCell(r.tool_name),
+      escapeCsvCell(r.payer_wallet),
+      escapeCsvCell(r.amount_usd),
+      escapeCsvCell(r.amount_atomic),
+      escapeCsvCell(r.network),
+      escapeCsvCell(r.tx_hash),
+      escapeCsvCell(r.status),
+      escapeCsvCell(r.latency_ms),
+      escapeCsvCell(r.tap_agent_id ?? ""),
+      escapeCsvCell(r.created_at)
+    ].join(",")
+  );
+
+  c.header("Content-Type", "text/csv; charset=utf-8");
+  c.header("Content-Disposition", 'attachment; filename="port4-ledger.csv"');
+  return c.body([header, ...lines].join("\n"), 200);
+});
+
+apiRoutes.get("/keys", requireScope("keys:write"), async (c) => {
   const user = c.get("user")!;
   const res = await c.env.DB.prepare(
     `SELECT id, name, key_prefix, COALESCE(scopes, 'tenant:read,tenant:write') AS scopes,
@@ -1548,10 +2039,10 @@ apiRoutes.get("/keys", async (c) => {
   return c.json({ keys: res.results ?? [] });
 });
 
-apiRoutes.post("/keys", async (c) => {
+apiRoutes.post("/keys", requireScope("keys:write"), async (c) => {
   const user = c.get("user")!;
   let name = "CLI Deploy Key";
-  let scopes = "tenant:read,tenant:write";
+  let scopes = "tenant:read,tenant:write,ledger:read";
   let expiresAt: string | null = null;
   try {
     const body = (await c.req.json()) as {
@@ -1582,11 +2073,16 @@ apiRoutes.post("/keys", async (c) => {
   const keyHash = await sha256Hex(rawSecret);
   const id = `key_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 
-  await c.env.DB.prepare(
-    "INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  )
-    .bind(id, user.id, name, keyPrefix, keyHash, scopes, expiresAt)
-    .run();
+  const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(id, user.id, name, keyPrefix, keyHash, scopes, expiresAt),
+    c.env.DB.prepare(
+      `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+       VALUES (?, ?, 'api_key.created', 'api_key', ?, ?)`
+    ).bind(auditId, user.id, id, JSON.stringify({ name, key_prefix: keyPrefix, scopes }))
+  ]);
 
   return c.json(
     {
@@ -1604,10 +2100,30 @@ apiRoutes.post("/keys", async (c) => {
 apiRoutes.delete("/keys/:id", async (c) => {
   const user = c.get("user")!;
   const id = c.req.param("id");
-  await c.env.DB.prepare(
-    "UPDATE api_keys SET revoked_at = datetime('now') WHERE id = ? AND user_id = ?"
-  )
-    .bind(id, user.id)
-    .run();
+  if (user.auth_via === "api_key") {
+    const scopes = user.api_key_scopes ?? [];
+    const isAdminKey = scopes.includes("admin:all");
+    const isSelfRevoke = user.api_key_id === id && scopes.includes("tenant:write");
+    if (!isAdminKey && !isSelfRevoke) {
+      return c.json(
+        {
+          error: "insufficient_api_key_scope",
+          required_scope: "keys:write",
+          message: "Interactive session or admin:all scope required to revoke other API keys."
+        },
+        403
+      );
+    }
+  }
+  const auditId = `aud_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "UPDATE api_keys SET revoked_at = datetime('now') WHERE id = ? AND user_id = ?"
+    ).bind(id, user.id),
+    c.env.DB.prepare(
+      `INSERT INTO audit_logs (id, actor_user_id, action, target_type, target_id, metadata_json)
+       VALUES (?, ?, 'api_key.revoked', 'api_key', ?, ?)`
+    ).bind(auditId, user.id, id, JSON.stringify({ key_id: id }))
+  ]);
   return c.json({ ok: true, revoked: true });
 });

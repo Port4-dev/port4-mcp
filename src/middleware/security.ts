@@ -66,9 +66,51 @@ export function isTrustedBrowserOrigin(
   return false;
 }
 
+/**
+ * Applies defensive HTTP security headers to all API, MCP, and SPA responses.
+ */
+export const securityHeadersMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => {
+  await next();
+
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "strict-origin-when-cross-origin");
+  c.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+
+  try {
+    if (new URL(c.req.url).protocol === "https:") {
+      c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+  } catch {
+    // ignore malformed url
+  }
+
+  const path = c.req.path;
+  const isApiOrProtocol =
+    path.startsWith("/api/") ||
+    path === "/mcp" ||
+    path.startsWith("/mcp/") ||
+    path === "/openapi.json" ||
+    path === "/health" ||
+    path.startsWith("/sandbox/");
+
+  if (isApiOrProtocol) {
+    c.header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  } else {
+    c.header(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https: data:; connect-src 'self' https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    );
+  }
+};
+
 /** Protect cookie-authenticated control-plane writes from cross-site form and fetch requests. */
 export const controlPlaneCsrfMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (!UNSAFE_METHODS.has(c.req.method)) {
+    return next();
+  }
+
+  if (c.req.path === "/api/webhooks/stripe" && c.req.header("Stripe-Signature")) {
     return next();
   }
 
